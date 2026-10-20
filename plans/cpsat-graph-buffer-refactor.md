@@ -26,8 +26,9 @@ Goal: model the solve as a graph.
   the same loop nest, whether the two ops join one tiling group, and where a group
   breaks.
 - **`Graph`** — owns the nodes and edges, and holds the global context (alignment,
-  LX capacity, exclusions, whether relayouts are priced). `Graph.timeline` returns the
-  op-output nodes in execution order.
+  LX capacity, exclusions, whether relayouts are priced). `graph.solve()` fills in
+  every free decision and returns the op-output nodes in execution order, which is
+  the execution plan.
 
 The work is split into small stages. Each one lands as its own PR, leaves the full
 suite green, and gets an empty equivalence diff (see *Verification*), so if behaviour
@@ -135,8 +136,7 @@ class Graph:
 
     def edges_of(self, kind) -> Iterator[DependencyEdge]
     def encode(self) -> None  # every edge posts its constraints into the shared model, in order
-    @property
-    def timeline(self) -> list[ComputeNode]  # op outputs by produced_at
+    def solve(self) -> list[ComputeNode]  # decisions filled; op outputs in execution order
     def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
 ```
 
@@ -197,7 +197,7 @@ Notes:
 
 - In `scratchpad/buffer_graph.py`: `DependencyKind`, `DivisionMap`, `DependencyEdge`
   (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`, `joinable`, `joins`),
-  `Graph` (context, `edges_of`, `timeline`, `tiling_segments`), `NodeFactory`, and the
+  `Graph` (context, `edges_of`, `tiling_segments`), `NodeFactory`, and the
   node gains `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`,
   `graph`/`model`, and `add_child` taking `pairs` only (no `geometry` yet; see Stage 2b).
 - `spill_cost` and the node's derived properties (`sym_is_lx`, `sym_division`,
@@ -207,7 +207,7 @@ Notes:
   one graph and model; `add_child` puts one edge object on both ends and the graph,
   and two edges of different kinds can join the same pair; `DivisionMap` answers `allows`/`dst_options`/`src_options`
   consistently with `pairs`; `slices_alike` is true on an ungated edge; `bridges`
-  returns only the copies priced for that pair; `timeline` order; execution chain
+  returns only the copies priced for that pair; execution chain order by `produced_at`;
   links and `contiguous`; `joins` follows `nest_pairs`; `tiling_segments` splits at
   gaps and at untileable ops; node fixing rules (single candidate fixes
   `division=0`, out-of-range division asserts); `tiling` is `None` while `division`
@@ -227,7 +227,7 @@ Notes:
   - IN_PLACE edges with `division_map=None` when the child's division was fixed
     upstream, otherwise the same `cd_parent_matches` entry.
   - RELAYOUT_COPY edges for live copies.
-  - `produced_at` from `uses[0]` for op outputs; `ExecutionEdge`s along the timeline,
+  - `produced_at` from `uses[0]` for op outputs; `ExecutionEdge`s in `produced_at` order,
     with `nest_pairs` from the two nodes' candidate `TileSpec.level_counts` (equal and
     non-empty).
   - `add_child` call order matches today's constraint order (READ by producer order,
@@ -333,22 +333,31 @@ Notes:
   equivalence diff for this stage compares decisions only; objectives may differ by a
   constant per stage.
 
-### Stage 8. Extract onto nodes; honour pre-fixed decisions
+### Stage 8. `graph.solve()`; honour pre-fixed decisions
 
-- `_extract` fills `node.resident/division/offset` (the solver fills in the undefined
-  fields) and returns the chosen relayouts per consumer.
+- `graph.solve()` runs `encode`, the objective ladder (`_run`) and extraction, and
+  returns the op-output nodes in execution order (following the `ExecutionEdge` chain)
+  with `node.resident/division/offset` filled where they were `None`. The chosen
+  relayout per READ edge is recorded on the edge.
+- The returned list is the execution plan: each node's chosen candidate (core split
+  and tiling), where its output lives, how each input is read (in place, through which
+  relayout copy, or from HBM), and the tiling groups along the joined execution edges.
+  Inputs and relayout copies are reached through the READ edges of the nodes that use
+  them.
 - Bottom-justify is skipped when any offset was pinned.
-- `_plan_layout_generic` writes nodes back to the caller's buffers: `address` in bytes,
+- `_plan_layout_generic` calls `graph.solve()` and writes the nodes back to the
+  caller's buffers: `address` in bytes,
   `spill_reason`, `chosen_division` only where the caller enumerated divisions, and
   `chosen_relayouts` scaled.
-- Tests: a solve with a pre-fixed `division`/`resident`/`offset` honours it, and every
-  free field comes back filled.
+- Tests: a solve with a pre-fixed `division`/`resident`/`offset` honours it; every free
+  field comes back filled; the returned order matches `produced_at`; and the tiling
+  groups read off the returned nodes equal `derive_tiling_groups` on the same choices.
 - Run the device suites.
 
 ### Stage 9. Cleanup
 
-- Rewrite the module docstring around nodes, dependency edges, execution edges and the
-  timeline; keep docstrings short.
+- Rewrite the module docstring around nodes, dependency edges, execution edges and
+  `graph.solve()`; keep docstrings short.
 - `tests/inductor/test_cooptimization_types.py:361-372` → compare against
   `buffer_graph.spill_cost(b)`.
 - Update the comments that cite the old classes by name: `plan_solver.py:152`,
@@ -385,8 +394,10 @@ Sized from the inventory:
   `graph.set_solver(SimulatedAnnealing())`. The `model` a node holds becomes the chosen
   solver's backend. Nodes and edges state the problem (candidates, division maps,
   relayouts, nest pairs, capacity), and each backend turns that into its own form:
-  CP vars and constraints for CP-SAT, a move space and cost for SA. `encode` dispatches
-  through the backend. Nothing outside the solvers changes yet.
+  CP vars and constraints for CP-SAT, a move space and cost for SA. `encode` and
+  `graph.solve()` dispatch through the backend, and `solve()` returns the same
+  execution-ordered nodes whichever solver ran. Nothing outside the solvers changes
+  yet.
 - **2b. Node absorbs the allocator-only fields.** The node (moved into
   `plan_solver.py`) gains what the allocator's commit path reads: `in_place_parents`
   (→ IN_PLACE edges), `residency_reason` (→ `Graph.exclusions`), lifetime overrides,
