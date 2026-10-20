@@ -108,6 +108,23 @@ class ComputeNode:                  # the node
     prev: Optional[ExecutionEdge]
     next: Optional[ExecutionEdge]
 
+    graph: Graph                    # set by the factory
+    model: cp_model.CpModel         # set by the factory; the node's decision vars live here
+
+    def add_child(
+        self,
+        child: ComputeNode,
+        kind: DependencyKind = DependencyKind.READ,
+        *,
+        geometry: Optional[ResidencyEdge] = None,  # derive the division map from the ops
+        pairs: Optional[Pairs] = None,             # or take it as given
+    ) -> DependencyEdge  # the only way to add an edge: derives its mapping, wires both ends
+    def finalize_relayouts(self) -> None  # after all parents: priced, capped relayouts per READ edge
+
+class NodeFactory:                  # one per solve; every node it makes shares graph and model
+    def __init__(self, graph: Graph, model: cp_model.CpModel)
+    def node(self, buffer) -> ComputeNode  # makes the node and its decision vars in `model`
+
 class Graph:
     alignment: int
     capacity: int                    # LX capacity in alignment units
@@ -116,8 +133,8 @@ class Graph:
     nodes: dict[str, ComputeNode]
     edges: list[DependencyEdge]      # in the order the solver adds their constraints
 
-    def connect(self, edge) -> None  # the only way to add an edge; appends to both ends
     def edges_of(self, kind) -> Iterator[DependencyEdge]
+    def encode(self) -> None  # every edge posts its constraints into the shared model, in order
     @property
     def timeline(self) -> list[ComputeNode]  # op outputs by produced_at
     def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
@@ -129,13 +146,27 @@ Notes:
   and get a short custom `__repr__` (name, or `src->dst:kind`).
 - A pair of nodes can share more than one edge (an in-place child usually reads its
   parent too). The solver iterates edges by kind, so there is no `isinstance` dispatch.
-- Only `connect` and the builder mutate the wiring. Once the solve starts, only decision
+- `parent.add_child(child, kind)` is the only way to add an edge. It ports the
+  allocator's per-edge logic: with `geometry` (the `ResidencyEdge` built from the two
+  live ops) it computes the `DivisionMap` itself, as `_cd_parent_matches` does today,
+  and the priced `relayouts`, as `_cd_parent_relayouts` does. Graphs with no live ops
+  (the synthetic and captured test graphs) pass `pairs` instead. Either way it puts the
+  one edge object on both ends and on the graph. Once the solve starts, only decision
   fields change.
-- The edges hold solver-agnostic facts and queries. The CP-SAT encoding of each one
-  (`_gate_divisions` over `division_map.pairs`, the served literals over `relayouts`,
-  the `joined` literal over `nest_pairs`) is a per-edge function in the solver, so
-  exhaustive search and SA can ask the same edges in Phase 2 without importing
-  OR-Tools.
+- Relayout capping (`_cap_relayout_groups`) keeps any consumer division that another
+  parent already matches for free, so it needs all of a child's READ edges first. The
+  relayouts are therefore filled in once every parent has been added
+  (`child.finalize_relayouts()`), not inside each `add_child` call.
+- Nodes come from a `NodeFactory` and hold a reference to the shared model. In Phase 1
+  that model is the CP-SAT model: a node creates its own decision vars when it is made,
+  and each edge encodes its own constraints (`_gate_divisions` over
+  `division_map.pairs`, the served literals over `relayouts`, the `joined` literal over
+  `nest_pairs`) through it. `Graph.encode()` walks the edges in today's constraint
+  order, so building the model stays deterministic. The edges' queries
+  (`slices_alike`, `bridges`, `joins`) need no model.
+- This interface stays inside the CP-SAT solve until the problem definition is unified
+  (Phase 2a, `graph.set_solver(...)`). Only after that is it pushed out to the
+  allocator.
 - `DivisionMap` is read in both directions: CP-SAT gates on `pairs`, while a solver
   that generates divisions asks `dst_options`/`src_options` for the other end of an edge.
 - Every division index on an edge (`DivisionMap.pairs`, `nest_pairs`, `relayouts`) is
@@ -166,13 +197,15 @@ Notes:
 
 - In `scratchpad/buffer_graph.py`: `DependencyKind`, `DivisionMap`, `DependencyEdge`
   (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`, `joinable`, `joins`),
-  `Graph` (context, `connect`, `edges_of`, `timeline`, `tiling_segments`), and the node
-  gains `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`.
+  `Graph` (context, `edges_of`, `timeline`, `tiling_segments`), `NodeFactory`, and the
+  node gains `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`,
+  `graph`/`model`, and `add_child` taking `pairs` only (no `geometry` yet; see Stage 2b).
 - `spill_cost` and the node's derived properties (`sym_is_lx`, `sym_division`,
   `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`) stay as drafted.
 - Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline` from the draft.
-- Tests (`tests/inductor/test_buffer_graph.py`, no device): `connect` shares one edge
-  object between both ends; `DivisionMap` answers `allows`/`dst_options`/`src_options`
+- Tests (`tests/inductor/test_buffer_graph.py`, no device): the factory's nodes share
+  one graph and model; `add_child` puts one edge object on both ends and the graph,
+  and two edges of different kinds can join the same pair; `DivisionMap` answers `allows`/`dst_options`/`src_options`
   consistently with `pairs`; `slices_alike` is true on an ungated edge; `bridges`
   returns only the copies priced for that pair; `timeline` order; execution chain
   links and `contiguous`; `joins` follows `nest_pairs`; `tiling_segments` splits at
@@ -180,10 +213,11 @@ Notes:
   `division=0`, out-of-range division asserts); `tiling` is `None` while `division`
   is free and the candidate's spec once it is set.
 
-### Stage 2. Builder
+### Stage 2a. Builder
 
-- `build_graph(buffers, alignment, capacity, exclusions, shuffles_priced)` is the only
-  code that looks at the allocator classes. It encodes what is already known:
+- `build_graph(buffers, model, alignment, capacity, exclusions, shuffles_priced)` makes
+  a `NodeFactory`, one node per buffer, and the edges through `add_child`. It is the
+  only code that looks at the allocator classes. It encodes what is already known:
   - `resident=False` for excluded buffers, and for copies whose source does not choose
     a division or that no READ edge can use.
   - READ edges only between nodes that both choose a division (this matches today's
@@ -196,12 +230,27 @@ Notes:
   - `produced_at` from `uses[0]` for op outputs; `ExecutionEdge`s along the timeline,
     with `nest_pairs` from the two nodes' candidate `TileSpec.level_counts` (equal and
     non-empty).
-  - Edge order matches today's constraint order (READ by producer order, then
-    RELAYOUT_COPY, then IN_PLACE), so model building stays deterministic.
+  - `add_child` call order matches today's constraint order (READ by producer order,
+    then RELAYOUT_COPY, then IN_PLACE), so `Graph.encode` stays deterministic.
 - Tests: for every synthetic graph, the edges must match what `_get_children`,
   `_relayout_copies` and `in_place_parents` give today, and `nest_pairs` must agree
   with `loop_id` equality from `_cut_literals`. These cross-checks are deleted in
-  Stages 3 and 4 along with those helpers.
+  Stages 3 and 4a along with those helpers.
+
+### Stage 2b. Port the allocator's edge derivation into `add_child`
+
+- `add_child(..., geometry=...)` derives the `DivisionMap` from the `ResidencyEdge`
+  over the two nodes' `core_divisions` (the body of `_cd_parent_matches`), and
+  `finalize_relayouts` derives the priced relayouts (the per-edge half of
+  `_cd_parent_relayouts` plus `_cap_relayout_groups`). The in-place pairing the
+  allocator does at `allocator.py:1552` moves the same way.
+- The builder passes `geometry` wherever the consumer's `residency_edges` has the
+  parent, and `pairs` from `cd_parent_matches` otherwise.
+- The allocator keeps computing its tables in Phase 1 (they are still the external
+  contract), so the test is that both agree: on the device-backed graphs
+  (test_work_division, test_solver_relayout_e2e) the derived map and relayouts must
+  equal `cd_parent_matches` / `cd_parent_relayouts` edge for edge.
+- Equivalence diff must be empty.
 
 ### Stage 3. Solver reads relationships from the graph
 
@@ -242,29 +291,31 @@ Notes:
   coarse-tiling suites against Stage 4a; if they regress, drop this stage and keep
   `nest_pairs` as a query for Phase 2.
 
-### Stage 5. `_NodeVars`
+### Stage 5. Nodes own their vars
 
-- One `_NodeVars` per node replaces the variable-making half of both wrappers. A free
-  field gets a CP var; a fixed one gets a constant:
+- `NodeFactory.node` creates the node's decision vars in its `model`, replacing the
+  variable-making half of both wrappers. A free field gets a CP var; a fixed one gets
+  a constant:
   - `division` → `new_constant(k)` with constant `eff_size`/`cores`/`core_cost`/
     `splits`. This generalises today's single-candidate fast path to any fixed `k`.
   - `resident`/`offset` → a var pinned with `model.add(var == value)`, because interval
     presence needs a literal.
-- It exposes `buffer`, `division` and `division_is` for `cpsat_expr_printer`, so that
-  contract is unchanged.
-- For now the wrappers hold a `_NodeVars` and delegate to it, so this stage changes no
+- The node exposes `buffer`, `division` and `division_is` for `cpsat_expr_printer`, so
+  that contract is unchanged. Var names stay as today (`div_<name>`, ...).
+- For now the wrappers hold their node and delegate to it, so this stage changes no
   constraint code.
 - Equivalence diff must be empty.
 
-### Stage 6. Constraints per edge; delete the wrappers
+### Stage 6. Edges encode themselves; delete the wrappers
 
-- `_constrain_residency(model, graph, vars)` runs per READ edge (slicing match over
-  `division_map`, or a resident copy from `relayouts`) and returns the served
-  literals.
-- `_constrain_relayout_copies` runs per RELAYOUT_COPY edge (`priced`).
-- `_add_inplace_relaxation` gives each IN_PLACE edge a merge literal, with a division
-  gate only when `division_map is not None`.
-- `_add_no_overlap_2d` keeps its logic, now over `_NodeVars`.
+- `DependencyEdge.encode()` posts its constraints through `src.model`, by kind:
+  - READ: slicing match over `division_map`, or a resident copy from `relayouts`; the
+    served literals are kept on the edge.
+  - RELAYOUT_COPY: today's `_constrain_relayout_copies` over `priced`.
+  - IN_PLACE: a merge literal, with a division gate only when `division_map is not
+    None` (today's `_add_inplace_relaxation`).
+- `Graph.encode()` calls them in edge order; the three solver methods go away.
+- `_add_no_overlap_2d` keeps its logic, now over the nodes.
 - `free_copies` (the presolve threshold) counts RELAYOUT_COPY edges whose source
   chooses a division.
 - Delete `_LifetimeBufferWithCpVars`, `_CoreDivisionBufferWithCpVars`, `_wrap`,
@@ -318,18 +369,25 @@ Kept unchanged through Phase 1: `_gate_divisions`, `_PlacementUnit`, `_justify`,
   test_coarse_tiling, test_scratchpad_patterns, test_perm_layout_solver, plus
   test_buffer_graph from Stage 1.
 - Equivalence diff from Stage 0: empty, except Stages 4b and 7 as noted.
-- After Stages 4a, 4b, 6 and 8: the device suites that compile through CP-SAT —
+- After Stages 2b, 4a, 4b, 6 and 8: the device suites that compile through CP-SAT —
   test_scratchpad_use, test_work_division, test_solver_relayout_e2e,
   test_solver_auto_coarse_tiling — base vs change, same serial setup.
 - `pre-commit run --files <changed>` (ruff, mypy).
 
 ## Phase 2 — outline (separate plan after Phase 1 lands)
 
-Make `ComputeNode` and `Graph` the allocator's output and retire
-`LifetimeBoundBuffer`/`CoreDivisionBuffer`/`RelayoutCopyBuffer`. Each stage below is
-also its own PR, green on the full suite. Sized from the inventory:
+Unify the problem definition first, then make `ComputeNode` and `Graph` the
+allocator's output and retire `LifetimeBoundBuffer`/`CoreDivisionBuffer`/
+`RelayoutCopyBuffer`. Each stage below is also its own PR, green on the full suite.
+Sized from the inventory:
 
-- **2a. Node absorbs the allocator-only fields.** The node (moved into
+- **2a. One problem definition, pluggable solver.** `graph.set_solver(CpSatSolver())` /
+  `graph.set_solver(SimulatedAnnealing())`. The `model` a node holds becomes the chosen
+  solver's backend. Nodes and edges state the problem (candidates, division maps,
+  relayouts, nest pairs, capacity), and each backend turns that into its own form:
+  CP vars and constraints for CP-SAT, a move space and cost for SA. `encode` dispatches
+  through the backend. Nothing outside the solvers changes yet.
+- **2b. Node absorbs the allocator-only fields.** The node (moved into
   `plan_solver.py`) gains what the allocator's commit path reads: `in_place_parents`
   (→ IN_PLACE edges), `residency_reason` (→ `Graph.exclusions`), lifetime overrides,
   `lx_view`, `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with`
@@ -339,20 +397,22 @@ also its own PR, green on the full suite. Sized from the inventory:
   `produced_at`/execution edges. Sizes
   stay in bytes on the node and CP-SAT converts to units internally. `address` stays
   in bytes (every solver writes bytes today).
-- **2b. The allocator builds nodes and the graph** at its four build sites in
+- **2c. The allocator builds nodes and the graph** at its four build sites in
   `allocator.py`: `_build_bound_buffers` (:1456/:1497),
   `_append_lx_relayout_destinations` (:1819), `_build_cd_bound_buffers`
   (:4074/:4275), and `_relayout_copy_buffers` (:4418, via `build_relayout_copy`). Its
   4 isinstance checks (:713, :2769, :2964, :3099) become
-  `graph.edges_of(RELAYOUT_COPY)` lookups. `build_graph` then reads nodes, not classes.
-- **2c. Placement-only solvers** (greedy, first-fit/best-fit, SA, cooling_schedules,
+  `graph.edges_of(RELAYOUT_COPY)` lookups. Its `_cd_parent_matches` /
+  `_cd_parent_relayouts` tables are deleted: it calls `add_child(geometry=...)`, which
+  has owned that logic since Stage 2b. `build_graph` then reads nodes, not classes.
+- **2d. Placement-only solvers** (greedy, first-fit/best-fit, SA, cooling_schedules,
   utils.plot_buffers) only read fields (~90 lines). Swap the type and drop greedy's
   isinstance at :183.
-- **2d. Exhaustive search and the SA co-optimizer** read `parents`/`cd_parent_matches`
+- **2e. Exhaustive search and the SA co-optimizer** read `parents`/`cd_parent_matches`
   from READ edges and write `division`/`resident` on nodes. SA's duplicated
   `_spill_cost` collapses onto `buffer_graph.spill_cost`, and its op adjacency moves
   onto execution edges.
-- **2e. Tests**: ~180 constructor calls across 13 files, mostly through helpers
+- **2f. Tests**: ~180 constructor calls across 13 files, mostly through helpers
   (`make_buffer_registry`, `synthetic_cooptimization_graphs._buf`,
   `cooptimization_capture_loader._buf`, `test_perm_layout_solver._buf`). Switch the
   helpers first, then the direct calls in `test_scratchpad_solver.py` (131) and
