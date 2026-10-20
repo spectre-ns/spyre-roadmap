@@ -86,8 +86,22 @@ class ExecutionEdge:
 
 @dataclass(eq=False)
 class ComputeNode:                  # the node
-    ... # name, size (units), core_divisions, start/end_time, spill_cost, boundary,
-        # sym_core_divs, sym_tile_counts, division/resident/offset (None = free)
+    ... # name, size (units), start/end_time, spill_cost, boundary,
+        # sym_core_divs, sym_tile_counts
+    # Candidates: core_divisions[i] is a split across cores and core_divisions[i].tiling
+    # the coarse tiling that goes with it, so one index picks both.
+    core_divisions: list[CoreDivision]
+    division: Optional[int]         # chosen candidate; None = free
+    resident: Optional[bool]        # None = free
+    offset: Optional[int]           # None = free
+
+    @property
+    def tilings(self) -> list[TileSpec]   # core_divisions[i].tiling for each candidate
+    @property
+    def tiling(self) -> Optional[TileSpec]  # the chosen candidate's tiling, once division is set
+    @property
+    def tileable(self) -> bool      # some candidate tiling is not untiled
+
     produced_at: Optional[int]      # tick of the producing write; None for inputs and copies
     inputs: list[DependencyEdge]
     outputs: list[DependencyEdge]
@@ -124,6 +138,9 @@ Notes:
   OR-Tools.
 - `DivisionMap` is read in both directions: CP-SAT gates on `pairs`, while a solver
   that generates divisions asks `dst_options`/`src_options` for the other end of an edge.
+- Every division index on an edge (`DivisionMap.pairs`, `nest_pairs`, `relayouts`) is
+  an index into the end node's `core_divisions`, so a pair fixes both the core split
+  and the coarse tiling of each end.
 - `ExecutionEdge`s link *all* op outputs in the solve, not just the tileable ones.
   `joinable` reproduces today's rule that an untileable op, or a gap in ticks, splits a
   tiling segment. `nest_pairs` is today's "same `TileSpec.level_counts`, not untiled"
@@ -150,7 +167,7 @@ Notes:
 - In `scratchpad/buffer_graph.py`: `DependencyKind`, `DivisionMap`, `DependencyEdge`
   (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`, `joinable`, `joins`),
   `Graph` (context, `connect`, `edges_of`, `timeline`, `tiling_segments`), and the node
-  gains `produced_at`/`inputs`/`outputs`/`prev`/`next`.
+  gains `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`.
 - `spill_cost` and the node's derived properties (`sym_is_lx`, `sym_division`,
   `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`) stay as drafted.
 - Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline` from the draft.
@@ -160,7 +177,8 @@ Notes:
   returns only the copies priced for that pair; `timeline` order; execution chain
   links and `contiguous`; `joins` follows `nest_pairs`; `tiling_segments` splits at
   gaps and at untileable ops; node fixing rules (single candidate fixes
-  `division=0`, out-of-range division asserts).
+  `division=0`, out-of-range division asserts); `tiling` is `None` while `division`
+  is free and the candidate's spec once it is set.
 
 ### Stage 2. Builder
 
