@@ -14,7 +14,7 @@ copy one pinned out. Relationships are re-derived ad hoc (`_get_children`,
 
 Goal: model the solve as a graph.
 
-- **Nodes** — one type, `CoreDivisionBoundBuffer`. Its decision fields (`division`,
+- **Nodes** — one type, `ComputeNode`. Its decision fields (`division`,
   `resident`, `offset`) are fixed ahead of time or `None` for the solver to find.
 - **`DependencyEdge`** — every relationship between two nodes (reads, in-place reuse,
   relayout copies). Edges are shared: the same edge object sits in its source's
@@ -48,8 +48,8 @@ class DependencyKind(Enum):
 
 @dataclass(eq=False)
 class DependencyEdge:
-    src: CoreDivisionBoundBuffer
-    dst: CoreDivisionBoundBuffer
+    src: ComputeNode
+    dst: ComputeNode
     kind: DependencyKind
     pairs: Optional[Pairs]              # (src div, dst div) that slice alike; None = no division gate
     relayouts: tuple[RelayoutRead, ...] = ()   # READ only: copies that can serve this read
@@ -57,8 +57,8 @@ class DependencyEdge:
 
 @dataclass(eq=False)
 class ExecutionEdge:
-    before: CoreDivisionBoundBuffer
-    after: CoreDivisionBoundBuffer
+    before: ComputeNode
+    after: ComputeNode
     contiguous: bool   # produced on consecutive ticks (nothing outside the solve runs between)
 
     @property
@@ -66,7 +66,7 @@ class ExecutionEdge:
         return self.contiguous and self.before.tileable and self.after.tileable
 
 @dataclass(eq=False)
-class CoreDivisionBoundBuffer:      # the node
+class ComputeNode:                  # the node
     ... # name, size (units), core_divisions, start/end_time, spill_cost, boundary,
         # sym_core_divs, sym_tile_counts, division/resident/offset (None = free)
     produced_at: Optional[int]      # tick of the producing write; None for inputs and copies
@@ -80,14 +80,14 @@ class Graph:
     capacity: int                    # LX capacity in alignment units
     exclusions: dict[str, str]       # name -> residency_reason (record_exclusions)
     shuffles_priced: bool            # False under the fallback objective: copies pinned out
-    nodes: dict[str, CoreDivisionBoundBuffer]
+    nodes: dict[str, ComputeNode]
     edges: list[DependencyEdge]      # in the order the solver adds their constraints
 
     def connect(self, edge) -> None  # the only way to add an edge; appends to both ends
     def edges_of(self, kind) -> Iterator[DependencyEdge]
     @property
-    def timeline(self) -> list[CoreDivisionBoundBuffer]  # op outputs by produced_at
-    def tiling_segments(self) -> list[list[CoreDivisionBoundBuffer]]  # maximal joinable chains
+    def timeline(self) -> list[ComputeNode]  # op outputs by produced_at
+    def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
 ```
 
 Notes:
@@ -251,7 +251,7 @@ Kept unchanged through Phase 1: `_gate_divisions`, `_PlacementUnit`, `_justify`,
 
 ## Phase 2 — outline (separate plan after Phase 1 lands)
 
-Make `CoreDivisionBoundBuffer` and `Graph` the allocator's output and retire
+Make `ComputeNode` and `Graph` the allocator's output and retire
 `LifetimeBoundBuffer`/`CoreDivisionBuffer`/`RelayoutCopyBuffer`. Each stage below is
 also its own PR, green on the full suite. Sized from the inventory:
 
