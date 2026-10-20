@@ -16,12 +16,15 @@ Goal: model the solve as a graph.
 
 - **Nodes** — one type, `ComputeNode`. Its decision fields (`division`,
   `resident`, `offset`) are fixed ahead of time or `None` for the solver to find.
-- **`DependencyEdge`** — every relationship between two nodes (reads, in-place reuse,
-  relayout copies). Edges are shared: the same edge object sits in its source's
-  `outputs` and its destination's `inputs`, so either end can walk it.
+- **`DependencyEdge`** — every data dependency between two nodes (reads, in-place
+  reuse, relayout copies). The edge owns the core-division mapping across it: which
+  (src division, dst division) pairs slice the shared buffer alike, and which pairs a
+  relayout copy can bridge. Edges are shared: the same edge object sits in its
+  source's `outputs` and its destination's `inputs`, so either end can walk it.
 - **`ExecutionEdge`** — links each op output to its chronological neighbours
-  (`node.prev` / `node.next`). Coarse-tiling state lives here: whether two adjacent
-  ops run the same loop nest, and where a tiling group breaks.
+  (`node.prev` / `node.next`). Coarse tiling is handled here: which division pairs run
+  the same loop nest, whether the two ops join one tiling group, and where a group
+  breaks.
 - **`Graph`** — owns the nodes and edges, and holds the global context (alignment,
   LX capacity, exclusions, whether relayouts are priced). `Graph.timeline` returns the
   op-output nodes in execution order.
@@ -42,28 +45,44 @@ the model below.
 
 ```python
 class DependencyKind(Enum):
-    READ = auto()          # dst reads src; residency gate + slicing match
+    READ = auto()          # dst's op reads src; residency gate + slicing match
     IN_PLACE = auto()      # dst may take over src's storage at the shared tick
     RELAYOUT_COPY = auto() # dst is a relayout destination of src
+
+@dataclass(frozen=True)
+class DivisionMap:
+    """(src division, dst division) pairs under which both ops own the shared buffer
+    with the same per-core slicing (today's cd_parent_matches entry for the edge)."""
+    pairs: tuple[tuple[int, int], ...]
+
+    def allows(self, src_div: int, dst_div: int) -> bool
+    def dst_options(self, src_div: int) -> frozenset[int]  # consumer divisions that read src_div in place
+    def src_options(self, dst_div: int) -> frozenset[int]  # producer divisions dst_div can read in place
 
 @dataclass(eq=False)
 class DependencyEdge:
     src: ComputeNode
     dst: ComputeNode
     kind: DependencyKind
-    pairs: Optional[Pairs]              # (src div, dst div) that slice alike; None = no division gate
-    relayouts: tuple[RelayoutRead, ...] = ()   # READ only: copies that can serve this read
-    priced: tuple[int, ...] = ()               # RELAYOUT_COPY only: src divisions the copy is priced for
+    division_map: Optional[DivisionMap]       # None = dst's division fixed upstream, no gate
+    relayouts: tuple[RelayoutRead, ...] = ()  # READ only: pairs a resident relayout copy bridges
+    priced: tuple[int, ...] = ()              # RELAYOUT_COPY only: src divisions the copy is priced for
+
+    def slices_alike(self, src_div: int, dst_div: int) -> bool  # division_map, or True if ungated
+    def bridges(self, src_div: int, dst_div: int) -> tuple[RelayoutRead, ...]  # copies that serve the pair
 
 @dataclass(eq=False)
 class ExecutionEdge:
     before: ComputeNode
     after: ComputeNode
-    contiguous: bool   # produced on consecutive ticks (nothing outside the solve runs between)
+    contiguous: bool  # produced on consecutive ticks (nothing outside the solve runs between)
+    nest_pairs: tuple[tuple[int, int], ...]  # (before div, after div) that run the same non-empty loop nest
 
     @property
     def joinable(self) -> bool:  # can the two ops share a loop nest at all?
         return self.contiguous and self.before.tileable and self.after.tileable
+
+    def joins(self, before_div: int, after_div: int) -> bool  # same tiling group under this pair
 
 @dataclass(eq=False)
 class ComputeNode:                  # the node
@@ -98,9 +117,21 @@ Notes:
   parent too). The solver iterates edges by kind, so there is no `isinstance` dispatch.
 - Only `connect` and the builder mutate the wiring. Once the solve starts, only decision
   fields change.
+- The edges hold solver-agnostic facts and queries. The CP-SAT encoding of each one
+  (`_gate_divisions` over `division_map.pairs`, the served literals over `relayouts`,
+  the `joined` literal over `nest_pairs`) is a per-edge function in the solver, so
+  exhaustive search and SA can ask the same edges in Phase 2 without importing
+  OR-Tools.
+- `DivisionMap` is read in both directions: CP-SAT gates on `pairs`, while a solver
+  that generates divisions asks `dst_options`/`src_options` for the other end of an edge.
 - `ExecutionEdge`s link *all* op outputs in the solve, not just the tileable ones.
   `joinable` reproduces today's rule that an untileable op, or a gap in ticks, splits a
-  tiling segment.
+  tiling segment. `nest_pairs` is today's "same `TileSpec.level_counts`, not untiled"
+  test, precomputed per edge instead of re-derived through `loop_id`.
+- Coarse tiling then splits across the two edge types the way the data does: group
+  membership (which adjacent ops share a nest) is decided on `ExecutionEdge`s, and
+  whether a tiled value must be cut to HBM is decided by checking its READ edges
+  against those groups.
 
 ## Phase 1 — CP-SAT internals
 
@@ -116,16 +147,20 @@ Notes:
 
 ### Stage 1. Data model
 
-- In `scratchpad/buffer_graph.py`: `DependencyKind`, `DependencyEdge`, `ExecutionEdge`,
+- In `scratchpad/buffer_graph.py`: `DependencyKind`, `DivisionMap`, `DependencyEdge`
+  (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`, `joinable`, `joins`),
   `Graph` (context, `connect`, `edges_of`, `timeline`, `tiling_segments`), and the node
   gains `produced_at`/`inputs`/`outputs`/`prev`/`next`.
 - `spill_cost` and the node's derived properties (`sym_is_lx`, `sym_division`,
   `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`) stay as drafted.
 - Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline` from the draft.
 - Tests (`tests/inductor/test_buffer_graph.py`, no device): `connect` shares one edge
-  object between both ends; `timeline` order; execution chain links and `contiguous`;
-  `tiling_segments` splits at gaps and at untileable ops; node fixing rules (single
-  candidate fixes `division=0`, out-of-range division asserts).
+  object between both ends; `DivisionMap` answers `allows`/`dst_options`/`src_options`
+  consistently with `pairs`; `slices_alike` is true on an ungated edge; `bridges`
+  returns only the copies priced for that pair; `timeline` order; execution chain
+  links and `contiguous`; `joins` follows `nest_pairs`; `tiling_segments` splits at
+  gaps and at untileable ops; node fixing rules (single candidate fixes
+  `division=0`, out-of-range division asserts).
 
 ### Stage 2. Builder
 
@@ -133,17 +168,22 @@ Notes:
   code that looks at the allocator classes. It encodes what is already known:
   - `resident=False` for excluded buffers, and for copies whose source does not choose
     a division or that no READ edge can use.
-  - READ edges (with `pairs` and `relayouts`) only between nodes that both choose a
-    division (this matches today's no-op `constrain_residency` on placement-only
-    wrappers).
-  - IN_PLACE edges with `pairs=None` when the child's division was fixed upstream.
+  - READ edges only between nodes that both choose a division (this matches today's
+    no-op `constrain_residency` on placement-only wrappers). `division_map` comes from
+    the consumer's `cd_parent_matches[src]`, `relayouts` from its
+    `cd_parent_relayouts[src]` filtered to groups with a copy in this solve.
+  - IN_PLACE edges with `division_map=None` when the child's division was fixed
+    upstream, otherwise the same `cd_parent_matches` entry.
   - RELAYOUT_COPY edges for live copies.
-  - `produced_at` from `uses[0]` for op outputs; `ExecutionEdge`s along the timeline.
+  - `produced_at` from `uses[0]` for op outputs; `ExecutionEdge`s along the timeline,
+    with `nest_pairs` from the two nodes' candidate `TileSpec.level_counts` (equal and
+    non-empty).
   - Edge order matches today's constraint order (READ by producer order, then
     RELAYOUT_COPY, then IN_PLACE), so model building stays deterministic.
 - Tests: for every synthetic graph, the edges must match what `_get_children`,
-  `_relayout_copies` and `in_place_parents` give today. This cross-check is deleted in
-  Stage 3 along with those helpers.
+  `_relayout_copies` and `in_place_parents` give today, and `nest_pairs` must agree
+  with `loop_id` equality from `_cut_literals`. These cross-checks are deleted in
+  Stages 3 and 4 along with those helpers.
 
 ### Stage 3. Solver reads relationships from the graph
 
@@ -154,21 +194,35 @@ Notes:
 - Delete `_get_children` and `_relayout_copies`. The wrappers still own the CP vars.
 - Equivalence diff must be empty.
 
-### Stage 4. Tiling on execution edges
+### Stage 4a. Tiling groups on execution edges
 
-- Per joinable `ExecutionEdge`: a `same_nest` and a `joined` literal (today's
-  `samenest_*` / `joined_*`), and the group id steps across the edge
-  (`group[after] = group[before] + 1 - joined`). Non-joinable edges start a new segment
-  with group 0.
-- `_tiling_group_ids` becomes a walk over `graph.tiling_segments()`. Its `uses[0]`
-  position logic and the `RelayoutCopyBuffer` check go away.
+- `_tile_execution_edge(model, edge, vars)` owns an edge's coarse-tiling encoding: a
+  `same_nest` and a `joined` literal (today's `samenest_*` / `joined_*`), and the group
+  id step across it (`group[after] = group[before] + 1 - joined`). A non-joinable edge
+  starts a new segment with group 0.
+- `same_nest` keeps today's `loop_id` equality encoding in this stage, so the CP model
+  is unchanged.
+- `_tiling_group_ids` becomes a walk over `graph.tiling_segments()` calling that
+  function per edge. Its `uses[0]` position logic and the `RelayoutCopyBuffer` check go
+  away.
 - `_cut_literals`: for each tiled node, the consumers on its READ edges in the same
-  segment get an `apart` literal over group ids, gated on `pairs`; a consumer outside
-  the segment, or a graph output, makes the node unshareable. Same rule as today, over
-  edges.
+  segment get an `apart` literal over group ids, gated on the edge's `division_map`; a
+  consumer outside the segment, or a graph output, makes the node unshareable. Same
+  rule as today, over edges.
 - `_tile_count_terms` iterates nodes.
 - Equivalence diff must be empty (run the coarse-tiling suites with
   `auto_coarse_tiling` on).
+
+### Stage 4b. `joined` from `nest_pairs`
+
+- `same_nest` becomes `_gate_divisions` over `edge.nest_pairs`, so the edge is the only
+  source of "these two ops can share a nest". `loop_id` and the nest interning in
+  `_cut_literals` go away; `tiled` comes from each node's untiled candidates directly.
+- Same constraints, different encoding, so CP-SAT may break ties differently. The
+  equivalence check for this stage: every ladder stage's objective is unchanged;
+  decisions may differ only where the objectives tie. Report solve times for the
+  coarse-tiling suites against Stage 4a; if they regress, drop this stage and keep
+  `nest_pairs` as a query for Phase 2.
 
 ### Stage 5. `_NodeVars`
 
@@ -186,11 +240,12 @@ Notes:
 
 ### Stage 6. Constraints per edge; delete the wrappers
 
-- `_constrain_residency(model, graph, vars)` runs per READ edge (slicing match, or a
-  resident copy from `relayouts`) and returns the served literals.
+- `_constrain_residency(model, graph, vars)` runs per READ edge (slicing match over
+  `division_map`, or a resident copy from `relayouts`) and returns the served
+  literals.
 - `_constrain_relayout_copies` runs per RELAYOUT_COPY edge (`priced`).
 - `_add_inplace_relaxation` gives each IN_PLACE edge a merge literal, with a division
-  gate only when `pairs is not None`.
+  gate only when `division_map is not None`.
 - `_add_no_overlap_2d` keeps its logic, now over `_NodeVars`.
 - `free_copies` (the presolve threshold) counts RELAYOUT_COPY edges whose source
   chooses a division.
@@ -204,9 +259,10 @@ Notes:
 - Parallelism, shape and tile-count terms come only from nodes with `division is None`.
   Constant terms cannot move the optimum, so a stage with no free terms is skipped.
   That removes the no-op re-solves a placement-only solve runs today.
-- This is the only Phase 1 stage meant to change what is observable: ladder objectives
-  shift by constants and fewer stages run. The equivalence diff for this stage compares
-  decisions only; objectives may differ by a constant per stage.
+- This is the one Phase 1 stage meant to change what is observable (4b may only break
+  ties differently): ladder objectives shift by constants and fewer stages run. The
+  equivalence diff for this stage compares decisions only; objectives may differ by a
+  constant per stage.
 
 ### Stage 8. Extract onto nodes; honour pre-fixed decisions
 
@@ -243,8 +299,8 @@ Kept unchanged through Phase 1: `_gate_divisions`, `_PlacementUnit`, `_justify`,
   test_restickify_cost_model, test_sa_cooptimizer, test_op_features,
   test_coarse_tiling, test_scratchpad_patterns, test_perm_layout_solver, plus
   test_buffer_graph from Stage 1.
-- Equivalence diff from Stage 0: empty, except Stage 7 as noted.
-- After Stages 4, 6 and 8: the device suites that compile through CP-SAT —
+- Equivalence diff from Stage 0: empty, except Stages 4b and 7 as noted.
+- After Stages 4a, 4b, 6 and 8: the device suites that compile through CP-SAT —
   test_scratchpad_use, test_work_division, test_solver_relayout_e2e,
   test_solver_auto_coarse_tiling — base vs change, same serial setup.
 - `pre-commit run --files <changed>` (ruff, mypy).
@@ -259,8 +315,10 @@ also its own PR, green on the full suite. Sized from the inventory:
   `plan_solver.py`) gains what the allocator's commit path reads: `in_place_parents`
   (→ IN_PLACE edges), `residency_reason` (→ `Graph.exclusions`), lifetime overrides,
   `lx_view`, `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with`
-  (greedy only). From the SA co-optimizer it gains `division_space`, `residency_edges`
-  and `tile_reads`; `op_position` is replaced by `produced_at`/execution edges. Sizes
+  (greedy only). From the SA co-optimizer it gains `division_space`; `residency_edges`
+  and `tile_reads` move onto READ edges (the geometry behind `division_map`, and
+  whether the consumer reads the producer tile by tile); `op_position` is replaced by
+  `produced_at`/execution edges. Sizes
   stay in bytes on the node and CP-SAT converts to units internally. `address` stays
   in bytes (every solver writes bytes today).
 - **2b. The allocator builds nodes and the graph** at its four build sites in
