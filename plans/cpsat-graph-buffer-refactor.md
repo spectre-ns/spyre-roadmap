@@ -872,12 +872,55 @@ constraints over small per-buffer domains, never per-pair tables.
       geometry (Phase 2c; SA already works lazily over `ResidencyEdge` through
       `_ViewRelation`, `sa_cooptimizer.py:614`) and `Lazy` division generation
       (`:378`).
+    - `BruteForce` — an exact oracle for small models. Like `Annealing` it records
+      what the strategy posts (rows, `OnlyEnforceIf`, element / table, products,
+      intervals, `AddNoOverlap2D`) and evaluates the constraints itself, with no
+      propagation and no other solver. `Solve` is a depth-first search over integer
+      assignments:
+      - variables ordered presence and division first, offsets last, since most
+        infeasibility shows up early and offsets have the largest domains;
+      - each constraint checked as soon as all its variables are assigned, and
+        partially where that is sound (a `≤` row with non-negative coefficients
+        already over its bound; two placed rectangles that overlap), pruning the
+        subtree;
+      - optional branch and bound: an optimistic objective bound per subtree,
+        pruned against the best feasible value so far.
+
+      It is exact by construction and trusts no solver, so it is the reference the
+      other backends are checked against. It is for tests only: a size guard
+      refuses models past a bound on the product of variable domains (roughly 20–25
+      binaries, offsets on a coarse grid).
+    - `Decomposed` — enumerates only the `Table` axes (the division menus) and solves
+      the rest of the model at each leaf with an inner backend (`CpSat`, `Annealing`,
+      or a placement heuristic). The model is posted once; each leaf fixes its
+      division choices through assumptions or domain changes, so nothing is rebuilt
+      per leaf. It is exact when the inner backend is `CpSat`, and it minimizes the
+      same `cost_expr` as every other backend (today's `ExhaustiveSearchSolver`
+      minimizes total HBM bytes). It generalizes `ExhaustiveSearchSolver.wrapping`
+      (3g).
+  - **Correctness ladder.** `BruteForce` is the ground truth on tiny models: unit tests
+    of each strategy's encodings (`Table` vs `Lazy` relations, the relayout closed
+    form inside a model, `apply_op_constraints`) and of each backend adapter. `CpSat`
+    must match it there, and is then the ground truth on real models. `Annealing`,
+    `Mip` and `Decomposed` are measured against `CpSat`.
   - **Gate.** Before `Mip` or `Annealing` is offered, replay the Phase 2.0 captures
     (`probes/cpsat-graph/deenum/`) through each: same optimum as `CpSat` where both
     prove one, plus solve time. The linearization cost is measured, not assumed. The
     SA side is prototyped in `probes/cpsat-graph/sa_ilp/`: `SaSolver` implements this
     interface, including `OnlyEnforceIf`, optional intervals and `AddNoOverlap2D` as a
     scored global constraint, next to a `cp_model` adapter with the same names.
+    Measured there (one builder, three backends): SA was feasible in 56/57 generic ILP
+    runs and all 108 2-D layout runs (independently verified). It reached the optimum
+    on LX residency in ~0.05 s and on 14/36 layout captures in ~0.15 s. It stalled
+    5–47% short on assignment-heavy and tightly packed layouts, so `CpSat` stays the
+    default and `Annealing` needs the graph's neighbourhood providers to compete.
+  - **Brute-force scope (probe first).** Prototype `BruteForce` in
+    `probes/cpsat-graph/sa_ilp/` behind the same interface. Cross-check it against
+    `CpSat` and SA on small generic ILPs and on tiny LX layouts with 2-D no-overlap
+    (a handful of buffers cut from the captures): same optimum as `CpSat` everywhere
+    both finish, and record the size where the guard bites. Then use it as the oracle
+    for the strategy unit tests above. `Decomposed` follows in 3g, once the allocator
+    is merged.
 - **3b. Node absorbs the allocator-only fields** (`in_place_parents` → IN_PLACE edges,
   `residency_reason` → `apply_op_constraints` reading the op, lifetime overrides,
   `lx_view`, `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with`
@@ -917,8 +960,9 @@ constraints over small per-buffer domains, never per-pair tables.
     backend reports it can realize (for example `Annealing` takes `Lazy` division and
     no pair tables), checked by the factory; an invalid combination is rejected at
     construction instead of branched on inside the allocator.
-    `ExhaustiveSearchSolver.wrapping` becomes a backend that iterates a `Table`
-    division axis around a placement-only search.
+    `ExhaustiveSearchSolver.wrapping` becomes the `Decomposed` backend (3a): it
+    enumerates the `Table` division axis around an inner backend and minimizes
+    `cost_expr`, not HBM bytes.
   - **Where `CoOptimizingAllocator`'s methods go.**
     - Candidates (`_division_map`, `_enumerate_core_divisions`, `_tiling_candidates`,
       `_division_space`) → the strategy producers behind the factory.
@@ -976,6 +1020,7 @@ take it from `TORCH_SPYRE`); compiling needs the Spyre card, replays do not.
 | Relayout pricing profile | `deenum/zoo_cprof.py` | where `_cd_parent_relayouts` spends its time | 2d |
 | SA as a generic backend | `sa_ilp/sa_solver.py`, `cpsat_backend.py`, `problems.py`, `run_probe.py` | whether a `pywraplp`-shaped interface can drive SCIP, CP-SAT and simulated annealing from one model builder; SA's gap on generic ILPs | 3a |
 | LX layout with 2-D no-overlap | `sa_ilp/lx_layout.py` | SA with a scored `AddNoOverlap2D` against CP-SAT on the real layout model from captures, with an independent feasibility check | 3a |
+| Brute-force oracle (planned) | `sa_ilp/` (to add) | an exact `BruteForce` backend behind the same interface, cross-checked against CP-SAT and SA on small ILPs and tiny LX layouts; the oracle for strategy unit tests | 3a |
 
 Typical runs:
 
