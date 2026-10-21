@@ -1,4 +1,4 @@
-runs/
+runs
 __pycache__/
 *.pkl
 *.jsonl
