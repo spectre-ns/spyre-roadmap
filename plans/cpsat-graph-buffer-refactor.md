@@ -25,10 +25,10 @@ Goal: model the solve as a graph.
   (`node.prev` / `node.next`). Coarse tiling is handled here: which division pairs run
   the same loop nest, whether the two ops join one tiling group, and where a group
   breaks.
-- **`Graph`** — owns the nodes and edges, and holds the global context (alignment,
-  LX capacity, exclusions, whether relayouts are priced). `graph.solve()` fills in
-  every free decision and returns the op-output nodes in execution order, which is
-  the execution plan.
+- **`Graph`** — a collection of nodes (which own the edges), plus the global context
+  (alignment, LX capacity, exclusions, whether relayouts are priced).
+  `graph.solve()` fills in every free decision and returns the op-output nodes in
+  execution order, which is the execution plan.
 
 The work is split into small stages. Each one lands as its own PR, leaves the full
 suite green, and gets an empty equivalence diff (see *Verification*), so if behaviour
@@ -133,10 +133,9 @@ class Graph:
     capacity: int                    # LX capacity in alignment units
     exclusions: dict[str, str]       # name -> residency_reason (record_exclusions)
     shuffles_priced: bool            # False under the fallback objective: copies pinned out
-    nodes: dict[str, ComputeNode]
-    edges: list[DependencyEdge]      # in the order the solver adds their constraints
+    nodes: dict[str, ComputeNode]    # insertion order = the order the factory made them
 
-    def edges_of(self, kind) -> Iterator[DependencyEdge]
+    def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes' outputs; no edge list
     def solve(self) -> list[ComputeNode]  # the public entry point: finalize, encode, solve,
                                           # fill every None field; op outputs in execution order
     def _finalize(self) -> None  # whole-graph derivations add_child/add_successor cannot do
@@ -155,7 +154,8 @@ Notes:
   live ops) it computes the `DivisionMap` itself, as `_cd_parent_matches` does today,
   and the priced `relayouts`, as `_cd_parent_relayouts` does. Graphs with no live ops
   (the synthetic and captured test graphs) pass `pairs` instead. Either way it puts the
-  one edge object on both ends and on the graph. Once the solve starts, only decision
+  one edge object on both ends: the source's `outputs` and the destination's `inputs`.
+  The graph keeps no edge list of its own. Once the solve starts, only decision
   fields change.
 - `add_child` and `add_successor` never compute anything that depends on another
   edge. What does is done once by `Graph._finalize()`, the first step of `solve()`:
@@ -176,8 +176,10 @@ Notes:
   that model is the CP-SAT model: a node creates its own decision vars when it is made,
   and each edge encodes its own constraints (`_gate_divisions` over
   `division_map.pairs`, the served literals over `relayouts`, the `joined` literal over
-  `nest_pairs`) through it. `Graph._encode()` walks the edges in today's constraint
-  order, so building the model stays deterministic. The edges' queries
+  `nest_pairs`) through it. `Graph._encode()` reaches the edges through the nodes: by
+  kind in today's order (READ, then RELAYOUT_COPY, then IN_PLACE), then nodes in
+  insertion order, then each node's `outputs` in the order they were added. That
+  reproduces today's constraint order, so building the model stays deterministic. The edges' queries
   (`slices_alike`, `bridges`, `joins`) need no model.
 - This interface stays inside the CP-SAT solve until the problem definition is unified
   (Phase 2a, `graph.set_solver(...)`). Only after that is it pushed out to the
@@ -225,7 +227,7 @@ Notes:
   `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`) stay as drafted.
 - Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline` from the draft.
 - Tests (`tests/inductor/test_buffer_graph.py`, no device): the factory's nodes share
-  one graph and model; `add_child` puts one edge object on both ends and the graph,
+  one graph and model; `add_child` puts one edge object on both ends (and nowhere else),
   and two edges of different kinds can join the same pair; `DivisionMap` answers `allows`/`dst_options`/`src_options`
   consistently with `pairs`; `slices_alike` is true on an ungated edge; `bridges`
   returns only the copies priced for that pair; `add_successor` links both ends, derives
@@ -337,7 +339,8 @@ Notes:
   - RELAYOUT_COPY: today's `_constrain_relayout_copies` over `priced`.
   - IN_PLACE: a merge literal, with a division gate only when `division_map is not
     None` (today's `_add_inplace_relaxation`).
-- `Graph._encode()` calls them in edge order; the three solver methods go away.
+- `Graph._encode()` calls them in that node-driven order; the three solver methods go
+  away.
 - `_add_no_overlap_2d` keeps its logic, now over the nodes.
 - `free_copies` (the presolve threshold) counts RELAYOUT_COPY edges whose source
   chooses a division.
