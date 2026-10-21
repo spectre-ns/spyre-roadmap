@@ -60,8 +60,14 @@ class DivisionMap:
     def dst_options(self, src_div: int) -> frozenset[int]  # consumer divisions that read src_div in place
     def src_options(self, dst_div: int) -> frozenset[int]  # producer divisions dst_div can read in place
 
+class GraphElement(ABC):
+    """Base of nodes and both edge types. Built piecewise; finalized and encoded only
+    once the whole graph exists."""
+    def _finalize(self) -> None             # derive what depends on the rest of the graph
+    def _encode(self, model) -> None        # post this element's vars / constraints
+
 @dataclass(eq=False)
-class DependencyEdge:
+class DependencyEdge(GraphElement):
     src: ComputeNode
     dst: ComputeNode
     kind: DependencyKind
@@ -73,7 +79,7 @@ class DependencyEdge:
     def bridges(self, src_div: int, dst_div: int) -> tuple[RelayoutRead, ...]  # copies that serve the pair
 
 @dataclass(eq=False)
-class ExecutionEdge:
+class ExecutionEdge(GraphElement):
     before: ComputeNode
     after: ComputeNode
     contiguous: bool  # produced on consecutive ticks (nothing outside the solve runs between)
@@ -86,7 +92,7 @@ class ExecutionEdge:
     def joins(self, before_div: int, after_div: int) -> bool  # same tiling group under this pair
 
 @dataclass(eq=False)
-class ComputeNode:                  # the node
+class ComputeNode(GraphElement):     # the node
     ... # name, size (units), start/end_time, spill_cost, boundary,
         # sym_core_divs, sym_tile_counts
     # Candidates: core_divisions[i] is a split across cores and core_divisions[i].tiling
@@ -110,7 +116,7 @@ class ComputeNode:                  # the node
     next: ExecutionEdge
 
     graph: Graph                    # set by the factory
-    model: cp_model.CpModel         # set by the factory; the node's decision vars live here
+    model: cp_model.CpModel         # set by the factory; empty until Graph._encode builds it
 
     def add_child(
         self,
@@ -126,7 +132,7 @@ class ComputeNode:                  # the node
 
 class NodeFactory:                  # one per solve; every node it makes shares graph and model
     def __init__(self, graph: Graph, model: cp_model.CpModel)
-    def node(self, buffer) -> ComputeNode  # makes the node and its decision vars in `model`
+    def node(self, buffer) -> ComputeNode  # makes the node only; no vars until the model is built
 
 class Graph:
     alignment: int
@@ -140,8 +146,8 @@ class Graph:
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes' outputs; no edge list
     def solve(self) -> list[ComputeNode]  # the public entry point: finalize, encode, solve,
                                           # fill every None field; op outputs in execution order
-    def _finalize(self) -> None  # whole-graph derivations add_child/add_successor cannot do
-    def _encode(self) -> None    # every edge posts its constraints into the shared model, in order
+    def _finalize(self) -> None  # every edge's _finalize, then every node's, then tiling segments
+    def _encode(self) -> None    # builds the model: every node's vars, then every edge's constraints
     def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
 ```
 
@@ -153,36 +159,40 @@ Notes:
   parent too). The solver iterates edges by kind, so there is no `isinstance` dispatch.
 - `parent.add_child(child, kind)` is the only way to add an edge. It ports the
   allocator's per-edge logic: with `geometry` (the `ResidencyEdge` built from the two
-  live ops) it computes the `DivisionMap` itself, as `_cd_parent_matches` does today,
-  and the priced `relayouts`, as `_cd_parent_relayouts` does. Graphs with no live ops
+  live ops) it computes the `DivisionMap` itself, as `_cd_parent_matches` does today.
+  The priced `relayouts` wait for finalization (below). Graphs with no live ops
   (the synthetic and captured test graphs) pass `pairs` instead. Either way it puts the
   one edge object on both ends: the source's `outputs` and the destination's `inputs`.
   The graph keeps no edge list of its own. Once the solve starts, only decision
   fields change.
-- `add_child` and `add_successor` never compute anything that depends on another
-  edge. What does is done once by `Graph._finalize()`, the first step of `solve()`:
-  1. Read counts: each node's `spill_cost` and the "no LX reader" exclusion
-     (`resident=False`).
-  2. Relayout capping: `_cap_relayout_groups` keeps any consumer division that another
-     parent already matches for free, so each child's priced relayouts are filled in
-     only once all its READ edges exist.
-  3. Relayout copies: a copy that no READ edge can use, or whose source does not
-     choose a division, is pinned out (`resident=False`).
-  4. Tiling segments: the maximal joinable chains along the execution edges.
-  5. Phase 2 only: lifetimes, once `end_time` comes from the last child instead of
-     the allocator.
+- Building is piecewise and does structure only: `add_child` and `add_successor`
+  never compute anything that depends on another edge, and nothing touches the model.
+  Everything else waits until all children are present. `Graph._finalize()`, the
+  first step of `solve()`, calls `_finalize` on every element, edges first, because
+  the node steps read the edges' results:
+  - `DependencyEdge._finalize` (READ): relayout capping. `_cap_relayout_groups` keeps
+    any consumer division that another parent already matches for free, so the priced
+    relayouts are derived here, with all of `dst.inputs` present.
+  - `ComputeNode._finalize`: read counts give `spill_cost` and the "no LX reader"
+    exclusion (`resident=False`). A relayout copy that no READ edge's relayouts use,
+    or whose source does not choose a division, is pinned out. In Phase 2, lifetimes
+    too, once `end_time` comes from the last child instead of the allocator.
+  - `ExecutionEdge._finalize`: nothing beyond checks in Phase 1 (`nest_pairs` and
+    `contiguous` are local to the two ends). The graph then derives tiling segments
+    from the chain.
 - `solve()` is the only public entry point after building: it runs `_finalize`,
   `_encode`, the objective ladder and extraction, and fills in every field that was
   `None`.
-- Nodes come from a `NodeFactory` and hold a reference to the shared model. In Phase 1
-  that model is the CP-SAT model: a node creates its own decision vars when it is made,
-  and each edge encodes its own constraints (`_gate_divisions` over
+- Nodes come from a `NodeFactory` and hold a reference to the shared model (the CP-SAT
+  model in Phase 1), but the model is built only after finalization, in
+  `Graph._encode()`. First every node's `_encode` creates its decision vars, then
+  every edge's `_encode` posts its constraints (`_gate_divisions` over
   `division_map.pairs`, the served literals over `relayouts`, the `joined` literal over
-  `nest_pairs`) through it. `Graph._encode()` reaches the edges through the nodes: by
-  kind in today's order (READ, then RELAYOUT_COPY, then IN_PLACE), then nodes in
-  insertion order, then each node's `outputs` in the order they were added. That
-  reproduces today's constraint order, so building the model stays deterministic. The edges' queries
-  (`slices_alike`, `bridges`, `joins`) need no model.
+  `nest_pairs`). Edges are reached through the nodes: by kind in today's order (READ,
+  then RELAYOUT_COPY, then IN_PLACE), then nodes in insertion order, then each node's
+  `outputs` in the order they were added. That reproduces today's constraint order,
+  so building the model stays deterministic. The edges' queries (`slices_alike`,
+  `bridges`, `joins`) need no model.
 - This interface stays inside the CP-SAT solve until the problem definition is unified
   (Phase 2a, `graph.set_solver(...)`). Only after that is it pushed out to the
   allocator.
@@ -233,8 +243,9 @@ Notes:
 
 ### Stage 1. Data model
 
-- In `scratchpad/buffer_graph.py`: `DependencyKind`, `DivisionMap`, `DependencyEdge`
-  (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`, `joinable`, `joins`),
+- In `scratchpad/buffer_graph.py`: `GraphElement`, `DependencyKind`, `DivisionMap`,
+  `DependencyEdge` (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`,
+  `joinable`, `joins`),
   `Graph` (context, `edges_of`, `tiling_segments`), `NodeFactory`, and the
   node gains `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`,
   `graph`/`model`, `add_child` taking `pairs` only (no `geometry` yet; see Stage 2b),
@@ -281,10 +292,11 @@ Notes:
 
 - `add_child(..., geometry=...)` derives the `DivisionMap` from the `ResidencyEdge`
   over the two nodes' `core_divisions` (the body of `_cd_parent_matches`), and
-  `Graph._finalize` derives the priced relayouts (the per-edge half of
-  `_cd_parent_relayouts` plus `_cap_relayout_groups`) and the read-count, copy and
-  segment steps. The in-place pairing the allocator does at `allocator.py:1552` moves
-  the same way. Until Stage 8 the builder calls `_finalize` itself.
+  `DependencyEdge._finalize` derives the priced relayouts (the per-edge half of
+  `_cd_parent_relayouts` plus `_cap_relayout_groups`); `ComputeNode._finalize` does
+  the read-count and copy steps. The in-place pairing the allocator does at
+  `allocator.py:1552` moves the same way. Until Stage 8 the builder calls
+  `Graph._finalize` itself.
 - The builder passes `geometry` wherever the consumer's `residency_edges` has the
   parent, and `pairs` from `cd_parent_matches` otherwise.
 - The allocator keeps computing its tables in Phase 1 (they are still the external
@@ -304,7 +316,8 @@ Notes:
 
 ### Stage 4a. Tiling groups on execution edges
 
-- `_tile_execution_edge(model, edge, vars)` owns an edge's coarse-tiling encoding: a
+- One per-edge function owns an execution edge's coarse-tiling encoding (it becomes
+  `ExecutionEdge._encode` in Stage 6, once the wrappers are gone): a
   `same_nest` and a `joined` literal (today's `samenest_*` / `joined_*`), and the group
   id step across it (`group[after] = group[before] + 1 - joined`). A non-joinable edge
   starts a new segment with group 0.
@@ -334,7 +347,7 @@ Notes:
 
 ### Stage 5. Nodes own their vars
 
-- `NodeFactory.node` creates the node's decision vars in its `model`, replacing the
+- `ComputeNode._encode(model)` creates the node's decision vars, replacing the
   variable-making half of both wrappers. A free field gets a CP var; a fixed one gets
   a constant:
   - `division` → `new_constant(k)` with constant `eff_size`/`cores`/`core_cost`/
@@ -349,7 +362,7 @@ Notes:
 
 ### Stage 6. Edges encode themselves; delete the wrappers
 
-- `DependencyEdge.encode()` posts its constraints through `src.model`, by kind:
+- `DependencyEdge._encode(model)` posts its constraints, by kind:
   - READ: slicing match over `division_map`, or a resident copy from `relayouts`; the
     served literals are kept on the edge.
   - RELAYOUT_COPY: today's `_constrain_relayout_copies` over `priced`.
