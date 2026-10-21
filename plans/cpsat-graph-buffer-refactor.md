@@ -35,10 +35,10 @@ Goal: model the solve as a graph.
   (`node.prev` / `node.next`). Coarse tiling is handled here: whether the two ops run
   the same loop nest (`NestRelation`), whether they join one tiling group, and where a
   group breaks.
-- **`Graph`** — a collection of nodes (which own the edges), plus the global context
-  (alignment, LX capacity). `graph.solve(model, cost_expr)` fills in every
-  free decision and returns the op-output nodes in execution order, which is the
-  execution plan.
+- **`SpyreOptimizationGraph`** — a collection of nodes (which own the edges), plus the
+  global context (alignment, LX capacity). `graph.solve(model, cost_expr)` fills in
+  every free decision and returns the op-output nodes in execution order, which is
+  the execution plan.
 
 Three phases, each stage its own PR that leaves the full suite green:
 
@@ -89,8 +89,8 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
    not a buffer type: it posts constants (or nothing) where an open axis posts vars.
 4. **Build structure, then finalize once.** `add_node` / `add_child` / `add_successor`
    wire the graph and touch no model. `solve(model, cost_expr)` calls
-   `Graph._finalize(model)`, where every element posts its vars and constraints in a
-   fixed order.
+   `SpyreOptimizationGraph._finalize(model)`, where every element posts its vars and
+   constraints in a fixed order.
 5. **Enumeration is a polymorphic strategy, per decision axis.** Each axis of a node
    (core division, coarse tiling, residency, offset; relayout choice per READ edge)
    has an `Enumeration` with `realize(model, node)` (post the axis's vars and legality)
@@ -199,7 +199,7 @@ class ComputeNode(GraphElement):
     def add_successor(self, after: ComputeNode) -> ExecutionEdge
                                              # the only way to add an execution edge
 
-class Graph:
+class SpyreOptimizationGraph:
     alignment: int
     capacity: int                            # LX capacity in alignment units
     nodes: dict[str, ComputeNode]            # add_node order = today's var order
@@ -300,8 +300,8 @@ Notes:
 ### Stage 1. Data model
 
 - Rename the draft (`CoreDivisionBoundBuffer` → `ComputeNode`, `BufferGraph` →
-  `Graph`, `build_buffer_graph` → `build_graph`) and reshape it into the graph above.
-  Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
+  `SpyreOptimizationGraph`, `build_buffer_graph` → `build_graph`) and reshape it into
+  the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
 - The supporting types, data and queries only (no solver methods yet):
 
   ```python
@@ -352,8 +352,8 @@ Notes:
 
 ### Stage 2. Builder
 
-- `build_graph(buffers, alignment, capacity)` makes the `Graph` and, for each
-  allocator buffer (`LifetimeBoundBuffer`, `CoreDivisionBuffer` or
+- `build_graph(buffers, alignment, capacity)` makes the `SpyreOptimizationGraph` and,
+  for each allocator buffer (`LifetimeBoundBuffer`, `CoreDivisionBuffer` or
   `RelayoutCopyBuffer`) in the allocator's order, a `NodeSpec` and one `add_node`
   with the default factory's strategies (`Table` of its `core_divisions`; an empty
   menu means placement-only and gets `Fixed(COMMITTED)`). Then it adds the edges
@@ -401,7 +401,8 @@ Notes:
 
 ### Stage 3. Solver reads relationships from the graph
 
-- `_plan_layout_generic` builds the `Graph` next to the existing wrappers.
+- `_plan_layout_generic` builds the `SpyreOptimizationGraph` next to the existing
+  wrappers.
 - `_get_children` → `node.outputs` of kind READ; `_relayout_copies` →
   `graph.edges_of(RELAYOUT_COPY)`; the `in_place_parents` loop in
   `_add_inplace_relaxation` → each node's IN_PLACE `inputs`.
@@ -454,8 +455,8 @@ Notes:
     kept on the edge.
   - RELAYOUT_COPY: today's `_constrain_relayout_copies` over `priced`.
 - `ExecutionEdge._finalize(model)` takes over the Stage 4 function; capacity,
-  no-overlap, exclusion pins, cuts and tile counts move into `Graph._finalize`, all in
-  the order listed under *The model*.
+  no-overlap, exclusion pins, cuts and tile counts move into
+  `SpyreOptimizationGraph._finalize`, all in the order listed under *The model*.
 - `free_copies` (presolve threshold) keeps today's rule: every copy whose parent
   chooses a division.
 - Delete `_LifetimeBufferWithCpVars`, `_CoreDivisionBufferWithCpVars`, `_wrap`,
