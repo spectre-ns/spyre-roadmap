@@ -170,6 +170,27 @@ def analyse_edge(e, final_pairs, menu_sizes):
         and key(ptc[i], prule_t) == key(ctc[j], crule_t)
     ]
     res["lazy_exact"] = sorted(pred) == sorted(map(tuple, final_pairs))
+
+    # Candidates with no usable view (or tile view): the gate must forbid them. A
+    # producer whose only reason is a split reduction axis is already covered by
+    # the "reduction split == 1" constraint; anything else needs the side's table.
+    def unexplained(keys, tkeys, cands, producer):
+        out = []
+        for k, t, c in zip(keys, tkeys, cands):
+            if k is None or t is None:
+                red = producer and k is None and t is not None and any(
+                    c["splits"].get(s, 1) > 1 for s in c["red"]
+                )
+                if not red:
+                    out.append(True)
+                    continue
+            out.append(False)
+        return out
+
+    pu = unexplained(pk, pt, e["pc"], True)
+    cu = unexplained(ck, ct, e["cc"], False)
+    res["p_ok"] = [i for i in range(len(pk)) if pk[i] is not None and pt[i] is not None] if any(pu) else None
+    res["c_ok"] = [j for j in range(len(ck)) if ck[j] is not None and ct[j] is not None] if any(cu) else None
     return res
 
 
@@ -336,20 +357,27 @@ class Builder:
                     continue
                 info = self.edges_info.get((parent, b.name))
                 if info is None or not info.get("lazy_exact"):
-                    # fallback: a table over the two split tuples
+                    # fallback: a table over the two (split, tile) tuples
                     pm, cm = self.menu(pb), self.menu(b)
-                    ps, cs = p["syms"], c["syms"]
-                    tuples = [
-                        [pm[i].splits.get(_sym(pm[i], s), 1) for s in ps]
-                        + [cm[j].splits.get(_sym(cm[j], s), 1) for s in cs]
-                        for i, j in pairs
-                    ]
-                    m.add_allowed_assignments(
-                        [p["split"][s] for s in ps] + [c["split"][s] for s in cs], tuples
-                    ).only_enforce_if(p["in"])
+
+                    def tup(cd, v):
+                        tiles = dict((str(k), n) for k, n in cd.tile_splits)
+                        return [cd.splits.get(_sym(cd, s), 1) for s in v["syms"]] + [
+                            tiles.get(t, 1) for t in v["tsyms"]
+                        ]
+
+                    def vars_of(v):
+                        return [v["split"][s] for s in v["syms"]] + [v["tile"][t] for t in v["tsyms"]]
+
+                    tuples = [tup(pm[i], p) + tup(cm[j], c) for i, j in pairs]
+                    m.add_allowed_assignments(vars_of(p) + vars_of(c), tuples).only_enforce_if(p["in"])
                     stats["table"] += 1
                     continue
                 stats["lazy"] += 1
+                if info.get("p_ok") is not None:
+                    self.post_usable(p, self.menu(pb), info["p_ok"])
+                if info.get("c_ok") is not None:
+                    self.post_usable(c, self.menu(b), info["c_ok"], en=p["in"])
                 self.post_lazy_gate(p, c, info["parent_rule"], info["consumer_rule"])
                 self.post_tile_gate(p, c, info["parent_tile_rule"], info["consumer_tile_rule"])
         return stats
@@ -384,6 +412,21 @@ class Builder:
         self.m.add(out == n).only_enforce_if(any_live)
         self.m.add(out == 1).only_enforce_if(~any_live)
         return out
+
+    def post_usable(self, v, menu, ok, en=None):
+        """Per-view table: the side's split/tile tuple must be one whose view exists."""
+        syms, tsyms = v["syms"], v["tsyms"]
+        tuples = [
+            [menu[i].splits.get(_sym(menu[i], s), 1) for s in syms]
+            + [dict((str(k), n) for k, n in menu[i].tile_splits).get(t, 1) for t in tsyms]
+            for i in ok
+        ]
+        vars_ = [v["split"][s] for s in syms] + [v["tile"][t] for t in tsyms]
+        lit = v["in"] if en is None else en
+        if tuples:
+            self.m.add_allowed_assignments(vars_, tuples).only_enforce_if(lit)
+        else:
+            self.m.add(lit == 0)
 
     def post_tile_gate(self, p, c, prule, crule):
         """Tile keys equal: same tile count and per-dim (count, stride)."""
