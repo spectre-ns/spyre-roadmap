@@ -36,7 +36,7 @@ Goal: model the solve as a graph.
   the same loop nest (`NestRelation`), whether they join one tiling group, and where a
   group breaks.
 - **`Graph`** — a collection of nodes (which own the edges), plus the global context
-  (alignment, LX capacity, exclusions). `graph.solve(model, cost_expr)` fills in every
+  (alignment, LX capacity). `graph.solve(model, cost_expr)` fills in every
   free decision and returns the op-output nodes in execution order, which is the
   execution plan.
 
@@ -72,10 +72,21 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
    include extern and placement-only readers), lifetimes and their overrides, and
    exclusions all come in as data. Moving any derivation out of the allocator is
    Phase 2/3 work with its own agreement test.
-3. **`None` means an open decision.** `assignment`, `resident`, `offset` only.
-   Structural fields are never `Optional`. "Fixed" is a strategy on a decision axis,
-   not a buffer type: an axis whose strategy is `Fixed` has its value before the solve
-   and posts constants (or nothing) where an open one posts vars.
+3. **`None` means an open decision.** A node has three decisions: `assignment` (core
+   division and tiling), `resident` and `offset`. Each is either open (`None`; the
+   solver decides) or fixed before the solve by its axis's `Fixed` strategy. Decisions
+   are fixed in exactly three places:
+   - **At construction, by the node's own checks.** Restrictions that apply to a kind
+     of node fix `resident=False` with a reason, so the node is out of LX before the
+     solve (today's `residency_reason`s: no LX reader, partial-reduction write,
+     unrepresentable view, and so on). In Phase 1 the checks take the allocator's
+     reason as given (rule 2); in Phase 3 they run in the node.
+   - **At construction, by the builder:** a placement-only buffer's division is
+     `Fixed(COMMITTED)`.
+   - **By the caller** (Stage 8): pinned `assignment`, `resident` or `offset`.
+
+   Structural fields are never `Optional`. `Fixed` is a strategy on a decision axis,
+   not a buffer type: it posts constants (or nothing) where an open axis posts vars.
 4. **Build structure, then finalize once.** `add_node` / `add_child` / `add_successor`
    wire the graph and touch no model. `solve(model, cost_expr)` calls
    `Graph._finalize(model)`, where every element posts its vars and constraints in a
@@ -176,7 +187,6 @@ class ComputeNode(GraphElement):
 class Graph:
     alignment: int
     capacity: int                            # LX capacity in alignment units
-    exclusions: dict[str, str]               # name -> residency_reason
     nodes: dict[str, ComputeNode]            # add_node order = today's var order
     head: Sentinel                           # chain ends; not in nodes, no vars,
     tail: Sentinel                           # never returned by solve()
@@ -220,7 +230,9 @@ Notes:
      at-most-one over each node's incoming and outgoing merges.
   3. **Capacity** per node (`offset + eff_size <= M`) and the **2-D no-overlap**
      (with the incoming-merge tick shortening).
-  4. **Exclusion pins** (`resident=False` from `Graph.exclusions`).
+  4. **Exclusion pins**: `resident=False` for every node whose residency was fixed
+     at construction. A `Fixed(False)` residency still makes its literal in step 1 and
+     posts the pin here, which is today's order.
   5. **READ edges**: parent order, then child order, then the child's `parents`
      order; served literals in sorted relayout-group order (`:440`).
   6. **RELAYOUT_COPY edges** in copy-node order, including today's copy pins (source
@@ -295,8 +307,8 @@ Notes:
   @dataclass(frozen=True)
   class Enumerations:                  # a node's strategy per axis
       division: Enumeration            # carries tiling too while it is a Table
-      residency: Enumeration           # open; exclusions stay on Graph.exclusions and
-                                       # are pinned at step 4, today's order
+      residency: Enumeration           # Fixed(False, reason) when a construction
+                                       # check excludes the node; else open
       offset: Enumeration
 
   class EnumerationFactory:            # validates the config, picks strategies
@@ -335,8 +347,9 @@ Notes:
   - IN_PLACE edges with `view=None` when the child's division was fixed upstream,
     otherwise the same table.
   - RELAYOUT_COPY edges for the allocator's copies, in its order.
-  - `read_count`, lifetimes and overrides, `spill_cost` inputs and `Graph.exclusions`
-    as given.
+  - `read_count`, lifetimes and overrides and `spill_cost` inputs as given; each
+    buffer's `residency_reason` becomes its node's construction check result
+    (`Fixed(False, reason)` residency).
   - `produced_at` from `uses[0]` for op outputs (today's filter: has `uses`, not
     `first_use_is_read`, not a copy), then `add_successor` in `produced_at` order;
     each `NestRelation` table comes from the two nodes' candidate
@@ -646,7 +659,7 @@ constraints over small per-buffer domains, never per-pair tables.
   `ResidencyEdge` through `_ViewRelation`, `sa_cooptimizer.py:614`, and generates
   divisions, `:378`), which Phase 2c provides.
 - **3b. Node absorbs the allocator-only fields** (`in_place_parents` → IN_PLACE edges,
-  `residency_reason` → `Graph.exclusions`, lifetime overrides, `lx_view`,
+  `residency_reason` → the node's construction checks, lifetime overrides, `lx_view`,
   `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with` (greedy only),
   `division_space` → `Lazy` division; `residency_edges` and `tile_reads` → relations;
   `op_position` → `produced_at`). Sizes stay in alignment units on the node as the draft
