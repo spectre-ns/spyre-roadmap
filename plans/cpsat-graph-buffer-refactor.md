@@ -873,10 +873,11 @@ constraints over small per-buffer domains, never per-pair tables.
   It replaces the allocator's buffer construction at `_build_bound_buffers`
   (:1456/:1497), `_append_lx_relayout_destinations` (:1819), `_build_cd_bound_buffers`
   (:4074/:4275) and `_relayout_copy_buffers` (:4418), so no intermediate buffer is
-  built at all; the buffer form of `add_node` stays for tests and capture replay. The allocator's
-  three `RelayoutCopyBuffer` checks (:2769, :2964, :3099) become relayout-layout lookups
-  and the drain-plan `CoreDivisionBuffer` assertion (:713) a node check.
-  `cd_parent_matches` / `cd_parent_relayouts` are deleted only once 2c/2d replace them.
+  built at all; the buffer form of `add_node` stays for tests and capture replay. The
+  allocator's three `RelayoutCopyBuffer` checks (:2769, :2964, :3099) become
+  relayout-layout lookups and the drain-plan `CoreDivisionBuffer` assertion (:713) a
+  node check. `cd_parent_matches` / `cd_parent_relayouts` are deleted only once 2c/2d
+  replace them.
 - **3d. Placement-only solvers** (greedy, first-fit/best-fit, SA, cooling_schedules,
   utils.plot_buffers) swap the type; greedy drops its isinstance at :183.
 - **3e. Exhaustive search and the SA co-optimizer** read relations from edges and
