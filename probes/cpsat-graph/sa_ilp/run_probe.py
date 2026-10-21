@@ -47,16 +47,20 @@ def run_exact(backend, build, seed, limit_s):
     )
 
 
-def run_sa(build, seed, sa_seed, limit_s):
+def run_sa(build, seed, sa_seed, limit_s, target=None):
     s = SaSolver(seed=sa_seed)
     build(s, random.Random(seed))
     s.SetTimeLimit(int(limit_s * 1000))
+    if target is not None:
+        s.SetTarget(target)
     st = s.Solve()
     return dict(
         status=STATUS.get(st, str(st)),
         obj=s.Objective().Value(),
         wall=s.WallTime() / 1000,
         time_to_best=s.stats.get("time_to_best"),
+        target=target,
+        reached_target=s.stats.get("reached_target"),
         iterations=s.stats.get("iterations"),
         vars=s.NumVariables(),
         rows=s.NumConstraints(),
@@ -72,16 +76,20 @@ def main():
         for name, build, seed in problems.instances():
             if filt and filt not in name:
                 continue
+            target = None
             for backend in ("SCIP", "CP_SAT"):
                 r = run_exact(backend, build, seed, ex_s)
+                if r["status"] == "OPTIMAL" and target is None:
+                    target = r["obj"]  # SA stops on reaching the proven optimum
                 f.write(json.dumps(dict(instance=name, solver=backend, **r)) + "\n")
                 f.flush()
                 print(name, backend, r["status"], r["obj"], f"{r['wall']:.2f}s", flush=True)
             for sa_seed in (0, 1, 2):
-                r = run_sa(build, seed, sa_seed, sa_s)
+                r = run_sa(build, seed, sa_seed, sa_s, target)
                 f.write(json.dumps(dict(instance=name, solver=f"SA.{sa_seed}", **r)) + "\n")
                 f.flush()
-                print(name, f"SA.{sa_seed}", r["status"], r["obj"], f"ttb={r['time_to_best']}", flush=True)
+                print(name, f"SA.{sa_seed}", r["status"], r["obj"], f"target={target}",
+                      f"reached={r['reached_target']}", f"ttb={r['time_to_best']}", flush=True)
 
 
 if __name__ == "__main__":

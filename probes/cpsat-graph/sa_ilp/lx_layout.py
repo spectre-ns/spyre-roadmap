@@ -96,9 +96,12 @@ def main():
                 continue
             arms = [("CPSAT", CpSatProtocol(workers=16), cp_s)]
             arms += [(f"SA.{k}", SaSolver(seed=k), sa_s) for k in (0, 1, 2)]
+            target, target_kind = None, None
             for arm, s, limit_s in arms:
                 pres, offs = build(s, limit, bufs)
                 s.SetTimeLimit(int(limit_s * 1000))
+                if arm.startswith("SA") and target is not None:
+                    s.SetTarget(target)  # stop on reaching CP-SAT's best (proven or not)
                 st = s.Solve()
                 ok = st in (s.FEASIBLE, getattr(s, "OPTIMAL", -1))
                 rec = dict(
@@ -111,8 +114,12 @@ def main():
                     p = {k: round(s.Value(v)) for k, v in pres.items()}
                     o = {k: round(s.Value(v)) for k, v in offs.items()}
                     rec["verified"] = verify(limit, bufs, p, o)
+                if arm == "CPSAT" and ok:
+                    target, target_kind = rec["obj"], rec["status"]
                 if arm.startswith("SA"):
                     rec["time_to_best"] = s.stats.get("time_to_best")
+                    rec.update(target=target, target_kind=target_kind,
+                               reached_target=s.stats.get("reached_target"))
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 print(name, arm, rec["status"], rec["obj"], rec.get("verified"), f"{rec['wall']:.2f}s", flush=True)

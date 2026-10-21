@@ -328,6 +328,7 @@ class SaSolver:
         self._best_obj_value = None
         self._wall = 0.0
         self.stats = {}
+        self.target = None  # stop once the best feasible objective reaches this
 
     # ---- modeling API ----------------------------------------------------
     def IntVar(self, lb, ub, name=""):
@@ -378,6 +379,11 @@ class SaSolver:
 
     def SetTimeLimit(self, ms):
         self.time_limit_s = ms / 1000.0
+
+    def SetTarget(self, value):
+        """Stop as soon as a feasible assignment reaches ``value`` (in the user's
+        objective units and sense), e.g. a proven optimum from another backend."""
+        self.target = value
 
     def WallTime(self):
         return int(self._wall * 1000)
@@ -495,8 +501,13 @@ class SaSolver:
 
         deadline = t0 + self.time_limit_s
         rng = self.rng
+        # internal objective is sense * (user objective - const); target likewise
+        goal = None if self.target is None else self.sense * (self.target - self.obj.const)
         while True:
             it += 1
+            if goal is not None and best_obj <= goal + 1e-9:
+                self.stats["time_to_target"] = self.stats.get("time_to_best")
+                break
             if (it & 255) == 0:
                 if time.perf_counter() >= deadline:
                     break
@@ -563,7 +574,11 @@ class SaSolver:
                 new = rng.randint(lb[i], ub[i])
             try_move(i, new)
         self._wall = time.perf_counter() - t0
-        self.stats.update(iterations=it, accepted=accepted)
+        self.stats.update(
+            iterations=it,
+            accepted=accepted,
+            reached_target=goal is not None and best_obj <= goal + 1e-9,
+        )
         if best_x is None:
             self._best_obj_value = None
             return self.NOT_SOLVED
