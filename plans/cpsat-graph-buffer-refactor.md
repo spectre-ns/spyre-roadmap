@@ -103,11 +103,11 @@ class ComputeNode:                  # the node
     @property
     def tileable(self) -> bool      # some candidate tiling is not untiled
 
-    produced_at: Optional[int]      # tick of the producing write; None for inputs and copies
+    produced_at: int                # tick of the producing write
     inputs: list[DependencyEdge]
     outputs: list[DependencyEdge]
-    prev: Optional[ExecutionEdge]
-    next: Optional[ExecutionEdge]
+    prev: ExecutionEdge             # always linked: the chain runs graph.head -> ... -> graph.tail
+    next: ExecutionEdge
 
     graph: Graph                    # set by the factory
     model: cp_model.CpModel         # set by the factory; the node's decision vars live here
@@ -134,6 +134,8 @@ class Graph:
     exclusions: dict[str, str]       # name -> residency_reason (record_exclusions)
     shuffles_priced: bool            # False under the fallback objective: copies pinned out
     nodes: dict[str, ComputeNode]    # insertion order = the order the factory made them
+    head: ComputeNode                # boundary sentinels closing the execution chain;
+    tail: ComputeNode                # edges to them are never joinable
 
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes' outputs; no edge list
     def solve(self) -> list[ComputeNode]  # the public entry point: finalize, encode, solve,
@@ -189,9 +191,20 @@ Notes:
 - Every division index on an edge (`DivisionMap.pairs`, `nest_pairs`, `relayouts`) is
   an index into the end node's `core_divisions`, so a pair fixes both the core split
   and the coarse tiling of each end.
+- `Optional` / `None` on a node means exactly one thing: an open decision that
+  `solve()` fills (`division`, `resident`, `offset`). Structural fields (`produced_at`,
+  `prev`, `next`, the edge lists) are never `Optional`, since execution order is fixed
+  in this plan.
 - `add_child` records data dependencies; `add_successor` records execution order. The
-  order is a single chain: `add_successor` asserts that `self.next` and `after.prev`
-  are both unset, so an op cannot be inserted between two linked ones later.
+  order is a single chain from `graph.head` to `graph.tail`: `add_successor` refuses
+  to relink a node that already has a successor or predecessor, so an op cannot be
+  inserted between two linked ones later, and `_finalize` asserts the chain is
+  complete.
+- Open: graph inputs and relayout copies have no slot of their own in the op order
+  today. An input's clone-in happens at its first use, and a copy's shuffle is
+  scheduled directly before its first consumer, but only if the solve keeps the copy.
+  How they get `produced_at`/`prev`/`next` without an `Optional` is being decided on
+  the PR.
   `contiguous` is derived as today (consecutive `produced_at` ticks), so a gap still
   splits a tiling segment even when the two nodes are linked.
 - Out of scope: solver-chosen op order. Execution order is an input to this plan
