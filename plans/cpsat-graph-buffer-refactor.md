@@ -201,9 +201,9 @@ class DependencyEdge:
 
 @dataclass(eq=False)
 class ExecutionEdge:
-    before: ResourceNode | Sentinel
-    after: ResourceNode | Sentinel
-    contiguous: bool                         # consecutive ticks; False at a sentinel
+    before: ResourceNode
+    after: ResourceNode
+    contiguous: bool                         # consecutive ticks
     nest: NestRelation
 
     @property
@@ -213,18 +213,12 @@ class ExecutionEdge:
 @dataclass(eq=False)
 class Produced:                              # written by an op in the solve
     produced_at: int                         # tick of the producing write
-    prev: ExecutionEdge = field(init=False)  # set by add_successor; always linked:
-    next: ExecutionEdge = field(init=False)  # graph.head -> ... -> graph.tail
+    prev: Optional[ExecutionEdge] = None     # set by add_successor; None at the
+    next: Optional[ExecutionEdge] = None     # first / last op of the chain
 
 @dataclass(frozen=True)
 class GraphInput:                            # no producing op; not on the chain
     first_read: int                          # tick of its first read (clone-in)
-
-@dataclass(eq=False)
-class Sentinel:                              # graph.head / graph.tail
-    name: str                                # no vars, not in nodes, never tileable
-    edge: Optional[ExecutionEdge] = None     # its one execution edge
-    tileable: ClassVar[bool] = False
 
 @dataclass(eq=False)
 class RelayoutLayout:
@@ -292,8 +286,7 @@ class SpyreOptimizationGraph:
     alignment: int
     capacity: int                            # LX capacity in alignment units
     nodes: dict[str, ResourceNode]            # add_node order = today's var order
-    head: Sentinel                           # chain ends; never returned by solve()
-    tail: Sentinel
+    first: Optional[ResourceNode]            # start of the execution chain
 
     def add_node(
         self, source: LifetimeBoundBuffer | torch._inductor.ir.Operation
@@ -344,9 +337,10 @@ Notes:
 - A pair of nodes can share more than one edge (an in-place child usually reads its
   parent too). The solver iterates edges by kind, so there is no `isinstance` dispatch.
 - `add_child` puts the one edge object on both ends and nowhere else; the graph keeps
-  no edge list. `add_successor` links one chain from `graph.head` to `graph.tail` and
-  refuses to relink a node that already has a neighbour; `_finalize` asserts the chain
-  is complete. `contiguous` is derived as today (consecutive `produced_at` ticks).
+  no edge list. `add_successor` links one chain, starting at `graph.first`, and refuses
+  to relink a node that already has a neighbour; `_finalize` asserts every `Produced`
+  node is on it. The chain ends have no edge (`prev` / `next` is `None`), which the
+  coarse-tiling walk treats like a non-joinable edge. `contiguous` is derived as today (consecutive `produced_at` ticks).
 - A missing match entry is an **empty** `Pairs`, never `None`: today
   `.get(parent, [])` (`ilp_solver_ortools.py:410`) gives an empty table, which
   `_gate_divisions` turns into its enforcement literal forced false: the residency
@@ -535,7 +529,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   relation queries (`holds`, `bridges`, `joins`) agree with their tables, and an empty
   table never holds; `add_successor` links both ends, derives `contiguous`, and refuses
   a second neighbour; `joinable` is false across a tick gap and at untileable ops;
-  sentinels are not in `nodes`; `tiling` is `None` while `assignment` is; `joins`
+  the chain ends have `prev` / `next` `None`; `tiling` is `None` while `assignment` is; `joins`
   agrees with `loop_id` equality ∧ `tiled[after]`.
 
 ### Stage 2. Builder
@@ -567,8 +561,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
     `apply_op_constraints` to apply and Stage 8 to write back as `spill_reason`.
   - Origins: `Produced(uses[0])` for op outputs (today's filter: has `uses`, not
     `first_use_is_read`, not a copy), `GraphInput(uses[0])` for graph inputs; then
-    `add_successor` from `graph.head` over the `Produced` nodes in `produced_at` order
-    to `graph.tail`.
+    `add_successor` over the `Produced` nodes in `produced_at` order, with
+    `graph.first` the earliest.
 - Tests, while the functions still exist: on every corpus graph IN_PLACE edges equal
   `in_place_parents`, READ edges equal `_get_children` restricted to pairs where both
   ends are in the solve and have a menu, and the layouts equal `_relayout_copies`.
@@ -616,8 +610,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   segment with group 0. `same_nest` keeps today's `loop_id` encoding, `tile_group_*`
   keeps its domain, and `loop_id`/`tiled` are still made first, for every buffer with
   a menu (copies included, last), in today's order.
-- `_tiling_group_ids` becomes a walk along the execution chain, starting a new segment
-  wherever an edge is not `joinable`; the segments are local to the coarse-tiling
+- `_tiling_group_ids` becomes a walk along the execution chain from `graph.first`,
+  starting a new segment at the first op and wherever an edge is not `joinable`; the segments are local to the coarse-tiling
   encoding (in `Strategy.apply_coarse_tiling` from Stage 6), not a graph method. Its
   `uses[0]` logic and `RelayoutCopyBuffer` check go away.
 - `_cut_literals`: for each tiled node, consumers on its READ edges in the same segment
