@@ -10,13 +10,23 @@ below decides the same question from the digits alone:
 1. domain: C_dst >= C_src, C_src | C_dst, each key's core count equals its
    domain, the source split product equals C_src; equal domains with identical
    keys are not a relayout;
-2. source slices distinct: sorted by stride, source digits are an exact mixed
-   radix (stride_k = product of the factors before it);
-3. destination covered evenly: sorted by stride, each stride is a multiple of
-   the previous digit's range (gaps are replication) and C_dst is a multiple of
-   the top digit's range; the destination split product divides C_dst;
+2. source slices distinct: the view's core -> slot map is a bijection onto its
+   slices;
+3. destination covered: the view's map reaches every slice (each the same
+   number of times when the domains are equal); the destination split product
+   divides C_dst.
+
+2 and 3 are properties of one view, not of the pair: evaluated over at most 32
+cores and cached per view, they are a small per-node table. For views
+``core_to_slice_mapping`` produces (prefix-product strides, replication gaps)
+they reduce to "exact mixed radix" and "nested strides with gaps", but coprime
+or overlapping strides can also be bijective, so the general form is the map
+itself;
 4. per device dim, one factor divides the other (uniform overlaps); then
-   fan-in = prod max(1, f_src / f_dst) and the larger-domain rule is fan-in 1;
+   fan-in = prod max(1, f_src / f_dst), fan-out = prod max(1, f_dst / f_src) *
+   (C_dst / split_dst); the larger-domain rule is fan-in 1 and, for each source
+   slice, the destination slices nested in it replicated C_dst / C_src times in
+   total (a function of the destination view and the source's factors);
 5. fan-in <= 8.
 """
 
@@ -32,6 +42,18 @@ MAX_FANIN = 8
 
 def digits(key):
     return sorted((tuple(d) for d in key[1]), key=lambda d: d[2])
+
+
+_SLICES: dict = {}
+
+
+def slices(key):
+    """Each core's slot tuple under the view's digits (cached per view)."""
+    k = (key[0], tuple(tuple(d) for d in key[1]))
+    if k not in _SLICES:
+        c, ds = k
+        _SLICES[k] = [tuple((core // s) % f for _, f, s in ds) for core in range(c)]
+    return _SLICES[k]
 
 
 def mixed_radix_exact(ds):
@@ -63,9 +85,12 @@ def closed_form(r):
     if spd <= 0 or cd % spd or sps != cs:
         return False, "split products"
     sd, dd = digits(sk), digits(dk)
-    if math.prod(f for _, f, _ in sd) != cs or not mixed_radix_exact(sd):
+    if math.prod(f for _, f, _ in sd) != cs or len(set(slices(sk))) != cs:
         return False, "source slices"
-    if math.prod(f for _, f, _ in dd) != spd or not nested_with_gaps(dd, cd):
+    reps = Counter(slices(dk))
+    if math.prod(f for _, f, _ in dd) != spd or len(reps) != spd:
+        return False, "destination coverage"
+    if cs == cd and len(set(reps.values())) != 1:  # equal domains: even replication
         return False, "destination coverage"
     fs = {d: f for d, f, _ in sd}
     fd = {d: f for d, f, _ in dd}
@@ -77,8 +102,23 @@ def closed_form(r):
         fanin *= max(1, a // b)
     if fanin > MAX_FANIN:
         return False, "fan-in"
-    if cd > cs and fanin != 1:
-        return False, "broadcast not one-to-one"
+    if cd > cs:
+        if fanin != 1:
+            return False, "broadcast not one-to-one"
+        # each source slice must reach exactly C_dst / C_src destination cores: sum
+        # the replication of the destination slices nested in it (depends on the
+        # destination view and the source's factors only, not its strides)
+        dims = [d for d, _, _ in dk[1]]  # slices() tuples follow the key's order
+        per_src = Counter()
+        for tup, n in reps.items():
+            parent = tuple(
+                (dim, t // (fd[dim] // fs.get(dim, 1))) for dim, t in zip(dims, tup)
+            )
+            per_src[parent] += n
+        if len(per_src) * math.prod(
+            fs.get(d, 1) for d in fs if d not in fd
+        ) != cs or any(v != cd // cs for v in per_src.values()):
+            return False, "broadcast not one-to-one"
     return True, "ok"
 
 

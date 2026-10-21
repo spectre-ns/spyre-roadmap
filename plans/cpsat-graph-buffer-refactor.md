@@ -755,11 +755,33 @@ constraints over small per-buffer domains, never per-pair tables.
   carries and clones included.
 - **2d. Relayouts as constraints.** One optional relayout layout per (parent, consumer)
   READ edge whose view is the consumer's; sharing between consumers by reified view
-  equality. Legality (`movement_supported`, projection and core-domain gates) and price
-  (per split-dim tables × 1/cores, governing dim chosen piecewise) are tables over (src
-  view, dst view). Relayout choice becomes an axis with strategies: today's group
-  capping (`_cap_relayout_groups`) is `Pruned`, and `Lazy` drops the cap (or caps views
-  per buffer). Agreement where capping did not bind; differences reported where it did.
+  equality.
+  - **Legality has a verified closed form** (`probes/cpsat-graph/deenum/ms_check.py`).
+    Over each view's digits (device dim, factor, stride) and core counts:
+    1. domain: C_src divides C_dst, each view's core count is its domain, and the
+       source split product is C_src; identical views on equal domains are not a
+       relayout;
+    2. source slices distinct: the source view's core → slot map is a bijection;
+    3. destination covered: every destination slice is reached (evenly when the
+       domains are equal);
+    4. per dim one factor divides the other; fan-in = ∏ max(1, f_src/f_dst) ≤ 8;
+    5. a larger destination domain is one-to-one: fan-in 1, and the destination
+       slices nested in each source slice are replicated C_dst/C_src times in total.
+
+    2 and 3 are per-view properties, and 5 depends on the destination view and the
+    source's factors only, so as constraints these are small per-view tables, per-dim
+    tables over (f_src, f_dst), a product bound and implications. Nothing enumerates
+    view pairs, which is 73% of relayout time today (`movement_supported` →
+    `transfer_edges` on 17,261 distinct pairs for `sdpa_gqa_1x32x8x512x128`).
+    It agrees with `movement_supported` on all 61,391 decisions recorded over the 32
+    zoo graphs and on 306,000 synthetic pairs (two seeds; `ms_synth.py`), with every
+    rejection reason exercised.
+  - Still to put in closed form: the projection gates (`work_division_from_view` on
+    both frames, `partition_footprint` within LX) and the price (per split-dim tables ×
+    1/cores, governing dim chosen piecewise).
+  - Relayout choice becomes an axis with strategies: today's group capping
+    (`_cap_relayout_groups`) is `Pruned`, and `Lazy` drops the cap (or caps views per
+    buffer). Agreement where capping did not bind; differences reported where it did.
 - **2e. In-place as constraints.** Per-core footprint equality
   (`out_partition · out_tiles`, a product equality) plus the `ViewRelation`. The
   pre-solve gates (pointwise input, equal device layout, one-tick handoff) stay
