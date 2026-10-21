@@ -71,7 +71,9 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
    exclusions all come in as data. Moving any derivation out of the allocator is
    Phase 2/3 work with its own agreement test.
 3. **`None` means an open decision.** `assignment`, `resident`, `offset` only.
-   Structural fields are never `Optional`.
+   Structural fields are never `Optional`. "Fixed" is a decision state, not a type:
+   a node is fixed when its `assignment` is set before the solve, whatever its space.
+   A fixed node posts constants (or nothing) where an open one posts vars.
 4. **Build structure, then finalize once.** `add_node` / `add_child` / `add_successor`
    wire the graph and touch no model. `solve(model, cost_expr)` calls
    `Graph._finalize(model)`, where every element posts its vars and constraints in a
@@ -250,11 +252,12 @@ Notes:
   class Assignment:                    # a decided split
       splits: Mapping[SplitKey, int]   # sym_core_divs keys
       tiling: TileSpec
+      COMMITTED: ClassVar[Assignment]  # fixed upstream by work division; its splits
+                                       # are not visible to the solve (placement-only)
 
   class SplitSpace(ABC):
       def holds(self, a: Assignment) -> bool
-  class FixedSpace(SplitSpace): ...    # placement-only: nothing to choose
-  class MenuSpace(SplitSpace):         # the allocator's menu
+  class MenuSpace(SplitSpace):         # the allocator's menu (empty when it built none)
       core_divisions: list[CoreDivision]
 
   class ViewRelation:                  # both ends own the buffer with the same view
@@ -279,13 +282,14 @@ Notes:
 ### Stage 2. Builder
 
 - `build_graph(buffers, alignment, capacity, exclusions)` makes the `Graph`, one
-  `add_node` per buffer in the allocator's order (`FixedSpace` for placement-only
-  buffers, `MenuSpace` otherwise), and the edges through `add_child`. It is the only
-  code that reads the allocator classes, and it copies their final data:
-  - READ edges only between nodes that both choose a division (today's no-op
-    `constrain_residency` on placement-only wrappers). `view.table` is
-    `cd_parent_matches.get(src, ())`; `relayout` is `cd_parent_relayouts[src]`
-    filtered to groups with a copy in this solve.
+  `add_node` per buffer in the allocator's order, each with a `MenuSpace` of its menu,
+  and the edges through `add_child`. A placement-only buffer has no menu: its node is
+  added with `assignment=Assignment.COMMITTED`, i.e. fixed, not a separate type. It is
+  the only code that reads the allocator classes, and it copies their final data:
+  - READ edges only between nodes that both have a menu, i.e. neither is
+    `COMMITTED` (today's no-op `constrain_residency` on placement-only wrappers).
+    `view.table` is `cd_parent_matches.get(src, ())`; `relayout` is
+    `cd_parent_relayouts[src]` filtered to groups with a copy in this solve.
   - IN_PLACE edges with `view=None` when the child's division was fixed upstream,
     otherwise the same table.
   - RELAYOUT_COPY edges for the allocator's copies, in its order.
@@ -328,10 +332,11 @@ Notes:
 - Adds `SplitSpace.post(model, node) -> NodeVars`, the node's vars as the relations
   will see them (`division`, `eff_size`, `cores`, `core_cost`, split and tile-count
   vars, `in_buffer`, `offset`, merge literals). `ComputeNode._finalize(model)` calls
-  it, replacing the variable-making half of both wrappers: `MenuSpace` posts today's
-  index var, element ties and single-candidate constants; `FixedSpace` posts today's
-  placement-only vars (`cores`, `core_cost` `None`, no gates). Merge literals are made
-  here, in node order.
+  it for nodes whose `assignment` is open, replacing the variable-making half of both
+  wrappers: `MenuSpace` posts today's index var, element ties and single-candidate
+  constants. A node fixed at `Assignment.COMMITTED` posts no split vars, which is
+  today's placement-only model (`cores`, `core_cost` `None`, no gates). Merge literals
+  are made here, in node order.
 - The node also exposes `buffer`, `division` and `division_is` for
   `cpsat_expr_printer`, so that contract is unchanged until Phase 2a. Var names stay
   as today.
@@ -378,9 +383,10 @@ Notes:
   op-output nodes along the execution chain with every `None` field filled
   (`assignment`, so the tiling; `resident`; `offset`) and `chosen` set on READ edges.
   That list is the execution plan.
-- Pre-fixed decisions: a fixed `assignment` on a `MenuSpace` posts a constant index;
-  fixed `resident`/`offset` pin their vars. Bottom-justify is skipped when any offset
-  was pinned.
+- Pre-fixed decisions: a fixed concrete `assignment` posts a constant index (its edges
+  keep their gates, with that side constant); `Assignment.COMMITTED` posts nothing, as
+  above; fixed `resident`/`offset` pin their vars. Bottom-justify is skipped when any
+  offset was pinned.
 - `_plan_layout_generic` makes the model, calls `graph.solve(model, cost_expr)` and
   writes back: `address` in bytes, `spill_reason`, `chosen_division` only where the
   caller enumerated divisions, `chosen_relayouts` scaled.
