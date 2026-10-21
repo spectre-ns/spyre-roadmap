@@ -80,63 +80,20 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
 ## The model
 
 ```python
-@dataclass(frozen=True)
-class Assignment:
-    """A decided split: per-axis core splits and the coarse tiling."""
-    splits: Mapping[SplitKey, int]   # sym_core_divs keys
-    tiling: TileSpec                 # per-level tile counts (level_counts)
-
-class SplitSpace(ABC):
-    """What a node may choose, and how its vars are posted."""
-    def post(self, model, node) -> NodeVars
-    def holds(self, a: Assignment) -> bool
-
-class FixedSpace(SplitSpace):        # placement-only: no split vars; cores/core_cost None
-class MenuSpace(SplitSpace):         # Phase 1: the allocator's core_divisions menu,
-    core_divisions: list[CoreDivision]  # one index var + element ties (today's model)
-class GeneratedSpace(SplitSpace):    # Phase 2: OpSplitSpace domains + legality
-    space: OpSplitSpace              # constraints, no menu
-
-class NodeVars:
-    """The solver-side view of a node; relations only talk to this."""
-    def split(self, key) -> IntVar
-    def level(self, k: int) -> IntVar        # tile count at loop level k
-    tiled: BoolVar
-    cores: Optional[IntVar]                  # None on FixedSpace, as today
-    eff_size: IntVar
-    in_buffer: BoolVar
-    offset: IntVar
-
 class GraphElement(ABC):
     """Base of nodes and both edge types: built piecewise, finalized once."""
     def _finalize(self, model) -> None       # post this element's vars / constraints
 
-class ViewRelation:
-    """Both ends own the shared buffer with the same per-core view."""
-    table: DivisionMap                       # Phase 1: allocator's final pairs;
-                                             # empty = never alike (never None)
-    geometry: tuple[ResidencyEdge, ...]      # Phase 2: conjunction (carry read +
-                                             # update); empty where none exists
-    def holds(self, src: Assignment, dst: Assignment) -> bool
-    def post(self, model, src: NodeVars, dst: NodeVars, enforce) -> None
-
-class RelayoutRelation:
-    """READ only: copies that can serve a mismatched view, with their price."""
-    reads: tuple[RelayoutRead, ...]          # Phase 1: allocator's capped candidates
-    def bridges(self, src: Assignment, dst: Assignment) -> tuple[RelayoutRead, ...]
-    def post(self, model, src, dst, copies) -> list[BoolVar]   # served literals
-
-class NestRelation:
-    """ExecutionEdge only: both ops run the same non-empty loop nest."""
-    def joins(self, before: Assignment, after: Assignment) -> bool
-    def post(self, model, before: NodeVars, after: NodeVars) -> BoolVar  # same_nest,
-                                             # reified both ways
+class DependencyKind(Enum):
+    READ = auto()          # dst's op reads src
+    IN_PLACE = auto()      # dst may take over src's storage at the shared tick
+    RELAYOUT_COPY = auto() # dst is a relayout destination of src
 
 @dataclass(eq=False)
 class DependencyEdge(GraphElement):
     src: ComputeNode
     dst: ComputeNode
-    kind: DependencyKind                     # READ / IN_PLACE / RELAYOUT_COPY
+    kind: DependencyKind
     view: Optional[ViewRelation]             # None only: IN_PLACE whose child was
                                              # fixed upstream (ungated)
     relayout: Optional[RelayoutRelation]     # READ only
@@ -158,21 +115,20 @@ class ExecutionEdge(GraphElement):
 class ComputeNode(GraphElement):
     ...  # name, size (alignment units), start/end_time and lifetime overrides,
          # read_count, spill_cost, boundary, sym_core_divs, sym_tile_counts
-    space: SplitSpace
+    space: SplitSpace                        # what the node may choose
     assignment: Optional[Assignment]         # None = free
     resident: Optional[bool]                 # None = free
     offset: Optional[int]                    # None = free
-
-    @property
-    def tiling(self) -> Optional[TileSpec]   # assignment.tiling once set
-    @property
-    def tileable(self) -> bool               # some allowed tiling is not untiled
-
     produced_at: int                         # tick of the producing write
     inputs: list[DependencyEdge]
     outputs: list[DependencyEdge]
     prev: ExecutionEdge                      # always linked:
     next: ExecutionEdge                      # graph.head -> ... -> graph.tail
+
+    @property
+    def tiling(self) -> Optional[TileSpec]   # assignment.tiling once set
+    @property
+    def tileable(self) -> bool               # some allowed tiling is not untiled
 
     def add_child(
         self,
@@ -203,6 +159,12 @@ class Graph:
     def _finalize(self, model) -> None       # every element, in today's order
     def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
 ```
+
+`SplitSpace`, `Assignment` and the three relations (`ViewRelation`,
+`RelayoutRelation`, `NestRelation`) are what the graph holds; each stage below
+introduces only the part of their interface it needs (Stage 1: data and queries;
+Stage 5: posting node vars; Stage 6: posting edge constraints; Phase 2: constraint
+encodings and generated spaces).
 
 Notes:
 
@@ -279,11 +241,32 @@ Notes:
 ### Stage 1. Data model
 
 - Rename the draft (`CoreDivisionBoundBuffer` → `ComputeNode`, `BufferGraph` →
-  `Graph`, `build_buffer_graph` → `build_graph`) and reshape it: `Assignment`,
-  `SplitSpace` (`FixedSpace`, `MenuSpace`), `GraphElement`, `ViewRelation` and
-  `RelayoutRelation` and `NestRelation` (table encodings only), `DependencyEdge`,
-  `ExecutionEdge`, `ComputeNode` (`add_child`, `add_successor`), `Graph` (`add_node`,
-  `edges_of`, `tiling_segments`). Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
+  `Graph`, `build_buffer_graph` → `build_graph`) and reshape it into the graph above.
+  Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
+- The supporting types, data and queries only (no solver methods yet):
+
+  ```python
+  @dataclass(frozen=True)
+  class Assignment:                    # a decided split
+      splits: Mapping[SplitKey, int]   # sym_core_divs keys
+      tiling: TileSpec
+
+  class SplitSpace(ABC):
+      def holds(self, a: Assignment) -> bool
+  class FixedSpace(SplitSpace): ...    # placement-only: nothing to choose
+  class MenuSpace(SplitSpace):         # the allocator's menu
+      core_divisions: list[CoreDivision]
+
+  class ViewRelation:                  # both ends own the buffer with the same view
+      table: DivisionMap               # allocator's final pairs; empty = never alike
+      def holds(self, src: Assignment, dst: Assignment) -> bool
+  class RelayoutRelation:              # READ: copies that can serve a mismatch
+      reads: tuple[RelayoutRead, ...]  # allocator's capped candidates
+      def bridges(self, src: Assignment, dst: Assignment) -> tuple[RelayoutRead, ...]
+  class NestRelation:                  # both ops run the same non-empty loop nest
+      table: tuple[tuple[int, int], ...]
+      def joins(self, before: Assignment, after: Assignment) -> bool
+  ```
 - `spill_cost` and the node's derived properties (`sym_is_lx`, `sym_division`,
   `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`) stay as drafted.
 - Tests (`tests/inductor/test_buffer_graph.py`, no device): `add_node` order;
@@ -301,9 +284,8 @@ Notes:
   code that reads the allocator classes, and it copies their final data:
   - READ edges only between nodes that both choose a division (today's no-op
     `constrain_residency` on placement-only wrappers). `view.table` is
-    `cd_parent_matches.get(src, ())`; `view.geometry` is the consumer's
-    `residency_edges[src]` where present (unused by the table encoding); `relayout`
-    is `cd_parent_relayouts[src]` filtered to groups with a copy in this solve.
+    `cd_parent_matches.get(src, ())`; `relayout` is `cd_parent_relayouts[src]`
+    filtered to groups with a copy in this solve.
   - IN_PLACE edges with `view=None` when the child's division was fixed upstream,
     otherwise the same table.
   - RELAYOUT_COPY edges for the allocator's copies, in its order.
@@ -343,20 +325,25 @@ Notes:
 
 ### Stage 5. Nodes post their own vars
 
-- `ComputeNode._finalize(model)` calls `space.post`, replacing the variable-making half
-  of both wrappers: `MenuSpace` posts today's index var, element ties and single-
-  candidate constants; `FixedSpace` posts today's placement-only vars (`cores`,
-  `core_cost` `None`, no gates). Merge literals are made here, in node order.
-- `NodeVars` is the interface relations use. The node also exposes `buffer`,
-  `division` and `division_is` for `cpsat_expr_printer`, so that contract is unchanged
-  until Phase 2a. Var names stay as today.
+- Adds `SplitSpace.post(model, node) -> NodeVars`, the node's vars as the relations
+  will see them (`division`, `eff_size`, `cores`, `core_cost`, split and tile-count
+  vars, `in_buffer`, `offset`, merge literals). `ComputeNode._finalize(model)` calls
+  it, replacing the variable-making half of both wrappers: `MenuSpace` posts today's
+  index var, element ties and single-candidate constants; `FixedSpace` posts today's
+  placement-only vars (`cores`, `core_cost` `None`, no gates). Merge literals are made
+  here, in node order.
+- The node also exposes `buffer`, `division` and `division_is` for
+  `cpsat_expr_printer`, so that contract is unchanged until Phase 2a. Var names stay
+  as today.
 - The wrappers hold their node and delegate to it, so no constraint code changes.
 - Proto diff empty.
 
 ### Stage 6. Edges post their own constraints; delete the wrappers
 
-- `DependencyEdge._finalize(model)` posts, by kind, through its relations' table
-  encodings:
+- Adds the relations' table encodings: `ViewRelation.post(model, src, dst, enforce)`
+  (today's `_gate_divisions`), `RelayoutRelation.post(...)` returning the served
+  literals, and `NestRelation.post(...)` for the Stage 4 `same_nest` literal.
+  `DependencyEdge._finalize(model)` posts, by kind, through them:
   - IN_PLACE: merge literal; `eff_size` equality when the child chooses a division;
     offset equality; both-resident implications; view gate unless `view is None`.
     Node-level parts (at-most-one, tick shortening) stay with the node and no-overlap.
@@ -431,9 +418,9 @@ constraints over small per-buffer domains, never per-pair tables.
   and `extract_op_features` reads `candidate_work_slices`. Tabulate over per-axis
   tuples (`AddAllowedAssignments`, small at ≤ 32 cores) instead. Prerequisite for the
   rest; agreement: identical lowered values at every menu point.
-- **2b. `NestRelation` on per-level tile vars.** Per node `L0`, `L1` (`max_dims=2`)
-  tied to the per-dim counts; `same_nest` is the two-way reified
-  `L0 == L0' ∧ L1 == L1' ∧ tiled` (a one-way `_gate_divisions` would let `joined` go
+- **2b. `NestRelation` on per-level tile vars.** `NodeVars` gains `level(k)`: per
+  node `L0`, `L1` (`max_dims=2`) tied to the per-dim counts; `same_nest` is the
+  two-way reified `L0 == L0' ∧ L1 == L1' ∧ tiled` (a one-way `_gate_divisions` would let `joined` go
   false on an equal pair and loosen cuts). Tile-by-tile alignment (`tile_misread`)
   becomes a tile `ViewRelation`, closing the Stage 8 gap.
 - **2c. `ViewRelation` constraints: views built from the ops.** A per-core view is
@@ -476,7 +463,9 @@ constraints over small per-buffer domains, never per-pair tables.
     them. If an agreement test finds a case these rules miss, that case gets a small
     allowed-tuples table per (node, dep), never a pair table.
 
-  Loop carries are the conjunction of the read and update relations; input clones need
+  `ViewRelation` gains `geometry: tuple[ResidencyEdge, ...]` (each read's index map
+  into the buffer) and a constraint `post` built from it. Loop carries are the
+  conjunction of the read and update relations; input clones need
   a relation derived from the clone's consumers (design item). Agreement: the feasible
   pairs equal the allocator's final `cd_parent_matches`, carries and clones included.
 - **2d. Relayouts as constraints.** One optional copy per (parent, consumer) READ edge
@@ -490,9 +479,10 @@ constraints over small per-buffer domains, never per-pair tables.
   (`out_partition · out_tiles`, a product equality) plus the `ViewRelation`. The
   pre-solve gates (pointwise input, equal device layout, one-tick handoff) stay
   builder facts.
-- **2f. `GeneratedSpace`.** Per-axis domains from `_legal_split_factors`, product ≤
-  max cores (multiplication equality), at most one reduction split, blocked dims, the
-  span cap as a per-dim table, tiling-dependent domains through the level vars. Menus
+- **2f. `GeneratedSpace`.** A third `SplitSpace` wrapping `OpSplitSpace`. Per-axis
+  domains from `_legal_split_factors`, product ≤ max cores (multiplication equality),
+  at most one reduction split, blocked dims, the span cap as a per-dim table,
+  tiling-dependent domains through the level vars. Menus
   are no longer materialized; `MenuSpace` remains for tests and for restricting a node
   to listed candidates. Agreement: same optimum wherever the menu was complete.
 
