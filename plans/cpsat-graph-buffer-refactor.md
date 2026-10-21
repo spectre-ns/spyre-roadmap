@@ -26,10 +26,11 @@ Goal: model the solve as a graph.
   layouts, decisions) is reached from a node, and the graph hands out nodes
   (`get_nodes()`). A node is every resource an op needs: op outputs and graph inputs. A
   relayout is not a node: it is a second layout of the producer's output with a longer
-  lifetime, and realizing the plan inserts the copy. A node holds
-  one **enumeration strategy per decision axis** (`Fixed`, `Table`, `Lazy` or
-  `Pruned`; see *Design rules*) and its decisions (`assignment`, `resident`, `offset`),
-  each fixed ahead of time or `None` for the solver to find.
+  lifetime, and realizing the plan inserts the copy. A node holds what the op is
+  (size, lifetime, its candidate menu, …) and its decisions (`assignment`, `resident`,
+  `offset`), each fixed ahead of time or `None` for the solver to find. How each
+  decision is enumerated (`Fixed`, `Table`, `Lazy` or `Pruned`) belongs to the
+  strategy; see *Design rules*.
 - **`DependencyEdge`** — every data dependency between two nodes (reads, in-place
   reuse). It holds *relations* over the two ends' decisions: the
   per-core view match (`ViewRelation`) and, on a read, the relayouts that can bridge a
@@ -106,7 +107,7 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
    enumerations; the `Strategy` does. For each node and each decision axis (core
    division, coarse tiling, residency, offset; relayout choice per READ edge) it holds
    an `Enumeration`, data plus `holds(value)` (a query, no model), built from the
-   node's spec, and it realizes that enumeration in the model:
+   node's fields, and it realizes that enumeration in the model:
    - `Fixed(value)` — known before the solve; posts constants. `Fixed(COMMITTED)` is a
      placement-only buffer: committed upstream by work division, posts nothing.
    - `Table(candidates)` — explicit candidates: an index var plus element ties
@@ -117,7 +118,7 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
      Today's relayout group capping is a `Pruned` relayout enumeration.
 
    The `EnumerationFactory` validates the config and builds a `Strategy` for a graph,
-   choosing each node's enumerations from its spec (for example, `Lazy` tiling
+   choosing each node's enumerations from its fields (for example, `Lazy` tiling
    requires tiling to be its own axis). The default reproduces today: `Table` over the
    node's menu, `Fixed(COMMITTED)` for an empty menu (placement-only), `Pruned`
    relayouts.
@@ -201,10 +202,10 @@ class RelayoutLayout:
     resident: Optional[bool]                 # None = free
     offset: Optional[int]                    # None = free
 
-@dataclass(frozen=True)
-class NodeSpec:
-    """What a node is. Built by the graph from whatever it is given: an allocator
-    buffer in Phase 1, the torch IR from Phase 3."""
+@dataclass(eq=False)
+class ResourceNode:
+    # what the resource is: filled by add_node from an allocator buffer (Phase 1)
+    # or the torch IR (Phase 3); fixed once built
     name: str
     size: int                                # alignment units
     start_time: int                          # lifetime, overrides applied
@@ -220,13 +221,11 @@ class NodeSpec:
                                              # whether to enumerate them
     residency_reason: Optional[str]          # Phase 1: the allocator's; Phase 3: from
                                              # the op; applied by apply_op_constraints
-
-@dataclass(eq=False)
-class ResourceNode:
-    spec: NodeSpec                           # spill_cost etc. derive from it
+    # decisions
     assignment: Optional[Assignment]         # None = free
     resident: Optional[bool]                 # None = free
     offset: Optional[int]                    # None = free
+    # structure
     origin: Produced | GraphInput            # where the resource comes from
     relayouts: list[RelayoutLayout]          # alternative layouts of this output
     inputs: list[DependencyEdge]
@@ -258,7 +257,7 @@ class SpyreOptimizationGraph:
     def add_node(
         self, source: LifetimeBoundBuffer | torch._inductor.ir.Operation
     ) -> ResourceNode
-        # the graph builds the NodeSpec from either source: an allocator buffer
+        # the graph fills the node's fields from either source: an allocator buffer
         # (or its CoreDivisionBuffer / RelayoutCopyBuffer subclass) in Phase 1, an
         # IR op from Phase 3 (returns the existing node if that op was added)
     def get_nodes(self) -> Iterator[ResourceNode]  # in add_node order; edges are
@@ -410,7 +409,7 @@ Notes:
 
   class EnumerationFactory:            # validates the config and builds strategies
       def strategy(self, graph: SpyreOptimizationGraph) -> Strategy
-          # default: today's model, from each node's spec (menu -> Table,
+          # default: today's model, from each node's fields (menu -> Table,
           # empty menu -> Fixed(COMMITTED))
 
   class ViewRelation:                  # both ends own the buffer with the same view
@@ -437,7 +436,7 @@ Notes:
 - `build_graph(buffers, alignment, capacity)` makes the `SpyreOptimizationGraph`,
   calls `add_node(buffer)` for each allocator buffer in the allocator's order, then
   adds the edges through `add_child`. `add_node` does the conversion inside the
-  graph: it builds the `NodeSpec`, with the buffer's `core_divisions` as the menu (a
+  graph: it fills the node's fields, with the buffer's `core_divisions` as the menu (a
   `LifetimeBoundBuffer` has none: placement-only). The strategy built for the graph
   later turns that into `Table` or `Fixed(COMMITTED)`. The allocator classes are read
   only there and in the edge wiring below; past `add_node` the node never refers back
@@ -452,8 +451,8 @@ Notes:
     node (not a node), in the allocator's order; graph inputs become nodes with a
     `GraphInput` origin.
   - `read_count`, lifetimes and overrides and `spill_cost` inputs as given; each
-    buffer's `residency_reason` is kept on its `NodeSpec`, for
-    `apply_op_constraints` to apply.
+    buffer's `residency_reason` is kept on its node, for `apply_op_constraints` to
+    apply.
   - Origins: `Produced(uses[0])` for op outputs (today's filter: has `uses`, not
     `first_use_is_read`, not a copy), `GraphInput(uses[0])` for graph inputs; then
     `add_successor` over the `Produced` nodes in `produced_at` order;
@@ -465,16 +464,16 @@ Notes:
   Phase 2b.
 
 - Where each `CoreDivisionBuffer` field goes. In Phase 1 a node is a
-  `CoreDivisionBuffer` redistributed: what it is (including its menu) in `NodeSpec`,
+  `CoreDivisionBuffer` redistributed: what it is (including its menu) in its fields,
   how it relates to others on edges, what was decided in its decision fields; how its
   choices are enumerated belongs to the strategy.
 
   | `CoreDivisionBuffer` field | Phase 1 home |
   |---|---|
-  | `name`, `size`, `first_use_is_read`, `boundary` | `NodeSpec` |
-  | `uses`, `lifetime_*_override` | `NodeSpec.start_time` / `end_time` / `read_count`; `uses[0]` → `produced_at` |
-  | `residency_reason` | `NodeSpec.residency_reason`, applied by `apply_op_constraints` |
-  | `core_divisions` (with each `.tiling`) | `NodeSpec.menu`; the default strategy's `Table` (division and tiling shared) |
+  | `name`, `size`, `first_use_is_read`, `boundary` | node fields |
+  | `uses`, `lifetime_*_override` | `start_time` / `end_time` / `read_count`; `uses[0]` → `produced_at` |
+  | `residency_reason` | `residency_reason`, applied by `apply_op_constraints` |
+  | `core_divisions` (with each `.tiling`) | `menu`; the default strategy's `Table` (division and tiling shared) |
   | `parents`, `cd_parent_matches`, `cd_parent_relayouts` | READ edges: `ViewRelation.table`, `RelayoutRelation` |
   | `in_place_parents` | IN_PLACE edges |
   | `RelayoutCopyBuffer` (whole buffer) | a `RelayoutLayout` on its parent's node |
@@ -526,7 +525,7 @@ Notes:
   `cpsat_expr_printer`, so that contract is unchanged until Phase 2a. `buffer` is a
   read-only view of the node, not an allocator buffer: the printer reads exactly
   `core_divisions` (the `Table` candidates), `sym_core_divs` and `sym_division`
-  (`NodeSpec`) through it (`cpsat_expr_printer.py:249`, `:840`, `:881-895`). Var names
+  (node fields) through it (`cpsat_expr_printer.py:249`, `:840`, `:881-895`). Var names
   stay as today.
 - The wrappers hold their node and delegate to it, so no constraint code changes.
 - Proto diff empty.
@@ -871,7 +870,7 @@ constraints over small per-buffer domains, never per-pair tables.
   → relations; `op_position` → `produced_at`). Sizes stay in alignment units on the
   node as the draft has them; `address` is written back in bytes.
 - **3c. The graph builds nodes from the IR.** `graph.add_node(op)` builds a node
-  straight from the torch IR (once per op): the `NodeSpec` from the op's layout
+  straight from the torch IR (once per op): its fields from the op's layout
   and its place in `graph.operations`, with the op's menu or its `OpSplitSpace` as the
   data the strategy enumerates (`Table`) or generates from (`Lazy`), and the residency
   reasons that `apply_op_constraints` reads from the op.
