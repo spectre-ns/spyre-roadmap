@@ -659,57 +659,72 @@ constraints over small per-buffer domains, never per-pair tables.
 
   *Is the per-axis relation exact?* The per-device-dim `(split, stride)` + core-count
   key reproduces every pair table (385/385 zoo, 200/200 Granite, both configs). The
-  inferred per-axis rule (symbol → device dim, iteration order, contiguous dim)
-  reproduces the allocator's **final** table on 382/382 untiled zoo edges and 192/200
-  Granite edges (8 irregular owner formulas). Under tiling, 68% (zoo) / 84% (Granite)
-  of edges carry tile keys, which the probe did not model; they fell back to a table.
+  inferred per-axis rule (symbol → device dim, iteration order, contiguous dim), plus
+  the same rule over tile splits for tile keys, reproduces the allocator's **final**
+  table on 382/382 zoo edges in both configs (tiled ones included) and on 192/200
+  Granite default / 94/100 Granite tiling edges (irregular owner formulas, and 2
+  tile rules that could not be inferred). Tile keys follow two conventions: the
+  `tile_splits` order, and a side whose tiling slices none of the buffer reads it
+  whole.
 
   *Solver cost.* One reduced model (residency, footprint, capacity, 2-D no-overlap,
   match gates; no cost expression, relayouts, in-place or cuts) built three ways: E
-  (menu index + pair tables, today), L1 (per-axis split vars, lazy gates, per-node
-  menu legality) and L2 (no menu: per-axis domains, core bound, one reduction
-  split). 30 s limit, seed 0. Proven optima agree everywhere: 0 objective mismatches
-  on every pair where both arms reached OPTIMAL, in every config, for L1 and L2 (so
-  the menus were complete for this model). Time to OPTIMAL vs E, pairs where E took
-  ≥ 0.2 s:
+  (menu index + pair tables, today), L1 (per-axis split and tile vars, lazy gates,
+  per-node menu legality) and L2 (no menu: per-axis domains, core bound, one
+  reduction split). 30 s limit, seed 0. Proven optima agree everywhere: 0 objective
+  mismatches on every pair where both arms reached OPTIMAL, in every config. (A first
+  tiling run showed lazy arms beating E's proven optimum; the cause was a probe bug:
+  the fallback pair table for edges without view keys ignored tile counts. Fixed, and
+  all tiling L1/L2 solves re-run.) Time to OPTIMAL vs E, pairs where E took ≥ 0.2 s:
 
   | config | workers | n | L1 median (range) | L2 median (range) |
   |---|---|---|---|---|
   | zoo, default | 16 | 8 | 1.02× (0.73–1.41) | 0.96× (0.77–1.28) |
   | zoo, default | 1 | 7 | 1.44× (0.30–2.55) | 1.36× (0.21–3.87) |
-  | zoo, tiling (32% of edges lazy) | 16 | 11 | 0.82× (0.24–1.38) | 0.67× (0.20–1.25) |
-  | Granite, default | 1 and 16 | 2 | 0.65× | 0.27–0.35× |
+  | zoo, default | 16, interleaved | 8 | 1.11× (0.68–2.30) | — |
+  | zoo, tiling | 16 | 10 | 0.56× (0.38–1.58) | 0.50× (0.10–1.52) |
+  | zoo, tiling | 1 | 5 | 0.80× (0.27–2.79) | 0.09× (0.08–0.57) |
+  | Granite, default and tiling | 1 and 16 | 0–2 | too few solves ≥ 0.2 s | |
 
   Lazy model build is slower in Python (0.38 s vs 0.12 s over all 32 zoo solves) but
   negligible next to planning.
+
+  *Eager + hash join* (the cheap Python fix, `DEENUM_HASHJOIN=1`): exact on 385/385
+  edges in both configs. Zoo tiling planning 292 → 179 s (match tables 138.6 →
+  23.2 s); default 3.0 → 2.5 s of match tables. Granite produced no usable numbers
+  (the default run hit the compile cache, and the tiling run hits a pre-existing
+  `Cannot tile buf0 … read-distance limit` failure on `main`).
+
+  *Deterministic multi-worker search* (`interleave_search`, 16 workers, two repeats):
+  not reproducible with a wall-clock limit. 33/36 proven optima repeated the same
+  solution, but only 1/27 time-limited solves did, and deterministic time never
+  matched. Next: a `max_deterministic_time` budget instead of seconds.
 
   *Expected improvement* (lazy removes menu and match-table construction; relayout
   pricing and cost-model prediction stay until 2a/2d; solve scaled by the medians
   above):
 
-  | config | today | expected with views + nests lazy | change |
-  |---|---|---|---|
-  | zoo, tiling | 292 s | ~85 s | **~3.4× faster planning** |
-  | Granite, tiling | 82 s | ~21 s | **~3.9× faster planning** |
-  | zoo, default, 16 workers | 152 s | ~148 s | ~3% faster (enumeration is small here) |
-  | zoo, default, 1 worker | 152 s | ~167 s | ~9% slower (1-worker search regression) |
-  | Granite, default | 171 s | ~168 s | ~2% faster (solve-bound; solve assumed at parity, n=2) |
+  | config | today | eager + hash join | views + nests lazy | lazy vs hash join |
+  |---|---|---|---|---|
+  | zoo, tiling | 292 s | 179 s | ~78 s | **~2.3× faster** |
+  | Granite, tiling | 82 s | not measured | ~21 s | — |
+  | zoo, default, 16 workers | 152 s | ~152 s | ~148 s | ~3% faster |
+  | zoo, default, 1 worker | 152 s | ~152 s | ~167 s | ~9% slower |
+  | Granite, default | 171 s | — | ~168 s | ~2% (solve-bound) |
 
   **Verdict: pass for compiles with coarse tiling on, not on its own for default
-  compiles.** Conditions before 2b/2c land:
-  1. The tile relation (2b) must show the same exactness and solve parity; the probe
-     covered only 16–32% of tiled edges.
-  2. The 1-worker regression (`use_deterministic_algorithms`) must be fixed or bounded,
-     for example by channeling the per-axis vars to division literals or hinting from
-     the eager solution; it matches the 2026-10-07 finding that integer equalities
-     hurt single-worker search.
-  3. Compare against the cheap Python fix first: a hash join on the exact view key
-     reproduced `match_pairs` and cut the heaviest tiling graphs 134 → 58 s on
-     2026-10-07, and caching menus per tiling removes much of the menu time. Lazy
-     earns its place only where it beats eager + hash join; that run is the next probe
-     (`DEENUM_HASHJOIN=1`, same harness).
-  4. Relayout pricing (13–34% of planning) is untouched by 2b/2c; its saving depends
-     on 2d (per view pair instead of per candidate pair) and was not measured.
+  compiles.** Conditions, as of the follow-up runs:
+  1. **Tile relation — done.** Exact on every zoo tiling edge and 94/100 Granite
+     tiling edges, and the lazy solve is faster under tiling at both worker counts.
+  2. **1-worker regression — open for the default config** (1.44×; 1.11× with
+     interleaved 16-worker search, which is not yet reproducible). Under tiling there
+     is no regression (0.80×, n=5).
+  3. **Hash join — done.** Lazy views and nests are still ~2.3× faster than eager +
+     hash join on zoo tiling. Menus (64 s, re-enumerated per tiling) are now the
+     largest eager cost; a per-tiling menu cache is the cheap alternative and has not
+     been measured.
+  4. **Relayout pricing — legality closed form verified** (2d); price and projection
+     gates remain.
 
 - **2a. Cost expression over per-axis vars.** Today `cpsat_expr_printer` tabulates
   over the menu: `_division_table` (`:309`), `RelayoutCharge` keyed on `sym_division`
