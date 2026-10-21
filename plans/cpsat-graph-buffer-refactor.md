@@ -412,6 +412,33 @@ the table encoding on the full corpus and the device graphs: same feasible
 is called out; it needs `AddMultiplicationEquality` / `AddDivisionEquality` or table
 constraints over small per-buffer domains, never per-pair tables.
 
+- **2.0. Probe: is lazy faster than eager? (go / no-go for the rest of Phase 2.)**
+  Phase 1 does not depend on it, so it can run alongside. Device-free, built on the
+  solver-input capture and replay harness in `~/cpsat_bench/pr5132`
+  (`zoo_cap.py`, `granite_cap.py`, `replay.py`):
+  1. **Where eager time goes today.** On the captured zoo models and Granite blocks,
+     time the enumeration end to end: menu generation per op, `_cd_parent_matches`
+     (|D_p| × |D_c| view comparisons per edge), `_cd_parent_relayouts` with
+     `predict_ops` per consumer candidate, copy construction, then CP-SAT model
+     build, sympy lowering, presolve and solve. This bounds what lazy can save.
+  2. **Prototype the lazy encoding** for views (2c) and nests (2b) on per-axis split /
+     per-level tile vars, outside the solver, over the same captured graphs. The
+     capture has to be extended to record each read's index map
+     (`dep_device_coordinates`, extents, stick size), since today it pickles only
+     what the solver was handed. Relayouts stay eager in the probe (the hardest
+     encoding; a separate probe if 2.0 passes).
+  3. **Compare** eager (tables + build + solve) against lazy (build + solve) per graph:
+     model size, presolve time, time to OPTIMAL at 1 worker
+     (`use_deterministic_algorithms`) and at 16 workers, and end-to-end compile time.
+     Both arms run in one process, interleaved, with a plan hash recorded (paired A/B:
+     cross-process variance is up to ~25%). Both must reach the same objective.
+  - **Pass:** lazy is faster end to end on the median and no slower on the slowest
+    graphs. The known risk is that CP-SAT propagates multiplication / division
+    constraints worse than small tables, so a lazy model can solve slower even when
+    it builds faster.
+  - **Fail:** keep menus and replace only the parts the probe shows are hot (for
+    example per-pair tables → per-buffer view tables), and revise the end state here.
+
 - **2a. Cost expression over per-axis vars.** Today `cpsat_expr_printer` tabulates
   over the menu: `_division_table` (`:309`), `RelayoutCharge` keyed on `sym_division`
   (`:822`), `log2_` by element on the division, `AppliedUndef` menu tables (`:854`),
