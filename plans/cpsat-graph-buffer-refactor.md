@@ -140,8 +140,12 @@ class Graph:
 
     def add_node(self, buffer) -> ComputeNode  # makes and registers the node; no vars yet
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes' outputs; no edge list
-    def solve(self) -> list[ComputeNode]  # the public entry point: make the model, finalize,
-                                          # solve, fill every None field; op outputs in order
+    def solve(
+        self,
+        model: cp_model.CpModel,
+        cost_expr: Optional[sympy.Expr] = None,  # None or unlowerable: fallback objective
+    ) -> list[ComputeNode]  # the public entry point: finalize into model, run the
+                            # ladder, fill every None field; op outputs in order
     def _finalize(self, model) -> None  # nodes, then dependency edges, then execution edges,
                                         # then the graph-wide constraints
     def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
@@ -164,7 +168,7 @@ Notes:
 - Building is piecewise and does structure only: `add_child` and `add_successor`
   never compute anything that depends on another edge, and nothing touches the model.
   Everything else waits until all children are present. There is no separate encode
-  step: `solve()` makes the model and passes it to `Graph._finalize(model)`, and each
+  step: `solve(model, cost_expr)` passes the caller's model to `Graph._finalize(model)`, and each
   element's `_finalize(model)` both derives what needs the rest of the graph and posts
   its own vars and constraints. Order:
   1. **Nodes**, in insertion order (today's var order). A node's `_finalize`:
@@ -189,9 +193,11 @@ Notes:
      no-overlap, and the objective terms.
 
   The edges' queries (`slices_alike`, `bridges`, `joins`) need no model.
-- `solve()` is the only public entry point after building: it makes the model, runs
-  `_finalize(model)`, the objective ladder and extraction, and fills in every field
-  that was `None`.
+- `solve(model, cost_expr)` is the only public entry point after building: it runs
+  `_finalize(model)`, then the objective ladder over the sympy `cost_expr` (lowered
+  as `_minimize_cost_expr` does today, with today's fallback objective when it is
+  `None` or fails to lower), then extraction, and fills in every field that was
+  `None`.
 - This interface stays inside the CP-SAT solve until the problem definition is unified
   (Phase 2a, `graph.set_solver(...)`). Only after that is it pushed out to the
   allocator.
@@ -391,9 +397,9 @@ Notes:
 
 ### Stage 8. `graph.solve()`; honour pre-fixed decisions
 
-- `graph.solve()` becomes the public entry point. It makes the model, runs
-  `_finalize(model)` (moved out of the solver), the objective ladder (`_run`) and
-  extraction, and returns
+- `graph.solve(model, cost_expr)` becomes the public entry point, taking the same model
+  and cost expression `_run` takes today. It runs `_finalize(model)` (moved out of the
+  solver), the objective ladder (`_run`) and extraction, and returns
   the op-output nodes in execution order (following the `ExecutionEdge` chain) with
   every field that was `None` filled in: `division` (so the tiling), `resident` and
   `offset`. The chosen
@@ -404,7 +410,8 @@ Notes:
   Inputs and relayout copies are reached through the READ edges of the nodes that use
   them.
 - Bottom-justify is skipped when any offset was pinned.
-- `_plan_layout_generic` calls `graph.solve()` and writes the nodes back to the
+- `_plan_layout_generic` makes the model, calls `graph.solve(model, cost_expr)` and
+  writes the nodes back to the
   caller's buffers: `address` in bytes,
   `spill_reason`, `chosen_division` only where the caller enumerated divisions, and
   `chosen_relayouts` scaled.
@@ -450,8 +457,9 @@ allocator's output and retire `LifetimeBoundBuffer`/`CoreDivisionBuffer`/
 Sized from the inventory:
 
 - **2a. One problem definition, pluggable solver.** `graph.set_solver(CpSatSolver())` /
-  `graph.set_solver(SimulatedAnnealing())`. The `model` that `solve()` passes to
-  `_finalize` becomes the chosen solver's backend. Nodes and edges state the problem (candidates, division maps,
+  `graph.set_solver(SimulatedAnnealing())`. The `model` passed to `solve()` (and on to
+  `_finalize`) becomes the chosen solver's backend; the sympy `cost_expr` stays the
+  solver-neutral objective. Nodes and edges state the problem (candidates, division maps,
   relayouts, nest pairs, capacity), and each backend turns that into its own form:
   CP vars and constraints for CP-SAT, a move space and cost for SA. The derivations in
   `_finalize` stay solver-neutral, and what it posts goes through the backend. `solve()`
