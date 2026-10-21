@@ -158,7 +158,8 @@ class ExecutionEdge(GraphElement):
 
 @dataclass(frozen=True)
 class NodeSpec:
-    """What a node is, independent of the allocator's buffer classes."""
+    """What a node is. Built by the graph from whatever it is given: an allocator
+    buffer in Phase 1, the torch IR from Phase 3."""
     name: str
     size: int                                # alignment units
     start_time: int                          # lifetime, overrides applied
@@ -208,7 +209,11 @@ class SpyreOptimizationGraph:
     head: Sentinel                           # chain ends; not in nodes, no vars,
     tail: Sentinel                           # never returned by solve()
 
-    def add_node(self, spec: NodeSpec, enumerations: Enumerations) -> ComputeNode
+    def add_node(self, buffer: LifetimeBoundBuffer) -> ComputeNode
+        # Phase 1: the graph converts the buffer (or its CoreDivisionBuffer /
+        # RelayoutCopyBuffer subclass) into a NodeSpec plus the factory's strategies
+    def get_compute_node(self, op: torch._inductor.ir.Operation) -> ComputeNode
+        # Phase 3: the node for an IR op, built from the IR on first use, then reused
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes; no edge list
     def solve(
         self,
@@ -329,9 +334,8 @@ Notes:
       offset: Enumeration
 
   class EnumerationFactory:            # validates the config, picks strategies
-      def for_node(                    # default: today's model
-          self, spec: NodeSpec, menu: Sequence[CoreDivision]  # empty: placement-only
-      ) -> Enumerations
+      def for_node(self, buffer: LifetimeBoundBuffer) -> Enumerations
+          # default: today's model; Phase 3 adds for_op(op) for get_compute_node
 
   class ViewRelation:                  # both ends own the buffer with the same view
       table: DivisionMap               # allocator's final pairs; empty = never alike
@@ -354,13 +358,14 @@ Notes:
 
 ### Stage 2. Builder
 
-- `build_graph(buffers, alignment, capacity)` makes the `SpyreOptimizationGraph` and,
-  for each allocator buffer (`LifetimeBoundBuffer`, `CoreDivisionBuffer` or
-  `RelayoutCopyBuffer`) in the allocator's order, a `NodeSpec` and one `add_node`
-  with the default factory's strategies (`Table` of its `core_divisions`; an empty
-  menu means placement-only and gets `Fixed(COMMITTED)`). Then it adds the edges
-  through `add_child`. It is the only code that reads the allocator classes; nothing
-  past it sees a buffer. It copies their final data:
+- `build_graph(buffers, alignment, capacity)` makes the `SpyreOptimizationGraph`,
+  calls `add_node(buffer)` for each allocator buffer in the allocator's order, then
+  adds the edges through `add_child`. `add_node` does the conversion inside the
+  graph: it builds the `NodeSpec` and asks the default factory for the strategies
+  (`Table` of `core_divisions`; a `LifetimeBoundBuffer` with no menu is placement-only
+  and gets `Fixed(COMMITTED)`). The allocator classes are read only there and in the
+  edge wiring below; past `add_node` the node never refers back to its buffer. The
+  final data copied:
   - READ edges only between nodes that both have a menu, i.e. neither is
     `COMMITTED` (today's no-op `constrain_residency` on placement-only wrappers).
     `view.table` is `cd_parent_matches.get(src, ())`; `relayout` is
@@ -734,11 +739,16 @@ constraints over small per-buffer domains, never per-pair tables.
   `division_space` → `Lazy` division; `residency_edges` and `tile_reads` → relations;
   `op_position` → `produced_at`). Sizes stay in alignment units on the node as the draft
   has them; `address` is written back in bytes.
-- **3c. The allocator builds the graph** at `_build_bound_buffers` (:1456/:1497),
-  `_append_lx_relayout_destinations` (:1819), `_build_cd_bound_buffers`
-  (:4074/:4275) and `_relayout_copy_buffers` (:4418). Its three `RelayoutCopyBuffer`
-  checks (:2769, :2964, :3099) become RELAYOUT_COPY lookups and the drain-plan
-  `CoreDivisionBuffer` assertion (:713) a node check. `cd_parent_matches` /
+- **3c. The graph builds nodes from the IR.** `graph.get_compute_node(op)` builds a
+  node straight from the torch IR on first use: the `NodeSpec` from the op's layout
+  and its place in `graph.operations`, the strategies from `EnumerationFactory
+  .for_op(op)` (menu or `OpSplitSpace`), and the residency checks from the op kind.
+  It replaces the allocator's buffer construction at `_build_bound_buffers`
+  (:1456/:1497), `_append_lx_relayout_destinations` (:1819), `_build_cd_bound_buffers`
+  (:4074/:4275) and `_relayout_copy_buffers` (:4418), so no intermediate buffer is
+  built at all; `add_node(buffer)` stays only for tests and replay. The allocator's
+  three `RelayoutCopyBuffer` checks (:2769, :2964, :3099) become RELAYOUT_COPY lookups
+  and the drain-plan `CoreDivisionBuffer` assertion (:713) a node check. `cd_parent_matches` /
   `cd_parent_relayouts` are deleted only once 2c/2d replace them.
 - **3d. Placement-only solvers** (greedy, first-fit/best-fit, SA, cooling_schedules,
   utils.plot_buffers) swap the type; greedy drops its isinstance at :183.
