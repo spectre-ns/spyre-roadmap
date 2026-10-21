@@ -731,10 +731,28 @@ constraints over small per-buffer domains, never per-pair tables.
 
   `ViewRelation` gains `geometry: tuple[ResidencyEdge, ...]` (each read's index map
   into the buffer), and the strategy gains a constraint encoding for views built from
-  it. Loop carries are the
-  conjunction of the read and update relations; input clones need
-  a relation derived from the clone's consumers (design item). Agreement: the feasible
-  pairs equal the allocator's final `cd_parent_matches`, carries and clones included.
+  it. Loop carries are the conjunction of the read and update relations.
+
+  **Input clones** (`apply_cloning`). Today `_clone_divisions_and_matches`
+  (`allocator.py`) builds a clone's menu as the distinct non-broadcast read views of
+  its consumers, each projected onto the symbols the read indexes, and each consumer's
+  table as "my read view equals that clone view". A clone has no write view of its
+  own: its view *is* the one its consumers read with. As constraints:
+  - The clone's division axis is a view, not a split: per-device-dim (factor, stride)
+    vars plus a core count, with no op behind them and no reduction split.
+  - Each READ edge from the clone posts, gated by the clone's residency, the
+    consumer's read view (from its split vars through its read map, as above) equal
+    to the clone's view. Together these say every consumer reads it alike, which is
+    today's "must match all consumers to be placed".
+  - The edge also posts non-broadcast: the product of the consumer's factors on the
+    buffer's dims equals the consumer's core count. A consumer that splits an axis
+    the input lacks would read stale scratchpad on the cores without a copy, and today
+    such a view is skipped.
+  - A consumer with no `MemoryDep` read of the input or no `MemoryDep` write is a
+    construction check: it fixes the clone out of LX, as today's empty table does.
+
+  Agreement: the feasible pairs equal the allocator's final `cd_parent_matches`,
+  carries and clones included.
 - **2d. Relayouts as constraints.** One optional relayout layout per (parent, consumer)
   READ edge whose view is the consumer's; sharing between consumers by reified view
   equality. Legality (`movement_supported`, projection and core-domain gates) and price
