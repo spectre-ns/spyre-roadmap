@@ -78,13 +78,16 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
    Phase 2/3 work with its own agreement test.
 3. **`None` means an open decision.** A node has three decisions: `assignment` (core
    division and tiling), `resident` and `offset`. Each is either open (`None`; the
-   solver decides) or fixed before the solve by its axis's `Fixed` strategy. Decisions
-   are fixed in exactly three places:
-   - **At construction, by the node's own checks.** Restrictions that apply to a kind
-     of node fix `resident=False` with a reason, so the node is out of LX before the
-     solve (today's `residency_reason`s: no LX reader, partial-reduction write,
-     unrepresentable view, and so on). In Phase 1 the checks take the allocator's
-     reason as given (rule 2); in Phase 3 they run in the node.
+   solver decides) or fixed: by its axis's `Fixed` strategy, or pinned in the model by
+   the strategy at finalization. Decisions are fixed in exactly three places:
+   - **At finalization, by the strategy's op constraints.**
+     `strategy.apply_op_constraints(node, model)` applies the restrictions for the
+     node's kind of op (today's `residency_reason`s: no LX reader, partial-reduction
+     write, unrepresentable view, and so on). The default strategy pins
+     `resident=False` and records the reason; another strategy may post a restriction
+     as a constraint instead (for example "a split reduction axis ⇒ not resident"),
+     which is why this lives in the strategy and not at construction. In Phase 1 the
+     reasons are the allocator's, as given (rule 2); in Phase 3 they come from the op.
    - **At construction, by the builder:** a placement-only buffer's division is
      `Fixed(COMMITTED)`.
    - **By the caller** (Stage 8): pinned `assignment`, `resident` or `offset`.
@@ -209,8 +212,8 @@ class NodeSpec:
     sym_core_divs: Mapping[SplitKey, sympy.Symbol]
     sym_tile_counts: Mapping[TileKey, sympy.Symbol]
     sym_division: sympy.Symbol
-    residency_reason: Optional[str]          # Phase 1: the allocator's; Phase 3: the
-                                             # node's construction checks
+    residency_reason: Optional[str]          # Phase 1: the allocator's; Phase 3: from
+                                             # the op; applied by apply_op_constraints
 
 @dataclass(eq=False)
 class ResourceNode:
@@ -292,6 +295,7 @@ Notes:
       for node in self.nodes: strategy.apply_core_division(node, model)
       for node in self.nodes: strategy.apply_inplace(node, model)
       strategy.apply_placement(self, model)
+      for node in self.nodes: strategy.apply_op_constraints(node, model)
       for node in self.nodes: strategy.apply_reads(node, model)
       strategy.apply_relayout(self, model)
       strategy.apply_coarse_tiling(self, model)
@@ -306,21 +310,23 @@ Notes:
   2. **`apply_inplace(node)`**, over the node's IN_PLACE `inputs` (by destination, as
      today): merge constraints, then at-most-one over its incoming and outgoing
      merges.
-  3. **`apply_placement(graph)`**: capacity per node (`offset + eff_size <= M`), the
-     2-D no-overlap (with the incoming-merge tick shortening), then the exclusion pins
-     (`resident=False` for every node fixed out of LX at construction; its literal was
-     made in step 1, as today).
-  4. **`apply_reads(node)`**, over the node's READ `outputs` (parent order, then child
+  3. **`apply_placement(graph)`**: capacity per node (`offset + eff_size <= M`) and the
+     2-D no-overlap (with the incoming-merge tick shortening).
+  4. **`apply_op_constraints(node)`**, in `add_node` order: the restrictions for the
+     node's kind of op. In the default strategy these are today's exclusion pins
+     (`resident=False` with the reason), posted exactly where they are today, after
+     the no-overlap and before any read gate; the literal was made in step 1.
+  5. **`apply_reads(node)`**, over the node's READ `outputs` (parent order, then child
      order, then the child's `parents` order): per edge, the served literals in sorted
      relayout-group order (`:440`) and the view gate, which is "match or served",
      interleaved as today's `constrain_residency` does.
-  5. **`apply_relayout(graph)`**: each relayout layout in copy order: priced source
+  6. **`apply_relayout(graph)`**: each relayout layout in copy order: priced source
      divisions, "a resident layout serves some read", and today's pins (source not
      choosing a division, no read can use it).
-  6. **`apply_coarse_tiling(graph)`**: `loop_id`/`tiled` per divided node, then
+  7. **`apply_coarse_tiling(graph)`**: `loop_id`/`tiled` per divided node, then
      execution edges along the chain (`same_nest`, `joined`, group step), then cuts,
      then tile counts.
-  7. **`apply_cloning(graph)`**: input clones. A no-op in Phase 1, where a clone's
+  8. **`apply_cloning(graph)`**: input clones. A no-op in Phase 1, where a clone's
      matches are ordinary READ-edge tables; in Phase 2c it posts the clone's relation
      derived from its consumers.
 
@@ -389,8 +395,8 @@ Notes:
   @dataclass(frozen=True)
   class Enumerations:                  # a node's strategy per axis
       division: Enumeration            # carries tiling too while it is a Table
-      residency: Enumeration           # Fixed(False, reason) when a construction
-                                       # check excludes the node; else open
+      residency: Enumeration           # open; apply_op_constraints may pin it at
+                                       # finalization
       offset: Enumeration
 
   class EnumerationFactory:            # validates the config, picks strategies
@@ -436,8 +442,8 @@ Notes:
     node (not a node), in the allocator's order; graph inputs become nodes with a
     `GraphInput` origin.
   - `read_count`, lifetimes and overrides and `spill_cost` inputs as given; each
-    buffer's `residency_reason` becomes its node's construction check result
-    (`Fixed(False, reason)` residency).
+    buffer's `residency_reason` is kept on its `NodeSpec`, for
+    `apply_op_constraints` to apply.
   - Origins: `Produced(uses[0])` for op outputs (today's filter: has `uses`, not
     `first_use_is_read`, not a copy), `GraphInput(uses[0])` for graph inputs; then
     `add_successor` over the `Produced` nodes in `produced_at` order;
@@ -457,7 +463,7 @@ Notes:
   |---|---|
   | `name`, `size`, `first_use_is_read`, `boundary` | `NodeSpec` |
   | `uses`, `lifetime_*_override` | `NodeSpec.start_time` / `end_time` / `read_count`; `uses[0]` → `produced_at` |
-  | `residency_reason` | `NodeSpec.residency_reason` → `Fixed(False, reason)` residency |
+  | `residency_reason` | `NodeSpec.residency_reason`, applied by `apply_op_constraints` |
   | `core_divisions` (with each `.tiling`) | `Table` enumeration (division and tiling shared) |
   | `parents`, `cd_parent_matches`, `cd_parent_relayouts` | READ edges: `ViewRelation.table`, `RelayoutRelation` |
   | `in_place_parents` | IN_PLACE edges |
@@ -521,8 +527,8 @@ Notes:
   - `apply_inplace(node)`: per IN_PLACE input, the merge literal; `eff_size` equality
     when the child chooses a division; offset equality; both-resident implications;
     the view gate unless `view is None`; then at-most-one.
-  - `apply_placement(graph)`: capacity, 2-D no-overlap with tick shortening,
-    exclusion pins.
+  - `apply_placement(graph)`: capacity and 2-D no-overlap with tick shortening.
+  - `apply_op_constraints(node)`: the exclusion pins, in today's position.
   - `apply_reads(node)`: per READ output, served literals and "match or served"; the
     served literals are kept on the edge.
   - `apply_relayout(graph)`: today's `_constrain_relayout_copies`, over the nodes'
@@ -765,8 +771,9 @@ constraints over small per-buffer domains, never per-pair tables.
     buffer's dims equals the consumer's core count. A consumer that splits an axis
     the input lacks would read stale scratchpad on the cores without a copy, and today
     such a view is skipped.
-  - A consumer with no `MemoryDep` read of the input or no `MemoryDep` write is a
-    construction check: it fixes the clone out of LX, as today's empty table does.
+  - A consumer with no `MemoryDep` read of the input or no `MemoryDep` write is an op
+    constraint (`apply_op_constraints`): it keeps the clone out of LX, as today's empty
+    table does.
 
   Agreement: the feasible pairs equal the allocator's final `cd_parent_matches`,
   carries and clones included.
@@ -846,8 +853,8 @@ constraints over small per-buffer domains, never per-pair tables.
     interface, including `OnlyEnforceIf`, optional intervals and `AddNoOverlap2D` as a
     scored global constraint, next to a `cp_model` adapter with the same names.
 - **3b. Node absorbs the allocator-only fields** (`in_place_parents` → IN_PLACE edges,
-  `residency_reason` → the node's construction checks, lifetime overrides, `lx_view`,
-  `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with` (greedy only),
+  `residency_reason` → `apply_op_constraints` reading the op, lifetime overrides,
+  `lx_view`, `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with` (greedy only),
   `division_space` → `Lazy` division; `residency_edges` and `tile_reads` → relations;
   `op_position` → `produced_at`). Sizes stay in alignment units on the node as the draft
   has them; `address` is written back in bytes.
