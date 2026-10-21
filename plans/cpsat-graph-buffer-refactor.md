@@ -697,11 +697,35 @@ constraints over small per-buffer domains, never per-pair tables.
 
 ## Phase 3 — one problem definition (outline; own plan after Phase 2)
 
-- **3a. `graph.set_solver(...)`.** The model passed to `solve` becomes the backend;
-  `cost_expr` stays the solver-neutral objective. Lands with CP-SAT only. SA becomes a
-  backend once it consumes relations' geometry (it already works lazily over
-  `ResidencyEdge` through `_ViewRelation`, `sa_cooptimizer.py:614`, and generates
-  divisions, `:378`), which Phase 2c provides.
+- **3a. `graph.set_solver(...)` over a backend protocol.** The model passed to `solve`
+  becomes a backend; `cost_expr` stays the solver-neutral objective.
+  - **The protocol is ours, shaped like `pywraplp`.** `pywraplp.Solver` (`ortools
+    .linear_solver`) is the template for the API: `CreateSolver(id)`, `IntVar` /
+    `BoolVar`, `Add`, `Minimize`, `Solve`, `solution_value`. On top of it go the
+    operations the elements already post: reification (`enforce_if`), element /
+    table, multiplication / division equality and 2-D no-overlap. `pywraplp` itself
+    cannot be the protocol: in OR-Tools 9.15 it is linear-only from Python (no
+    indicator constraints exposed), and `math_opt` adds indicator and quadratic
+    constraints but no globals. Linearizing our model (big-M reification, one-hot
+    element/table, pairwise no-overlap disjunctions, binary expansion of products)
+    would hand CP-SAT a much weaker model, and the solve is 29–73% of planning today
+    (Phase 2.0).
+  - **Backends.**
+    - `CpSat` — direct pass-through. It is the only backend that lands first.
+    - `Mip` — over `pywraplp` (SCIP, HiGHS, CBC, or `CP_SAT` as an MPSolver),
+      implementing the extra operations by linearization. It gives a second opinion
+      on optima and access to MIP solvers.
+    - `Annealing` — a wrapper that lets SA act as a generic solver behind the same
+      protocol: it records vars, domains and constraints, then searches assignments
+      with constraints as hard checks or penalties and the objective from
+      `cost_expr`. A flat constraint list makes a weak SA, so the wrapper also takes
+      optional neighbourhood providers from the elements: the view relations'
+      geometry (Phase 2c; SA already works lazily over `ResidencyEdge` through
+      `_ViewRelation`, `sa_cooptimizer.py:614`) and `Lazy` division generation
+      (`:378`).
+  - **Gate.** Before `Mip` or `Annealing` is offered, replay the Phase 2.0 captures
+    (`~/cpsat_bench/deenum2`) through each: same optimum as `CpSat` where both prove
+    one, plus solve time. The linearization cost is measured, not assumed.
 - **3b. Node absorbs the allocator-only fields** (`in_place_parents` → IN_PLACE edges,
   `residency_reason` → the node's construction checks, lifetime overrides, `lx_view`,
   `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with` (greedy only),
