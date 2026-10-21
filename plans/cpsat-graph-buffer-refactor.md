@@ -23,9 +23,9 @@ that end state without another redesign.
 Goal: model the solve as a graph.
 
 - **`ComputeNode`** — an op output (inputs and copies: see *Open questions*). It holds
-  a `SplitSpace` (what it may choose: per-axis core splits and per-level tile counts)
-  and its decisions (`assignment`, `resident`, `offset`), each fixed ahead of time or
-  `None` for the solver to find.
+  one **enumeration strategy per decision axis** (`Fixed`, `Table`, `Lazy` or
+  `Pruned`; see *Design rules*) and its decisions (`assignment`, `resident`, `offset`),
+  each fixed ahead of time or `None` for the solver to find.
 - **`DependencyEdge`** — every data dependency between two nodes (reads, in-place
   reuse, relayout copies). It holds *relations* over the two ends' decisions: the
   per-core view match (`ViewRelation`) and, on a read, the relayouts that can bridge a
@@ -46,9 +46,10 @@ Three phases, each stage its own PR that leaves the full suite green:
   allocator's final data and every relation uses its *table* encoding, which is
   today's model. Each stage is proven by an identical CP model (see *Verification*).
   The allocator's three classes stay the external contract.
-- **Phase 2 — constraint encodings (CP-SAT internals).** Each relation gains a
-  constraint encoding over per-axis split / per-level tile vars, behind a flag, checked
-  against the table encoding. Then menus stop being materialized.
+- **Phase 2 — constraint encodings (CP-SAT internals).** Each axis gains a `Lazy`
+  strategy and each relation a constraint encoding over per-axis split / per-level tile
+  vars, selected through the strategy factory and checked against the table encoding.
+  Then menus stop being materialized where the config asks for it.
 - **Phase 3 — one problem definition.** `graph.set_solver(...)`, then the allocator
   builds the graph and the other solvers move onto it.
 
@@ -61,9 +62,10 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
 ## Design rules
 
 1. **Relations, not tables.** Every relationship is an object over the two ends'
-   decisions with two encodings: a table over menu indices (Phase 1, today's model)
-   and constraints over split / tile vars (Phase 2). Nothing outside a relation reads
-   menu indices; queries take `Assignment`s.
+   decisions. Its encoding follows the strategies at its two ends (see rule 5): a
+   table over menu indices when both are `Table` (Phase 1, today's model), constraints
+   over per-axis vars otherwise (Phase 2). Nothing outside a relation reads menu
+   indices; queries take `Assignment`s.
 2. **Phase 1 derives nothing the allocator decided.** Match tables (including the
    loop-carry intersection and input-clone overrides, `allocator.py:4160-4240`),
    capped relayouts and the copies built from them, read counts (`len(uses)`, which
@@ -71,13 +73,41 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
    exclusions all come in as data. Moving any derivation out of the allocator is
    Phase 2/3 work with its own agreement test.
 3. **`None` means an open decision.** `assignment`, `resident`, `offset` only.
-   Structural fields are never `Optional`. "Fixed" is a decision state, not a type:
-   a node is fixed when its `assignment` is set before the solve, whatever its space.
-   A fixed node posts constants (or nothing) where an open one posts vars.
+   Structural fields are never `Optional`. "Fixed" is a strategy on a decision axis,
+   not a buffer type: an axis whose strategy is `Fixed` has its value before the solve
+   and posts constants (or nothing) where an open one posts vars.
 4. **Build structure, then finalize once.** `add_node` / `add_child` / `add_successor`
    wire the graph and touch no model. `solve(model, cost_expr)` calls
    `Graph._finalize(model)`, where every element posts its vars and constraints in a
    fixed order.
+5. **Enumeration is a polymorphic strategy, per decision axis.** Each axis of a node
+   (core division, coarse tiling, residency, offset; relayout choice per READ edge)
+   has an `Enumeration` with `realize(model, node)` (post the axis's vars and legality)
+   and `holds(value)` (a query, no model):
+   - `Fixed(value)` — known before the solve; posts constants. `Fixed(COMMITTED)` is a
+     placement-only buffer: committed upstream by work division, posts nothing.
+   - `Table(candidates)` — explicit candidates: an index var plus element ties
+     (today's menu). Core division and tiling share one `Table` (today's joint menu)
+     until tiling goes lazy, then they separate.
+   - `Lazy(space)` — per-axis vars plus legality as constraints, no candidates.
+   - `Pruned(space, keep)` — generate, keep a shortlist, realize it as a `Table`.
+     Today's relayout group capping is a `Pruned` relayout enumeration.
+
+   Strategies come from a default plus an `EnumerationFactory` that validates the
+   config and returns the strategies for each node (for example, `Lazy` tiling requires
+   tiling to be its own axis). The default reproduces today: `Table` for menus,
+   `Fixed(COMMITTED)` for placement-only buffers, `Pruned` relayouts.
+
+   Every strategy's `realize` exposes the same per-axis vars (`split(key)`,
+   `level(k)`; `Table` already makes them by element). So a relation has one general
+   encoding, per-axis constraints, plus the pair table as an optimization when both
+   ends are `Table`:
+
+   | src \ dst | `Fixed` | `Table` / `Pruned` | `Lazy` |
+   |---|---|---|---|
+   | `Fixed` | checked at build | allowed indices | per-axis equality to constants |
+   | `Table` / `Pruned` | allowed indices | pair table (today) | per-axis equality |
+   | `Lazy` | per-axis equality to constants | per-axis equality | per-axis equality |
 
 ## The model
 
@@ -117,7 +147,7 @@ class ExecutionEdge(GraphElement):
 class ComputeNode(GraphElement):
     ...  # name, size (alignment units), start/end_time and lifetime overrides,
          # read_count, spill_cost, boundary, sym_core_divs, sym_tile_counts
-    space: SplitSpace                        # what the node may choose
+    enumerations: Enumerations               # one strategy per decision axis
     assignment: Optional[Assignment]         # None = free
     resident: Optional[bool]                 # None = free
     offset: Optional[int]                    # None = free
@@ -151,7 +181,7 @@ class Graph:
     head: Sentinel                           # chain ends; not in nodes, no vars,
     tail: Sentinel                           # never returned by solve()
 
-    def add_node(self, buffer, space: SplitSpace) -> ComputeNode
+    def add_node(self, buffer, enumerations: Enumerations) -> ComputeNode
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes; no edge list
     def solve(
         self,
@@ -162,11 +192,11 @@ class Graph:
     def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
 ```
 
-`SplitSpace`, `Assignment` and the three relations (`ViewRelation`,
+The `Enumeration` strategies, `Assignment` and the three relations (`ViewRelation`,
 `RelayoutRelation`, `NestRelation`) are what the graph holds; each stage below
 introduces only the part of their interface it needs (Stage 1: data and queries;
-Stage 5: posting node vars; Stage 6: posting edge constraints; Phase 2: constraint
-encodings and generated spaces).
+Stage 5: `realize`; Stage 6: posting edge constraints; Phase 2: `Lazy` / `Pruned`
+strategies and the mixed-pair encodings).
 
 Notes:
 
@@ -183,7 +213,7 @@ Notes:
   `apart` in cuts (`ilp_solver_ortools.py:392/410/470`), and a missing key is common
   (any producer with a `residency_reason`).
 - **`_finalize(model)` order is today's order**, element by element:
-  1. **Nodes**, in `add_node` order: `space.post` (division, `eff_size`, `cores`,
+  1. **Nodes**, in `add_node` order: each axis's `realize` (division, `eff_size`, `cores`,
      `core_cost`, split and tile-count vars), `in_buffer`, `offset`, and the `merge_*`
      literal for each IN_PLACE input (today these are made per wrapper, `:226`).
   2. **IN_PLACE edges**, by destination (`dst.inputs`): merge constraints, then
@@ -215,12 +245,12 @@ Notes:
 - **Graph inputs and relayout copies.** Neither has its own slot in the op order: an
   input's clone-in happens at its first use, and a copy's shuffle runs directly before
   its first consumer only if the solve keeps it. Recommendation: a small node type of
-  their own (space, decisions, `inputs`/`outputs`, no `produced_at`/`prev`/`next`),
+  their own (enumerations, decisions, `inputs`/`outputs`, no `produced_at`/`prev`/`next`),
   joined through `add_child`; `ComputeNode` stays op outputs only. Copies do not break
   tiling runs today, and this keeps that exactly.
-- **Tiling vs division coupling** is settled by the end state: in Phase 1 a menu index
-  picks both; in Phase 2 splits and tile counts are separate vars constrained jointly
-  (split domains depend on the tiling through `predict_frame`).
+- **Tiling vs division coupling** is settled: they share one `Table` (one menu index
+  picks both) and separate into two axes once tiling goes `Lazy`, as separate vars
+  constrained jointly (split domains depend on the tiling through `predict_frame`).
 
 ## Phase 1 — re-representation
 
@@ -255,10 +285,22 @@ Notes:
       COMMITTED: ClassVar[Assignment]  # fixed upstream by work division; its splits
                                        # are not visible to the solve (placement-only)
 
-  class SplitSpace(ABC):
-      def holds(self, a: Assignment) -> bool
-  class MenuSpace(SplitSpace):         # the allocator's menu (empty when it built none)
-      core_divisions: list[CoreDivision]
+  class Enumeration(ABC):              # one decision axis of a node
+      def holds(self, value) -> bool
+  class Fixed(Enumeration):            # value known before the solve
+      value: Any
+  class Table(Enumeration):            # explicit candidates (the allocator's menu)
+      candidates: list[CoreDivision]   # division and tiling share it for now
+
+  @dataclass(frozen=True)
+  class Enumerations:                  # a node's strategy per axis
+      division: Enumeration            # carries tiling too while it is a Table
+      residency: Enumeration           # open; exclusions stay on Graph.exclusions and
+                                       # are pinned at step 4, today's order
+      offset: Enumeration
+
+  class EnumerationFactory:            # validates the config, picks strategies
+      def for_node(self, buffer) -> Enumerations   # default: today's model
 
   class ViewRelation:                  # both ends own the buffer with the same view
       table: DivisionMap               # allocator's final pairs; empty = never alike
@@ -282,10 +324,10 @@ Notes:
 ### Stage 2. Builder
 
 - `build_graph(buffers, alignment, capacity, exclusions)` makes the `Graph`, one
-  `add_node` per buffer in the allocator's order, each with a `MenuSpace` of its menu,
-  and the edges through `add_child`. A placement-only buffer has no menu: its node is
-  added with `assignment=Assignment.COMMITTED`, i.e. fixed, not a separate type. It is
-  the only code that reads the allocator classes, and it copies their final data:
+  `add_node` per buffer in the allocator's order, with the default factory's
+  strategies (`Table` of the buffer's menu; a placement-only buffer gets
+  `Fixed(COMMITTED)`), and the edges through `add_child`. It is the only code that
+  reads the allocator classes, and it copies their final data:
   - READ edges only between nodes that both have a menu, i.e. neither is
     `COMMITTED` (today's no-op `constrain_residency` on placement-only wrappers).
     `view.table` is `cd_parent_matches.get(src, ())`; `relayout` is
@@ -329,14 +371,14 @@ Notes:
 
 ### Stage 5. Nodes post their own vars
 
-- Adds `SplitSpace.post(model, node) -> NodeVars`, the node's vars as the relations
-  will see them (`division`, `eff_size`, `cores`, `core_cost`, split and tile-count
-  vars, `in_buffer`, `offset`, merge literals). `ComputeNode._finalize(model)` calls
-  it for nodes whose `assignment` is open, replacing the variable-making half of both
-  wrappers: `MenuSpace` posts today's index var, element ties and single-candidate
-  constants. A node fixed at `Assignment.COMMITTED` posts no split vars, which is
-  today's placement-only model (`cores`, `core_cost` `None`, no gates). Merge literals
-  are made here, in node order.
+- Adds `Enumeration.realize(model, node)`, returning the node's vars as the relations
+  will see them (`NodeVars`: `division`, `eff_size`, `cores`, `core_cost`, split and
+  tile-count vars, `in_buffer`, `offset`, merge literals). `ComputeNode._finalize`
+  calls it per axis, replacing the variable-making half of both wrappers: `Table`
+  posts today's index var, element ties and single-candidate constants;
+  `Fixed(COMMITTED)` posts no split vars, which is today's placement-only model
+  (`cores`, `core_cost` `None`, no gates). Merge literals are made here, in node
+  order.
 - The node also exposes `buffer`, `division` and `division_is` for
   `cpsat_expr_printer`, so that contract is unchanged until Phase 2a. Var names stay
   as today.
@@ -383,9 +425,10 @@ Notes:
   op-output nodes along the execution chain with every `None` field filled
   (`assignment`, so the tiling; `resident`; `offset`) and `chosen` set on READ edges.
   That list is the execution plan.
-- Pre-fixed decisions: a fixed concrete `assignment` posts a constant index (its edges
-  keep their gates, with that side constant); `Assignment.COMMITTED` posts nothing, as
-  above; fixed `resident`/`offset` pin their vars. Bottom-justify is skipped when any
+- Pre-fixed decisions are `Fixed` strategies: a concrete `Fixed` division posts a
+  constant index (its edges keep their gates, with that side constant);
+  `Fixed(COMMITTED)` posts nothing, as above; `Fixed` residency / offset pin their
+  vars. Bottom-justify is skipped when any
   offset was pinned.
 - `_plan_layout_generic` makes the model, calls `graph.solve(model, cost_expr)` and
   writes back: `address` in bytes, `spill_reason`, `chosen_division` only where the
@@ -412,9 +455,11 @@ Kept unchanged through Phase 1: `_gate_divisions`, `_PlacementUnit`, `_justify`,
 
 ## Phase 2 — constraint encodings (outline; own plan after Phase 1)
 
-Each stage adds a constraint encoding behind a flag and an **agreement test** against
-the table encoding on the full corpus and the device graphs: same feasible
-(src, dst) assignments for a relation, or same optimum for a solve. What is not linear
+Each stage adds a strategy or encoding, selectable through the `EnumerationFactory`
+(default unchanged), and an **agreement test** against the table encoding on the full
+corpus and the device graphs: same feasible (src, dst) assignments for a relation, or
+same optimum for a solve. Mixed strategies on one graph (for example `Lazy` on tiled
+ops, `Table` elsewhere) use the per-axis encodings from rule 5. What is not linear
 is called out; it needs `AddMultiplicationEquality` / `AddDivisionEquality` or table
 constraints over small per-buffer domains, never per-pair tables.
 
@@ -522,8 +567,9 @@ constraints over small per-buffer domains, never per-pair tables.
   and `extract_op_features` reads `candidate_work_slices`. Tabulate over per-axis
   tuples (`AddAllowedAssignments`, small at ≤ 32 cores) instead. Prerequisite for the
   rest; agreement: identical lowered values at every menu point.
-- **2b. `NestRelation` on per-level tile vars.** `NodeVars` gains `level(k)`: per
-  node `L0`, `L1` (`max_dims=2`) tied to the per-dim counts; `same_nest` is the
+- **2b. `Lazy` tiling; `NestRelation` on per-level tile vars.** Tiling becomes its
+  own axis (the factory requires it for `Lazy` tiling). `NodeVars` gains `level(k)`:
+  per node `L0`, `L1` (`max_dims=2`) tied to the per-dim counts; `same_nest` is the
   two-way reified `L0 == L0' ∧ L1 == L1' ∧ tiled` (a one-way `_gate_divisions`
   would let `joined` go false on an equal pair and loosen cuts). Tile-by-tile
   alignment (`tile_misread`) becomes a tile `ViewRelation`, closing the Stage 8 gap.
@@ -576,19 +622,21 @@ constraints over small per-buffer domains, never per-pair tables.
   whose view is the consumer's; sharing between consumers by reified view equality.
   Legality (`movement_supported`, projection and core-domain gates) and price (per
   split-dim tables × 1/cores, governing dim chosen piecewise) are tables over
-  (src view, dst view). Group capping (`_cap_relayout_groups`) exists to bound
-  enumeration and goes away, or becomes a cap on views per buffer. Agreement where
-  capping did not bind; differences reported where it did.
+  (src view, dst view). Relayout choice becomes an axis with strategies: today's
+  group capping (`_cap_relayout_groups`) is `Pruned`, and `Lazy` drops the cap (or caps
+  views per buffer). Agreement where capping did not bind; differences reported where
+  it did.
 - **2e. In-place as constraints.** Per-core footprint equality
   (`out_partition · out_tiles`, a product equality) plus the `ViewRelation`. The
   pre-solve gates (pointwise input, equal device layout, one-tick handoff) stay
   builder facts.
-- **2f. `GeneratedSpace`.** A third `SplitSpace` wrapping `OpSplitSpace`. Per-axis
-  domains from `_legal_split_factors`, product ≤ max cores (multiplication equality),
-  at most one reduction split, blocked dims, the span cap as a per-dim table,
-  tiling-dependent domains through the level vars. Menus
-  are no longer materialized; `MenuSpace` remains for tests and for restricting a node
-  to listed candidates. Agreement: same optimum wherever the menu was complete.
+- **2f. `Lazy` core division.** `Lazy(OpSplitSpace)`: per-axis domains from
+  `_legal_split_factors`, product ≤ max cores (multiplication equality), at most one
+  reduction split, blocked dims, the span cap as a per-dim table, tiling-dependent
+  domains through the level vars. Menus are no longer materialized for nodes the
+  factory makes `Lazy`; `Table` remains for small menus, tests and listed candidates,
+  and `Pruned` for SA-seeded or cost-ranked shortlists. Agreement: same optimum
+  wherever the menu was complete.
 
 ## Phase 3 — one problem definition (outline; own plan after Phase 2)
 
@@ -600,7 +648,7 @@ constraints over small per-buffer domains, never per-pair tables.
 - **3b. Node absorbs the allocator-only fields** (`in_place_parents` → IN_PLACE edges,
   `residency_reason` → `Graph.exclusions`, lifetime overrides, `lx_view`,
   `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with` (greedy only),
-  `division_space` → `GeneratedSpace`; `residency_edges` and `tile_reads` → relations;
+  `division_space` → `Lazy` division; `residency_edges` and `tile_reads` → relations;
   `op_position` → `produced_at`). Sizes stay in alignment units on the node as the draft
   has them; `address` is written back in bytes.
 - **3c. The allocator builds the graph** at `_build_bound_buffers` (:1456/:1497),
