@@ -154,10 +154,25 @@ class ExecutionEdge(GraphElement):
     def joinable(self) -> bool:              # can the two ops share a nest at all?
         return self.contiguous and self.before.tileable and self.after.tileable
 
+@dataclass(frozen=True)
+class NodeSpec:
+    """What a node is, independent of the allocator's buffer classes."""
+    name: str
+    size: int                                # alignment units
+    start_time: int                          # lifetime, overrides applied
+    end_time: int
+    read_count: int                          # every reader, extern ones included
+    first_use_is_read: bool
+    boundary: BufferType
+    sym_core_divs: Mapping[SplitKey, sympy.Symbol]
+    sym_tile_counts: Mapping[TileKey, sympy.Symbol]
+    sym_division: sympy.Symbol
+    residency_reason: Optional[str]          # Phase 1: the allocator's; Phase 3: the
+                                             # node's construction checks
+
 @dataclass(eq=False)
 class ComputeNode(GraphElement):
-    ...  # name, size (alignment units), start/end_time and lifetime overrides,
-         # read_count, spill_cost, boundary, sym_core_divs, sym_tile_counts
+    spec: NodeSpec                           # spill_cost etc. derive from it
     enumerations: Enumerations               # one strategy per decision axis
     assignment: Optional[Assignment]         # None = free
     resident: Optional[bool]                 # None = free
@@ -191,7 +206,7 @@ class Graph:
     head: Sentinel                           # chain ends; not in nodes, no vars,
     tail: Sentinel                           # never returned by solve()
 
-    def add_node(self, buffer, enumerations: Enumerations) -> ComputeNode
+    def add_node(self, spec: NodeSpec, enumerations: Enumerations) -> ComputeNode
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes; no edge list
     def solve(
         self,
@@ -312,7 +327,9 @@ Notes:
       offset: Enumeration
 
   class EnumerationFactory:            # validates the config, picks strategies
-      def for_node(self, buffer) -> Enumerations   # default: today's model
+      def for_node(                    # default: today's model
+          self, spec: NodeSpec, menu: Sequence[CoreDivision]  # empty: placement-only
+      ) -> Enumerations
 
   class ViewRelation:                  # both ends own the buffer with the same view
       table: DivisionMap               # allocator's final pairs; empty = never alike
@@ -335,11 +352,13 @@ Notes:
 
 ### Stage 2. Builder
 
-- `build_graph(buffers, alignment, capacity, exclusions)` makes the `Graph`, one
-  `add_node` per buffer in the allocator's order, with the default factory's
-  strategies (`Table` of the buffer's menu; a placement-only buffer gets
-  `Fixed(COMMITTED)`), and the edges through `add_child`. It is the only code that
-  reads the allocator classes, and it copies their final data:
+- `build_graph(buffers, alignment, capacity)` makes the `Graph` and, for each
+  allocator buffer (`LifetimeBoundBuffer`, `CoreDivisionBuffer` or
+  `RelayoutCopyBuffer`) in the allocator's order, a `NodeSpec` and one `add_node`
+  with the default factory's strategies (`Table` of its `core_divisions`; an empty
+  menu means placement-only and gets `Fixed(COMMITTED)`). Then it adds the edges
+  through `add_child`. It is the only code that reads the allocator classes; nothing
+  past it sees a buffer. It copies their final data:
   - READ edges only between nodes that both have a menu, i.e. neither is
     `COMMITTED` (today's no-op `constrain_residency` on placement-only wrappers).
     `view.table` is `cd_parent_matches.get(src, ())`; `relayout` is
@@ -393,8 +412,11 @@ Notes:
   (`cores`, `core_cost` `None`, no gates). Merge literals are made here, in node
   order.
 - The node also exposes `buffer`, `division` and `division_is` for
-  `cpsat_expr_printer`, so that contract is unchanged until Phase 2a. Var names stay
-  as today.
+  `cpsat_expr_printer`, so that contract is unchanged until Phase 2a. `buffer` is a
+  read-only view of the node, not an allocator buffer: the printer reads exactly
+  `core_divisions` (the `Table` candidates), `sym_core_divs` and `sym_division`
+  (`NodeSpec`) through it (`cpsat_expr_printer.py:249`, `:840`, `:881-895`). Var names
+  stay as today.
 - The wrappers hold their node and delegate to it, so no constraint code changes.
 - Proto diff empty.
 
