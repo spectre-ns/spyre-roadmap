@@ -906,3 +906,31 @@ constraints over small per-buffer domains, never per-pair tables.
   test_scratchpad_use, test_work_division, test_solver_relayout_e2e,
   test_solver_auto_coarse_tiling — base vs change, same serial setup.
 - `pre-commit run --files <changed>` (ruff, mypy).
+
+## Probes
+
+All measurement code behind this plan is in **`probes/cpsat-graph/`**, with a README
+covering setup and every script. Nothing there changes torch-spyre: each hook is a
+process-local monkeypatch. Run outputs and captures go to `deenum/runs/`, which is not
+committed. Run with the torch-spyre checkout first on `PYTHONPATH` (the shell drivers
+take it from `TORCH_SPYRE`); compiling needs the Spyre card, replays do not.
+
+| probe | where | answers | used in |
+|---|---|---|---|
+| Eager profile and solver-input capture | `deenum/timers.py`, `zoo_t.py`, `granite_t.py`, `run_profile.sh` | where planning time goes per phase; captures each solve's inputs with per-candidate view and tile keys | 2.0 tables |
+| Eager + hash join | `deenum/run_profile_hj.sh` (`DEENUM_HASHJOIN=1`) | the bar lazy has to beat: `match_pairs` as a hash join on the exact view key, checked against the original | 2.0 |
+| Lazy vs eager replay | `deenum/lazy_probe.py`, `report_probe.py` | per-edge exactness of the per-axis view and tile relations; solve time and objective for E / L1 / L2 at 1 and 16 workers; `INTERLEAVE=1` for deterministic multi-worker search | 2.0, 2b, 2c |
+| Relayout legality | `deenum/zoo_ms.py` (record), `ms_check.py` (closed form), `ms_synth.py` (synthetic views) | whether `movement_supported` has a closed form over view digits | 2d |
+| Relayout pricing profile | `deenum/zoo_cprof.py` | where `_cd_parent_relayouts` spends its time | 2d |
+| SA as a generic backend | `sa_ilp/sa_solver.py`, `cpsat_backend.py`, `problems.py`, `run_probe.py` | whether a `pywraplp`-shaped interface can drive SCIP, CP-SAT and simulated annealing from one model builder; SA's gap on generic ILPs | 3a |
+| LX layout with 2-D no-overlap | `sa_ilp/lx_layout.py` | SA with a scored `AddNoOverlap2D` against CP-SAT on the real layout model from captures, with an independent feasibility check | 3a |
+
+Typical runs:
+
+```bash
+bash probes/cpsat-graph/deenum/run_profile.sh                 # profile + captures (card)
+PYTHONPATH=$TORCH_SPYRE python3 probes/cpsat-graph/deenum/lazy_probe.py \
+    probes/cpsat-graph/deenum/runs/caps_default out.jsonl 1,16 30  # replay (no card)
+python3 probes/cpsat-graph/deenum/ms_check.py ms.jsonl         # relayout closed form
+python3 probes/cpsat-graph/sa_ilp/run_probe.py ilp.jsonl 10 60 # SA vs SCIP / CP-SAT
+```
