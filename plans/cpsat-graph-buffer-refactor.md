@@ -194,6 +194,9 @@ Notes:
   are both unset, so an op cannot be inserted between two linked ones later.
   `contiguous` is derived as today (consecutive `produced_at` ticks), so a gap still
   splits a tiling segment even when the two nodes are linked.
+- Out of scope: solver-chosen op order. Execution order is an input to this plan
+  (`add_successor`). Leaving it out, and letting the solve place ops, is what op
+  reordering would need; that is separate work and changes none of the stages here.
 - `ExecutionEdge`s link *all* op outputs in the solve, not just the tileable ones.
   `joinable` reproduces today's rule that an untileable op, or a gap in ticks, splits a
   tiling segment. `nest_pairs` is today's "same `TileSpec.level_counts`, not untiled"
