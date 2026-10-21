@@ -115,7 +115,6 @@ class ComputeNode(GraphElement):     # the node
     prev: ExecutionEdge             # always linked: the chain runs graph.head -> ... -> graph.tail
     next: ExecutionEdge
 
-    graph: Graph                    # set by the factory
     # decision vars: created by _finalize(model), read back by extraction
 
     def add_child(
@@ -130,19 +129,16 @@ class ComputeNode(GraphElement):     # the node
         # the only way to add an execution edge: sets self.next / after.prev, derives
         # nest_pairs from both nodes' candidate tilings and contiguous from produced_at
 
-class NodeFactory:                  # one per solve; every node it makes joins the same graph
-    def __init__(self, graph: Graph)
-    def node(self, buffer) -> ComputeNode  # makes the node only; no vars until _finalize(model)
-
 class Graph:
     alignment: int
     capacity: int                    # LX capacity in alignment units
     exclusions: dict[str, str]       # name -> residency_reason (record_exclusions)
     shuffles_priced: bool            # False under the fallback objective: copies pinned out
-    nodes: dict[str, ComputeNode]    # insertion order = the order the factory made them
+    nodes: dict[str, ComputeNode]    # insertion order = add_node order
     head: ComputeNode                # boundary sentinels closing the execution chain;
     tail: ComputeNode                # edges to them are never joinable
 
+    def add_node(self, buffer) -> ComputeNode  # makes and registers the node; no vars yet
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes' outputs; no edge list
     def solve(self) -> list[ComputeNode]  # the public entry point: make the model, finalize,
                                           # solve, fill every None field; op outputs in order
@@ -249,17 +245,17 @@ Notes:
 - In `scratchpad/buffer_graph.py`: `GraphElement`, `DependencyKind`, `DivisionMap`,
   `DependencyEdge` (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`,
   `joinable`, `joins`),
-  `Graph` (context, `edges_of`, `tiling_segments`), `NodeFactory`, and the
-  node gains `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`,
-  `graph`, `add_child` taking `pairs` only (no `geometry` yet; see Stage 2b),
-  and `add_successor`.
+  `Graph` (context, `add_node`, `edges_of`, `tiling_segments`), and the node gains
+  `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`, `add_child`
+  taking `pairs` only (no `geometry` yet; see Stage 2b), and `add_successor`.
 - `spill_cost` and the node's derived properties (`sym_is_lx`, `sym_division`,
   `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`) stay as drafted.
 - Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline` from the draft.
-- Tests (`tests/inductor/test_buffer_graph.py`, no device): the factory's nodes share
-  one graph; `add_child` puts one edge object on both ends (and nowhere else), and two
+- Tests (`tests/inductor/test_buffer_graph.py`, no device): `add_node` keeps insertion
+  order; `add_child` puts one edge object on both ends (and nowhere else), and two
   edges of different kinds can join the same pair; `DivisionMap` answers
-  `allows`/`dst_options`/`src_options` consistently with `pairs`; `slices_alike` is true on an ungated edge; `bridges`
+  `allows`/`dst_options`/`src_options` consistently with `pairs`; `slices_alike` is
+  true on an ungated edge; `bridges`
   returns only the copies priced for that pair; `add_successor` links both ends, derives
   `nest_pairs` and `contiguous`, and refuses a second successor or predecessor;
   links and `contiguous`; `joins` follows `nest_pairs`; `tiling_segments` splits at
@@ -269,11 +265,11 @@ Notes:
 
 ### Stage 2a. Builder
 
-- `build_graph(buffers, model, alignment, capacity, exclusions, shuffles_priced)` makes
-  a `NodeFactory`, one node per buffer, and the edges through `add_child`. It is the
-  only code that looks at the allocator classes. It encodes what is already known:
-  - `resident=False` for excluded buffers, and for copies whose source does not choose
-    a division or that no READ edge can use.
+- `build_graph(buffers, alignment, capacity, exclusions, shuffles_priced)` makes the
+  `Graph`, one `add_node` per buffer in the allocator's order, and the edges through
+  `add_child`. It is the only code that looks at the allocator classes. It encodes what
+  is already known:
+  - `resident=False` for excluded buffers. Copy pinning waits for `_finalize`.
   - READ edges only between nodes that both choose a division (this matches today's
     no-op `constrain_residency` on placement-only wrappers). `division_map` comes from
     the consumer's `cd_parent_matches[src]`, `relayouts` from its
