@@ -22,7 +22,9 @@ that end state without another redesign.
 
 Goal: model the solve as a graph.
 
-- **`ResourceNode`** — every resource an op needs: op outputs and graph inputs. A
+- **`ResourceNode`** — the main object of the graph: everything else (edges, relayout
+  layouts, decisions) is reached from a node, and the graph hands out nodes
+  (`get_nodes()`). A node is every resource an op needs: op outputs and graph inputs. A
   relayout is not a node: it is a second layout of the producer's output with a longer
   lifetime, and realizing the plan inserts the copy. A node holds
   one **enumeration strategy per decision axis** (`Fixed`, `Table`, `Lazy` or
@@ -259,7 +261,9 @@ class SpyreOptimizationGraph:
         # the graph builds the NodeSpec from either source: an allocator buffer
         # (or its CoreDivisionBuffer / RelayoutCopyBuffer subclass) in Phase 1, an
         # IR op from Phase 3 (returns the existing node if that op was added)
-    def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes; no edge list
+    def get_nodes(self) -> Iterator[ResourceNode]  # in add_node order; edges are
+                                                   # reached through node.inputs /
+                                                   # node.outputs, never listed
     def solve(
         self,
         model: cp_model.CpModel,
