@@ -439,6 +439,77 @@ constraints over small per-buffer domains, never per-pair tables.
   - **Fail:** keep menus and replace only the parts the probe shows are hot (for
     example per-pair tables → per-buffer view tables), and revise the end state here.
 
+  **Minimal probe, run 2026-10-21 on `main` 82edd8f6** (harness `~/cpsat_bench/deenum2`:
+  `timers.py` phase profile + capture, `lazy_probe.py`, `report_probe.py`; 32 zoo
+  graphs and Granite 4.0-micro, default config and `AUTO_COARSE_TILING=1`).
+
+  *Where eager planning time goes today* (exclusive seconds; enumeration = menus +
+  match tables):
+
+  | config | planning | menus | match tables | relayout pricing | lowering + cost build | CP-SAT solve |
+  |---|---|---|---|---|---|---|
+  | zoo, default | 152.5 s | 2.3 s (1.5%) | 3.0 s (2%) | 52.2 s (34%) | 44.4 s (29%) | 44.8 s (29%) |
+  | zoo, tiling | 292.4 s | 63.1 s (22%) | 138.6 s (47%) | 56.6 s (19%) | 0 | 28.9 s (10%) |
+  | Granite, default | 170.6 s | 1.2 s (1%) | 1.5 s (1%) | 11.1 s (7%) | 29.1 s (17%) | 124.9 s (73%) |
+  | Granite, tiling (11 of 15 plans) | 82.3 s | 25.4 s (31%) | 36.1 s (44%) | 10.5 s (13%) | 0 | 9.0 s (11%) |
+
+  Under tiling, `match_pairs` compares 63.7M candidate pairs (62M `same_partition`
+  calls) to produce 33K pairs; menus are re-enumerated per tiling.
+
+  *Is the per-axis relation exact?* The per-device-dim `(split, stride)` + core-count
+  key reproduces every pair table (385/385 zoo, 200/200 Granite, both configs). The
+  inferred per-axis rule (symbol → device dim, iteration order, contiguous dim)
+  reproduces the allocator's **final** table on 382/382 untiled zoo edges and 192/200
+  Granite edges (8 irregular owner formulas). Under tiling, 68% (zoo) / 84% (Granite)
+  of edges carry tile keys, which the probe did not model; they fell back to a table.
+
+  *Solver cost.* One reduced model (residency, footprint, capacity, 2-D no-overlap,
+  match gates; no cost expression, relayouts, in-place or cuts) built three ways: E
+  (menu index + pair tables, today), L1 (per-axis split vars, lazy gates, per-node
+  menu legality) and L2 (no menu: per-axis domains, core bound, one reduction
+  split). 30 s limit, seed 0. Proven optima agree everywhere: 0 objective mismatches
+  on every pair where both arms reached OPTIMAL, in every config, for L1 and L2 (so
+  the menus were complete for this model). Time to OPTIMAL vs E, pairs where E took
+  ≥ 0.2 s:
+
+  | config | workers | n | L1 median (range) | L2 median (range) |
+  |---|---|---|---|---|
+  | zoo, default | 16 | 8 | 1.02× (0.73–1.41) | 0.96× (0.77–1.28) |
+  | zoo, default | 1 | 7 | 1.44× (0.30–2.55) | 1.36× (0.21–3.87) |
+  | zoo, tiling (32% of edges lazy) | 16 | 11 | 0.82× (0.24–1.38) | 0.67× (0.20–1.25) |
+  | Granite, default | 1 and 16 | 2 | 0.65× | 0.27–0.35× |
+
+  Lazy model build is slower in Python (0.38 s vs 0.12 s over all 32 zoo solves) but
+  negligible next to planning.
+
+  *Expected improvement* (lazy removes menu and match-table construction; relayout
+  pricing and cost-model prediction stay until 2a/2d; solve scaled by the medians
+  above):
+
+  | config | today | expected with views + nests lazy | change |
+  |---|---|---|---|
+  | zoo, tiling | 292 s | ~85 s | **~3.4× faster planning** |
+  | Granite, tiling | 82 s | ~21 s | **~3.9× faster planning** |
+  | zoo, default, 16 workers | 152 s | ~148 s | ~3% faster (enumeration is small here) |
+  | zoo, default, 1 worker | 152 s | ~167 s | ~9% slower (1-worker search regression) |
+  | Granite, default | 171 s | ~168 s | ~2% faster (solve-bound; solve assumed at parity, n=2) |
+
+  **Verdict: pass for compiles with coarse tiling on, not on its own for default
+  compiles.** Conditions before 2b/2c land:
+  1. The tile relation (2b) must show the same exactness and solve parity; the probe
+     covered only 16–32% of tiled edges.
+  2. The 1-worker regression (`use_deterministic_algorithms`) must be fixed or bounded,
+     for example by channeling the per-axis vars to division literals or hinting from
+     the eager solution; it matches the 2026-10-07 finding that integer equalities
+     hurt single-worker search.
+  3. Compare against the cheap Python fix first: a hash join on the exact view key
+     reproduced `match_pairs` and cut the heaviest tiling graphs 134 → 58 s on
+     2026-10-07, and caching menus per tiling removes much of the menu time. Lazy
+     earns its place only where it beats eager + hash join; that run is the next probe
+     (`DEENUM_HASHJOIN=1`, same harness).
+  4. Relayout pricing (13–34% of planning) is untouched by 2b/2c; its saving depends
+     on 2d (per view pair instead of per candidate pair) and was not measured.
+
 - **2a. Cost expression over per-axis vars.** Today `cpsat_expr_printer` tabulates
   over the menu: `_division_table` (`:309`), `RelayoutCharge` keyed on `sym_division`
   (`:822`), `log2_` by element on the division, `AppliedUndef` menu tables (`:854`),
