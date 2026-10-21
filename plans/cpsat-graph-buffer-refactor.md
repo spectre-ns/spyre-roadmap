@@ -580,9 +580,9 @@ is called out; it needs `AddMultiplicationEquality` / `AddDivisionEquality` or t
 constraints over small per-buffer domains, never per-pair tables.
 
 - **2.0. Probe: is lazy faster than eager? (go / no-go for the rest of Phase 2.)**
-  Phase 1 does not depend on it, so it can run alongside. Device-free, built on the
-  solver-input capture and replay harness in `~/cpsat_bench/pr5132`
-  (`zoo_cap.py`, `granite_cap.py`, `replay.py`):
+  Phase 1 does not depend on it, so it can run alongside. The code is in
+  `probes/cpsat-graph/deenum/` (see its README): phase timers and solver-input
+  capture during a compile, then a device-free replay of the captures:
   1. **Where eager time goes today.** On the captured zoo models and Granite blocks,
      time the enumeration end to end: menu generation per op, `_cd_parent_matches`
      (|D_p| × |D_c| view comparisons per edge), `_cd_parent_relayouts` with
@@ -606,7 +606,7 @@ constraints over small per-buffer domains, never per-pair tables.
   - **Fail:** keep menus and replace only the parts the probe shows are hot (for
     example per-pair tables → per-buffer view tables), and revise the end state here.
 
-  **Minimal probe, run 2026-10-21 on `main` 82edd8f6** (harness `~/cpsat_bench/deenum2`:
+  **Minimal probe, run 2026-10-21 on `main` 82edd8f6** (`probes/cpsat-graph/deenum/`:
   `timers.py` phase profile + capture, `lazy_probe.py`, `report_probe.py`; 32 zoo
   graphs and Granite 4.0-micro, default config and `AUTO_COARSE_TILING=1`).
 
@@ -801,8 +801,11 @@ constraints over small per-buffer domains, never per-pair tables.
       `_ViewRelation`, `sa_cooptimizer.py:614`) and `Lazy` division generation
       (`:378`).
   - **Gate.** Before `Mip` or `Annealing` is offered, replay the Phase 2.0 captures
-    (`~/cpsat_bench/deenum2`) through each: same optimum as `CpSat` where both prove
-    one, plus solve time. The linearization cost is measured, not assumed.
+    (`probes/cpsat-graph/deenum/`) through each: same optimum as `CpSat` where both
+    prove one, plus solve time. The linearization cost is measured, not assumed. The
+    SA side is prototyped in `probes/cpsat-graph/sa_ilp/`: `SaSolver` implements this
+    interface, including `OnlyEnforceIf`, optional intervals and `AddNoOverlap2D` as a
+    scored global constraint, next to a `cp_model` adapter with the same names.
 - **3b. Node absorbs the allocator-only fields** (`in_place_parents` → IN_PLACE edges,
   `residency_reason` → the node's construction checks, lifetime overrides, `lx_view`,
   `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with` (greedy only),
