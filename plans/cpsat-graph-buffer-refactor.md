@@ -127,6 +127,23 @@ Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
    | `Table` / `Pruned` | allowed indices | pair table (today) | per-axis equality |
    | `Lazy` | per-axis equality to constants | per-axis equality | per-axis equality |
 
+   **Composing strategies across axes.** Every strategy realizes onto the same
+   per-axis vars, so composing them is a conjunction of constraints over those vars:
+   - `Fixed` with anything: the fixed axis's vars are constants.
+   - `Table` and `Lazy` on independent axes: each posts its own legality; nothing joins
+     them.
+   - `Table` and `Lazy` on dependent axes (a menu item is legal only for some values
+     of the other axis, e.g. a division whose span limit depends on the tiling): the
+     menu carries, per item, its condition on the other axis. It is posted either as
+     one per-node table over (menu index, the lazy vars the condition reads), or as
+     `division == i ⇒ condition_i` per item. Both stay per node, never per pair. For
+     division × tiling that is |menu| × at most 64 tiling options.
+   - If an item's condition can't be stated without enumerating the lazy axis in full
+     (a table past a size bound, or no closed form), the factory rejects that
+     composition and keeps both axes in one joint `Table` (today's menu) or makes both
+     `Lazy`. Each strategy declares the other axes it reads, and that declaration is
+     what the factory validates.
+
 ## The model
 
 ```python
