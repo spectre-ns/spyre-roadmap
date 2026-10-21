@@ -420,9 +420,9 @@ constraints over small per-buffer domains, never per-pair tables.
   rest; agreement: identical lowered values at every menu point.
 - **2b. `NestRelation` on per-level tile vars.** `NodeVars` gains `level(k)`: per
   node `L0`, `L1` (`max_dims=2`) tied to the per-dim counts; `same_nest` is the
-  two-way reified `L0 == L0' ∧ L1 == L1' ∧ tiled` (a one-way `_gate_divisions` would let `joined` go
-  false on an equal pair and loosen cuts). Tile-by-tile alignment (`tile_misread`)
-  becomes a tile `ViewRelation`, closing the Stage 8 gap.
+  two-way reified `L0 == L0' ∧ L1 == L1' ∧ tiled` (a one-way `_gate_divisions`
+  would let `joined` go false on an equal pair and loosen cuts). Tile-by-tile
+  alignment (`tile_misread`) becomes a tile `ViewRelation`, closing the Stage 8 gap.
 - **2c. `ViewRelation` constraints: views built from the ops.** A per-core view is
   determined by the op's index map plus divisibility of the buffer's shape, so it is
   posted, not enumerated:
