@@ -253,11 +253,12 @@ class SpyreOptimizationGraph:
     head: Sentinel                           # chain ends; not in nodes, no vars,
     tail: Sentinel                           # never returned by solve()
 
-    def add_node(self, buffer: LifetimeBoundBuffer) -> ResourceNode
-        # Phase 1: the graph converts the buffer (or its CoreDivisionBuffer /
-        # RelayoutCopyBuffer subclass) into a NodeSpec
-    def get_resource_node(self, op: torch._inductor.ir.Operation) -> ResourceNode
-        # Phase 3: the node for an IR op, built from the IR on first use, then reused
+    def add_node(
+        self, source: LifetimeBoundBuffer | torch._inductor.ir.Operation
+    ) -> ResourceNode
+        # the graph builds the NodeSpec from either source: an allocator buffer
+        # (or its CoreDivisionBuffer / RelayoutCopyBuffer subclass) in Phase 1, an
+        # IR op from Phase 3 (returns the existing node if that op was added)
     def edges_of(self, kind) -> Iterator[DependencyEdge]  # walks nodes; no edge list
     def solve(
         self,
@@ -864,15 +865,15 @@ constraints over small per-buffer domains, never per-pair tables.
   (greedy only), `division_space` → `Lazy` division; `residency_edges` and `tile_reads`
   → relations; `op_position` → `produced_at`). Sizes stay in alignment units on the
   node as the draft has them; `address` is written back in bytes.
-- **3c. The graph builds nodes from the IR.** `graph.get_resource_node(op)` builds a
-  node straight from the torch IR on first use: the `NodeSpec` from the op's layout
+- **3c. The graph builds nodes from the IR.** `graph.add_node(op)` builds a node
+  straight from the torch IR (once per op): the `NodeSpec` from the op's layout
   and its place in `graph.operations`, with the op's menu or its `OpSplitSpace` as the
   data the strategy enumerates (`Table`) or generates from (`Lazy`), and the residency
   reasons that `apply_op_constraints` reads from the op.
   It replaces the allocator's buffer construction at `_build_bound_buffers`
   (:1456/:1497), `_append_lx_relayout_destinations` (:1819), `_build_cd_bound_buffers`
   (:4074/:4275) and `_relayout_copy_buffers` (:4418), so no intermediate buffer is
-  built at all; `add_node(buffer)` stays only for tests and replay. The allocator's
+  built at all; the buffer form of `add_node` stays for tests and capture replay. The allocator's
   three `RelayoutCopyBuffer` checks (:2769, :2964, :3099) become relayout-layout lookups
   and the drain-plan `CoreDivisionBuffer` assertion (:713) a node check.
   `cd_parent_matches` / `cd_parent_relayouts` are deleted only once 2c/2d replace them.
