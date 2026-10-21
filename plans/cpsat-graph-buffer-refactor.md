@@ -51,7 +51,9 @@ Three phases, each stage its own PR that leaves the full suite green:
   vars, selected through the strategy factory and checked against the table encoding.
   Then menus stop being materialized where the config asks for it.
 - **Phase 3 — one problem definition.** `graph.set_solver(...)`, then the allocator
-  builds the graph and the other solvers move onto it.
+  builds the graph, the other solvers move onto it, and the allocator subclasses
+  collapse into one allocator whose behaviour comes from the backend and the
+  enumeration strategies.
 
 Work happens in worktree `.claude/worktrees/cpsat-graph-model` (branch
 `cpsat-graph-model`, off `main` 82edd8f6). No commits (user commits).
@@ -743,6 +745,40 @@ constraints over small per-buffer domains, never per-pair tables.
 - **3e. Exhaustive search and the SA co-optimizer** read relations from edges and
   write `assignment`/`resident` on nodes; SA's `_spill_cost` collapses onto
   `buffer_graph.spill_cost` and its op adjacency onto execution edges.
+- **3g. One allocator.** Today `select_allocator` (`allocator.py:5117`) picks
+  `ScratchpadAllocator` (33 methods, placement only) or `CoOptimizingAllocator(
+  ScratchpadAllocator)` (41 more, joint) from `config.co_optimizing_lx_planning`, and
+  the allocator branches on seven solver capability flags (`supports_paired_buffers`,
+  `decides_lx_relayouts`, `generates_divisions`, `chooses_tilings`,
+  `tilings_from_menu`, `replans_after_tiling`, `linear_cost_only`;
+  `plan_solver.py:988-1035`). Every difference is which unknowns are open and who
+  resolves them, which the graph now states generically, so the subclass goes:
+  - **What is unknown** is the strategies. Placement-only is every division
+    `Fixed(COMMITTED)`; joint is `Table` / `Lazy` / `Pruned`. The factory picks them
+    from config, so `co_optimizing_lx_planning` becomes a factory setting.
+  - **Who resolves it** is the backend (3a). The capability flags become what the
+    backend reports it can realize (for example `Annealing` takes `Lazy` division and
+    no pair tables), checked by the factory; an invalid combination is rejected at
+    construction instead of branched on inside the allocator.
+    `ExhaustiveSearchSolver.wrapping` becomes a backend that iterates a `Table`
+    division axis around a placement-only search.
+  - **Where `CoOptimizingAllocator`'s methods go.**
+    - Candidates (`_division_map`, `_enumerate_core_divisions`, `_tiling_candidates`,
+      `_division_space`) → the strategy producers behind the factory.
+    - Pair derivations (`_cd_parent_matches`, `_cd_parent_relayouts`,
+      `_cap_relayout_groups`, `_clone_divisions_and_matches`, `_loop_carry_*`,
+      `_parent_residency_edges`) → relations (2c / 2d).
+    - Pricing (`_pricing_operations`, `_extract_op_features`,
+      `_direct_read_candidates_priced`) → building `cost_expr`, the same for every
+      backend.
+    - Post-solve (`_post_solve`, `_materialize_selection`, `_apply_chosen_tilings`,
+      `_commit_copy_out_divisions`, `_finalize_lx_relayout_allocation`) → one
+      consumer of `solve()`'s execution plan, run unconditionally; with nothing open
+      it changes nothing.
+  - **`select_allocator`** returns the one allocator with (backend, factory) from
+    config. Needs 3a, 3c and 3e. Verification: every `layout_solver` ×
+    `co_optimizing_lx_planning` combination in the suites compiles to the same plans
+    as before the merge.
 - **3f. Tests**: 194 constructor calls across 14 files, mostly through helpers
   (`make_buffer_registry`, `synthetic_cooptimization_graphs._buf`,
   `cooptimization_capture_loader._buf`, `test_perm_layout_solver._buf`), plus direct
