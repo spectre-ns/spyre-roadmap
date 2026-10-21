@@ -268,7 +268,6 @@ class SpyreOptimizationGraph:
     ) -> list[ResourceNode]                   # op outputs in execution order
     def _finalize(self, model, strategy) -> None  # the strategy's apply_* steps,
                                                   # in today's order
-    def tiling_segments(self) -> list[list[ResourceNode]]  # maximal joinable chains
 ```
 
 The `Enumeration`s, `Assignment` and the three relations (`ViewRelation`,
@@ -426,8 +425,8 @@ Notes:
   `add_child` puts one edge object on both ends only, and two kinds can join one pair;
   relation queries (`holds`, `bridges`, `joins`) agree with their tables, and an empty
   table never holds; `add_successor` links both ends, derives `contiguous`, and refuses
-  a second neighbour; `tiling_segments` splits at gaps and at untileable ops; sentinels
-  are not in `nodes`; `tiling` is `None` while `assignment` is.
+  a second neighbour; `joinable` is false across a tick gap and at untileable ops;
+  sentinels are not in `nodes`; `tiling` is `None` while `assignment` is.
 
 ### Stage 2. Builder
 
@@ -500,8 +499,10 @@ Notes:
   (`group[after] = group[before] + 1 - joined`). A non-joinable edge starts a new
   segment with group 0. `same_nest` keeps today's `loop_id` encoding, `tile_group_*`
   keeps its domain, and `loop_id`/`tiled` are still made first, in node order.
-- `_tiling_group_ids` becomes a walk over `graph.tiling_segments()`; its `uses[0]`
-  logic and `RelayoutCopyBuffer` check go away.
+- `_tiling_group_ids` becomes a walk along the execution chain, starting a new segment
+  wherever an edge is not `joinable`; the segments are local to the coarse-tiling
+  encoding (in `Strategy.apply_coarse_tiling` from Stage 6), not a graph method. Its
+  `uses[0]` logic and `RelayoutCopyBuffer` check go away.
 - `_cut_literals`: for each tiled node, consumers on its READ edges in the same segment
   get an `apart` literal gated on `edge.view`; a consumer outside the segment, or a
   graph output, makes the node unshareable. `_tile_count_terms` iterates nodes.
