@@ -123,7 +123,6 @@ class ComputeNode:                  # the node
     def add_successor(self, after: ComputeNode) -> ExecutionEdge
         # the only way to add an execution edge: sets self.next / after.prev, derives
         # nest_pairs from both nodes' candidate tilings and contiguous from produced_at
-    def finalize_relayouts(self) -> None  # after all parents: priced, capped relayouts per READ edge
 
 class NodeFactory:                  # one per solve; every node it makes shares graph and model
     def __init__(self, graph: Graph, model: cp_model.CpModel)
@@ -138,8 +137,10 @@ class Graph:
     edges: list[DependencyEdge]      # in the order the solver adds their constraints
 
     def edges_of(self, kind) -> Iterator[DependencyEdge]
-    def encode(self) -> None  # every edge posts its constraints into the shared model, in order
-    def solve(self) -> list[ComputeNode]  # decisions filled; op outputs in execution order
+    def solve(self) -> list[ComputeNode]  # the public entry point: finalize, encode, solve,
+                                          # fill every None field; op outputs in execution order
+    def _finalize(self) -> None  # whole-graph derivations add_child/add_successor cannot do
+    def _encode(self) -> None    # every edge posts its constraints into the shared model, in order
     def tiling_segments(self) -> list[list[ComputeNode]]  # maximal joinable chains
 ```
 
@@ -156,15 +157,26 @@ Notes:
   (the synthetic and captured test graphs) pass `pairs` instead. Either way it puts the
   one edge object on both ends and on the graph. Once the solve starts, only decision
   fields change.
-- Relayout capping (`_cap_relayout_groups`) keeps any consumer division that another
-  parent already matches for free, so it needs all of a child's READ edges first. The
-  relayouts are therefore filled in once every parent has been added
-  (`child.finalize_relayouts()`), not inside each `add_child` call.
+- `add_child` and `add_successor` never compute anything that depends on another
+  edge. What does is done once by `Graph._finalize()`, the first step of `solve()`:
+  1. Read counts: each node's `spill_cost` and the "no LX reader" exclusion
+     (`resident=False`).
+  2. Relayout capping: `_cap_relayout_groups` keeps any consumer division that another
+     parent already matches for free, so each child's priced relayouts are filled in
+     only once all its READ edges exist.
+  3. Relayout copies: a copy that no READ edge can use, or whose source does not
+     choose a division, is pinned out (`resident=False`).
+  4. Tiling segments: the maximal joinable chains along the execution edges.
+  5. Phase 2 only: lifetimes, once `end_time` comes from the last child instead of
+     the allocator.
+- `solve()` is the only public entry point after building: it runs `_finalize`,
+  `_encode`, the objective ladder and extraction, and fills in every field that was
+  `None`.
 - Nodes come from a `NodeFactory` and hold a reference to the shared model. In Phase 1
   that model is the CP-SAT model: a node creates its own decision vars when it is made,
   and each edge encodes its own constraints (`_gate_divisions` over
   `division_map.pairs`, the served literals over `relayouts`, the `joined` literal over
-  `nest_pairs`) through it. `Graph.encode()` walks the edges in today's constraint
+  `nest_pairs`) through it. `Graph._encode()` walks the edges in today's constraint
   order, so building the model stays deterministic. The edges' queries
   (`slices_alike`, `bridges`, `joins`) need no model.
 - This interface stays inside the CP-SAT solve until the problem definition is unified
@@ -241,7 +253,7 @@ Notes:
     outputs in `produced_at` order. Each edge's `nest_pairs` comes from the two nodes'
     candidate `TileSpec.level_counts` (equal and non-empty).
   - `add_child` call order matches today's constraint order (READ by producer order,
-    then RELAYOUT_COPY, then IN_PLACE), so `Graph.encode` stays deterministic.
+    then RELAYOUT_COPY, then IN_PLACE), so `Graph._encode` stays deterministic.
 - Tests: for every synthetic graph, the edges must match what `_get_children`,
   `_relayout_copies` and `in_place_parents` give today, and `nest_pairs` must agree
   with `loop_id` equality from `_cut_literals`. These cross-checks are deleted in
@@ -251,9 +263,10 @@ Notes:
 
 - `add_child(..., geometry=...)` derives the `DivisionMap` from the `ResidencyEdge`
   over the two nodes' `core_divisions` (the body of `_cd_parent_matches`), and
-  `finalize_relayouts` derives the priced relayouts (the per-edge half of
-  `_cd_parent_relayouts` plus `_cap_relayout_groups`). The in-place pairing the
-  allocator does at `allocator.py:1552` moves the same way.
+  `Graph._finalize` derives the priced relayouts (the per-edge half of
+  `_cd_parent_relayouts` plus `_cap_relayout_groups`) and the read-count, copy and
+  segment steps. The in-place pairing the allocator does at `allocator.py:1552` moves
+  the same way. Until Stage 8 the builder calls `_finalize` itself.
 - The builder passes `geometry` wherever the consumer's `residency_edges` has the
   parent, and `pairs` from `cd_parent_matches` otherwise.
 - The allocator keeps computing its tables in Phase 1 (they are still the external
@@ -324,7 +337,7 @@ Notes:
   - RELAYOUT_COPY: today's `_constrain_relayout_copies` over `priced`.
   - IN_PLACE: a merge literal, with a division gate only when `division_map is not
     None` (today's `_add_inplace_relaxation`).
-- `Graph.encode()` calls them in edge order; the three solver methods go away.
+- `Graph._encode()` calls them in edge order; the three solver methods go away.
 - `_add_no_overlap_2d` keeps its logic, now over the nodes.
 - `free_copies` (the presolve threshold) counts RELAYOUT_COPY edges whose source
   chooses a division.
@@ -345,9 +358,11 @@ Notes:
 
 ### Stage 8. `graph.solve()`; honour pre-fixed decisions
 
-- `graph.solve()` runs `encode`, the objective ladder (`_run`) and extraction, and
-  returns the op-output nodes in execution order (following the `ExecutionEdge` chain)
-  with `node.resident/division/offset` filled where they were `None`. The chosen
+- `graph.solve()` becomes the public entry point. It runs `_finalize` (moved out of
+  the builder), `_encode`, the objective ladder (`_run`) and extraction, and returns
+  the op-output nodes in execution order (following the `ExecutionEdge` chain) with
+  every field that was `None` filled in: `division` (so the tiling), `resident` and
+  `offset`. The chosen
   relayout per READ edge is recorded on the edge.
 - The returned list is the execution plan: each node's chosen candidate (core split
   and tiling), where its output lives, how each input is read (in place, through which
@@ -404,8 +419,8 @@ Sized from the inventory:
   `graph.set_solver(SimulatedAnnealing())`. The `model` a node holds becomes the chosen
   solver's backend. Nodes and edges state the problem (candidates, division maps,
   relayouts, nest pairs, capacity), and each backend turns that into its own form:
-  CP vars and constraints for CP-SAT, a move space and cost for SA. `encode` and
-  `graph.solve()` dispatch through the backend, and `solve()` returns the same
+  CP vars and constraints for CP-SAT, a move space and cost for SA. `_finalize` stays
+  solver-neutral; `_encode` and `graph.solve()` dispatch through the backend, and `solve()` returns the same
   execution-ordered nodes whichever solver ran. Nothing outside the solvers changes
   yet.
 - **2b. Node absorbs the allocator-only fields.** The node (moved into
