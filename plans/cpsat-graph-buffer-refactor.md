@@ -120,6 +120,9 @@ class ComputeNode:                  # the node
         geometry: Optional[ResidencyEdge] = None,  # derive the division map from the ops
         pairs: Optional[Pairs] = None,             # or take it as given
     ) -> DependencyEdge  # the only way to add an edge: derives its mapping, wires both ends
+    def add_successor(self, after: ComputeNode) -> ExecutionEdge
+        # the only way to add an execution edge: sets self.next / after.prev, derives
+        # nest_pairs from both nodes' candidate tilings and contiguous from produced_at
     def finalize_relayouts(self) -> None  # after all parents: priced, capped relayouts per READ edge
 
 class NodeFactory:                  # one per solve; every node it makes shares graph and model
@@ -172,6 +175,11 @@ Notes:
 - Every division index on an edge (`DivisionMap.pairs`, `nest_pairs`, `relayouts`) is
   an index into the end node's `core_divisions`, so a pair fixes both the core split
   and the coarse tiling of each end.
+- `add_child` records data dependencies; `add_successor` records execution order. The
+  order is a single chain: `add_successor` asserts that `self.next` and `after.prev`
+  are both unset, so an op cannot be inserted between two linked ones later.
+  `contiguous` is derived as today (consecutive `produced_at` ticks), so a gap still
+  splits a tiling segment even when the two nodes are linked.
 - `ExecutionEdge`s link *all* op outputs in the solve, not just the tileable ones.
   `joinable` reproduces today's rule that an untileable op, or a gap in ticks, splits a
   tiling segment. `nest_pairs` is today's "same `TileSpec.level_counts`, not untiled"
@@ -199,7 +207,8 @@ Notes:
   (`slices_alike`, `bridges`), `ExecutionEdge` (`nest_pairs`, `joinable`, `joins`),
   `Graph` (context, `edges_of`, `tiling_segments`), `NodeFactory`, and the
   node gains `tilings`/`tiling`/`produced_at`/`inputs`/`outputs`/`prev`/`next`,
-  `graph`/`model`, and `add_child` taking `pairs` only (no `geometry` yet; see Stage 2b).
+  `graph`/`model`, `add_child` taking `pairs` only (no `geometry` yet; see Stage 2b),
+  and `add_successor`.
 - `spill_cost` and the node's derived properties (`sym_is_lx`, `sym_division`,
   `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`) stay as drafted.
 - Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline` from the draft.
@@ -207,7 +216,8 @@ Notes:
   one graph and model; `add_child` puts one edge object on both ends and the graph,
   and two edges of different kinds can join the same pair; `DivisionMap` answers `allows`/`dst_options`/`src_options`
   consistently with `pairs`; `slices_alike` is true on an ungated edge; `bridges`
-  returns only the copies priced for that pair; execution chain order by `produced_at`;
+  returns only the copies priced for that pair; `add_successor` links both ends, derives
+  `nest_pairs` and `contiguous`, and refuses a second successor or predecessor;
   links and `contiguous`; `joins` follows `nest_pairs`; `tiling_segments` splits at
   gaps and at untileable ops; node fixing rules (single candidate fixes
   `division=0`, out-of-range division asserts); `tiling` is `None` while `division`
@@ -227,9 +237,9 @@ Notes:
   - IN_PLACE edges with `division_map=None` when the child's division was fixed
     upstream, otherwise the same `cd_parent_matches` entry.
   - RELAYOUT_COPY edges for live copies.
-  - `produced_at` from `uses[0]` for op outputs; `ExecutionEdge`s in `produced_at` order,
-    with `nest_pairs` from the two nodes' candidate `TileSpec.level_counts` (equal and
-    non-empty).
+  - `produced_at` from `uses[0]` for op outputs, then `add_successor` along the op
+    outputs in `produced_at` order. Each edge's `nest_pairs` comes from the two nodes'
+    candidate `TileSpec.level_counts` (equal and non-empty).
   - `add_child` call order matches today's constraint order (READ by producer order,
     then RELAYOUT_COPY, then IN_PLACE), so `Graph.encode` stays deterministic.
 - Tests: for every synthetic graph, the edges must match what `_get_children`,
