@@ -169,10 +169,12 @@ class GraphInput:                            # no producing op; not on the chain
 @dataclass(eq=False)
 class RelayoutLayout:
     """The node's output re-laid-out from its native view: a second copy in LX with
-    its own decisions and a lifetime extended to the last read it serves."""
+    its own decisions, live from the first read it serves to the last (today's
+    copy lifetime, `build_relayout_copy`)."""
     group: int                               # destination view (today's group)
     candidates: tuple[RelayoutCandidate, ...]  # priced source divisions
-    lifetime_end: int                        # last consumer it can serve
+    start_time: int                          # first consumer it can serve (the
+    end_time: int                            # shuffle runs just before); last one
     resident: Optional[bool]                 # None = free
     offset: Optional[int]                    # None = free
 
