@@ -378,6 +378,27 @@ Notes:
   The `_get_children`/`_relayout_copies` checks go in Stage 3; the nest check in
   Phase 2b.
 
+- Where each `CoreDivisionBuffer` field goes. In Phase 1 a node is a
+  `CoreDivisionBuffer` redistributed: what it is in `NodeSpec`, what it may choose in
+  its enumerations, how it relates to others on edges, what was decided in its
+  decision fields.
+
+  | `CoreDivisionBuffer` field | Phase 1 home |
+  |---|---|
+  | `name`, `size`, `first_use_is_read`, `boundary` | `NodeSpec` |
+  | `uses`, `lifetime_*_override` | `NodeSpec.start_time` / `end_time` / `read_count`; `uses[0]` → `produced_at` |
+  | `residency_reason` | `NodeSpec.residency_reason` → `Fixed(False, reason)` residency |
+  | `core_divisions` (with each `.tiling`) | `Table` enumeration (division and tiling shared) |
+  | `parents`, `cd_parent_matches`, `cd_parent_relayouts` | READ edges: `ViewRelation.table`, `RelayoutRelation` |
+  | `in_place_parents` | IN_PLACE edges |
+  | `RelayoutCopyBuffer.relayout_parent` / `group` / `candidates` | RELAYOUT_COPY edge, `priced` |
+  | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | decisions and `chosen`, written back by Stage 8 |
+  | `residency_edges`, `division_space`, `tile_reads` | not carried; Phase 2c / 2f / 2b |
+  | `op_position` | replaced by `produced_at` and execution edges |
+  | `paired_with`, `lx_view`, `lx_relayout_plans` | not read by CP-SAT; Phase 3b |
+
+  A `LifetimeBoundBuffer` maps the same way with an empty menu (`Fixed(COMMITTED)`).
+
 ### Stage 3. Solver reads relationships from the graph
 
 - `_plan_layout_generic` builds the `Graph` next to the existing wrappers.
