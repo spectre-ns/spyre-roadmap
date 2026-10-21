@@ -39,8 +39,8 @@ Goal: model the solve as a graph.
   per-core view match (`ViewRelation`) and, on a read, the relayouts that can bridge a
   mismatch (`RelayoutRelation`). Edges are shared: the same edge object sits in its
   source's `outputs` and its destination's `inputs`, so either end can walk it.
-- **`ExecutionEdge`** — links each op output (a node with a `Produced` origin) to its
-  chronological neighbours (`origin.prev` / `origin.next`). Coarse tiling is handled
+- **`ExecutionEdge`** — links each op output (a node with a `produced_at` tick) to its
+  chronological neighbours (`node.prev` / `node.next`). Coarse tiling is handled
   here: whether the two ops run the same loop nest (`NestRelation`), whether they join
   one tiling group, and where a group breaks.
 - **`SpyreOptimizationGraph`** — a collection of nodes (which own the edges), plus the
@@ -211,16 +211,6 @@ class ExecutionEdge:
         return self.contiguous and self.before.tileable and self.after.tileable
 
 @dataclass(eq=False)
-class Produced:                              # written by an op in the solve
-    produced_at: int                         # tick of the producing write
-    prev: Optional[ExecutionEdge] = None     # set by add_successor; None at the
-    next: Optional[ExecutionEdge] = None     # first / last op of the chain
-
-@dataclass(frozen=True)
-class GraphInput:                            # no producing op; not on the chain
-    first_read: int                          # tick of its first read (clone-in)
-
-@dataclass(eq=False)
 class RelayoutLayout:
     """The node's output re-laid-out from its native view: a second copy in LX with
     its own decisions, live from the first read it serves to the last (today's
@@ -261,7 +251,11 @@ class ResourceNode:
     resident: Optional[bool]
     offset: Optional[int]                    # stays None when not resident
     # structure
-    origin: Produced | GraphInput            # where the resource comes from
+    produced_at: Optional[int]               # tick of the producing write (uses[0]);
+                                             # None for a graph input. Not start_time,
+                                             # which a start override can move earlier
+    prev: Optional[ExecutionEdge]            # set by add_successor; None for a graph
+    next: Optional[ExecutionEdge]            # input and at the chain ends
     relayouts: list[RelayoutLayout]          # alternative layouts of this output
     inputs: list[DependencyEdge]
     outputs: list[DependencyEdge]
@@ -320,7 +314,7 @@ Phase 2: `Lazy` / `Pruned` and the mixed-pair encodings).
 
 Notes:
 
-- **Graph inputs are nodes** with a `GraphInput` origin: no producing op and not on
+- **Graph inputs are nodes** with `produced_at = None`: no producing op and not on
   the execution chain (their first use is another op's read tick). They have a menu
   (today's clone menu), which the strategy enumerates, and residency like any node.
 - **Relayouts are layouts, not nodes.** A `RelayoutLayout` is the producer's output
@@ -338,8 +332,8 @@ Notes:
   parent too). The solver iterates edges by kind, so there is no `isinstance` dispatch.
 - `add_child` puts the one edge object on both ends and nowhere else; the graph keeps
   no edge list. `add_successor` links one chain, starting at `graph.first`, and refuses
-  to relink a node that already has a neighbour; `_finalize` asserts every `Produced`
-  node is on it. The chain ends have no edge (`prev` / `next` is `None`), which the
+  to relink a node that already has a neighbour; `_finalize` asserts every node with a
+  `produced_at` is on it. The chain ends have no edge (`prev` / `next` is `None`), which the
   coarse-tiling walk treats like a non-joinable edge. `contiguous` is derived as today (consecutive `produced_at` ticks).
 - A missing match entry is an **empty** `Pairs`, never `None`: today
   `.get(parent, [])` (`ilp_solver_ortools.py:410`) gives an empty table, which
@@ -552,17 +546,16 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
     grouped into one `RelayoutRead` per layout.
   - IN_PLACE edges with `view=None` when the child's division was fixed upstream,
     otherwise the same table.
-  - Graph inputs become nodes with a `GraphInput` origin.
+  - Graph inputs become nodes with `produced_at = None`.
   - `read_count`, lifetimes and overrides as given. A plain `LifetimeBoundBuffer` has no
     `boundary`; it maps to `Input` if `first_use_is_read`, else `Intermediate`, never
     `Output` (today's fallback, `ilp_solver_ortools.py:263-270`). Each node's
     `residency_reason` is `MemoryPlanSolver.excluded(buffer)`: the allocator's reason,
     else the capacity check (`record_exclusions`, `ilp_solver_ortools.py:630`), for
     `apply_op_constraints` to apply and Stage 8 to write back as `spill_reason`.
-  - Origins: `Produced(uses[0])` for op outputs (today's filter: has `uses`, not
-    `first_use_is_read`, not a copy), `GraphInput(uses[0])` for graph inputs; then
-    `add_successor` over the `Produced` nodes in `produced_at` order, with
-    `graph.first` the earliest.
+  - `produced_at = uses[0]` for op outputs (today's filter: has `uses`, not
+    `first_use_is_read`, not a copy), `None` for graph inputs; then `add_successor`
+    over those nodes in `produced_at` order, with `graph.first` the earliest.
 - Tests, while the functions still exist: on every corpus graph IN_PLACE edges equal
   `in_place_parents`, READ edges equal `_get_children` restricted to pairs where both
   ends are in the solve and have a menu, and the layouts equal `_relayout_copies`.
@@ -1164,8 +1157,8 @@ constraints over small per-buffer domains, never per-pair tables.
   straight from the torch IR (once per op): its fields from the op's layout and its
   place in `graph.operations`, with the op's menu or its `OpSplitSpace` as the data the
   strategy enumerates (`Table`) or generates from (`Lazy`), and the residency reasons
-  that `apply_op_constraints` reads from the op. It also adds a `GraphInput` node for
-  each graph input the op reads (an `InputBuffer` or constant is not an `Operation`).
+  that `apply_op_constraints` reads from the op. It also adds a node with
+  `produced_at = None` for each graph input the op reads (an `InputBuffer` or constant is not an `Operation`).
   What it builds depends on the graph's division mode, a build setting read from
   `co_optimizing_lx_planning` when the graph is constructed and kept in its global
   context: sizes, lifetimes (drain plans), residency reasons, in-place candidates,
