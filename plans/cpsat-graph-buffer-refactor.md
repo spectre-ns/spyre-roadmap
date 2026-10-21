@@ -457,10 +457,24 @@ constraints over small per-buffer domains, never per-pair tables.
     sticks); the interleave rule (an inner split > 1 with an outer symbol unsplit is
     unrepresentable) as an implication; the span cap as `AddDivisionEquality` or a
     per-dim table; a conjunction over every read of the buffer.
-  - **Table fallback only where the proof is opaque:** reshapes where several symbols
-    serve one device dim and the decompose ownership proofs (`invert_per_core_view`,
-    `pass_utils.py:3894`) post a small allowed-tuples table per (node, dep), not a
-    pair table.
+  - **Reshapes are just another read order.** The consumer's read already maps its
+    loop symbols to the buffer's device coordinates as a mixed-radix expression
+    (`dep_device_coordinates`, `pass_utils.py:3410-3414`, e.g.
+    `4*outer + floor(inner/64)`), so a reshape is handled like a transposed read:
+    - several symbols on one device axis, ordered outer → inner by coefficient: a
+      split owns a contiguous slice only if every outer symbol on that axis is fully
+      split, `split_inner > 1 ⇒ split_outer == extent_outer` (today's interleave
+      rule, `:3700-3725`), and the axis factor is the product of their splits;
+    - one symbol spanning several device axes (the collapsed-axis case
+      `decompose_fused_split_view` handles): the split factorises in mixed radix,
+      `f = f_outer · f_inner` with `f_inner > 1 ⇒ f_outer == d_outer`, each factor
+      dividing its axis;
+    - `floor(inner / elems_per_stick)` terms make divisibility count in sticks, which
+      also covers the partial multi-stick case.
+
+    So views need no table fallback: divisibility, implications and products cover
+    them. If an agreement test finds a case these rules miss, that case gets a small
+    allowed-tuples table per (node, dep), never a pair table.
 
   Loop carries are the conjunction of the read and update relations; input clones need
   a relation derived from the clone's consumers (design item). Agreement: the feasible
