@@ -854,10 +854,10 @@ constraints over small per-buffer domains, never per-pair tables.
     scored global constraint, next to a `cp_model` adapter with the same names.
 - **3b. Node absorbs the allocator-only fields** (`in_place_parents` → IN_PLACE edges,
   `residency_reason` → `apply_op_constraints` reading the op, lifetime overrides,
-  `lx_view`, `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with` (greedy only),
-  `division_space` → `Lazy` division; `residency_edges` and `tile_reads` → relations;
-  `op_position` → `produced_at`). Sizes stay in alignment units on the node as the draft
-  has them; `address` is written back in bytes.
+  `lx_view`, `spill_reason`, `chosen_relayouts`, `lx_relayout_plans`, `paired_with`
+  (greedy only), `division_space` → `Lazy` division; `residency_edges` and `tile_reads`
+  → relations; `op_position` → `produced_at`). Sizes stay in alignment units on the
+  node as the draft has them; `address` is written back in bytes.
 - **3c. The graph builds nodes from the IR.** `graph.get_resource_node(op)` builds a
   node straight from the torch IR on first use: the `NodeSpec` from the op's layout
   and its place in `graph.operations`, the strategies from `EnumerationFactory
