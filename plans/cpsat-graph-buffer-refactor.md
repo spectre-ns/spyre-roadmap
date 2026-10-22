@@ -144,10 +144,11 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
      allocator (rule 2).
    - `Open` — no restriction; the model decides (residency and offset by default).
 
-   The `EnumerationFactory` validates the config and builds a `Strategy` for a graph,
-   choosing each node's enumerations from its fields and the config
-   (for example, `Lazy` tiling requires tiling to be its own axis), and each edge's
-   relations from its ends' enumerations. The Phase 1 default reproduces today: `Table`
+   The `EnumerationFactory` is created from configuration alone (which enumeration each
+   axis uses) and validated then, for example `Lazy` tiling requires tiling to be its
+   own axis. `factory.strategy(graph, tables)` builds a `Strategy` for one graph,
+   choosing each node's enumerations from its fields and the configuration, and each
+   edge's relations from its ends' enumerations; `tables` is that graph's table data. The Phase 1 default reproduces today: `Table`
    over the node's candidate menu, `Fixed(value)` for a set decision (so
    `Fixed(COMMITTED)` for a placement-only node), `TableView` / `TableRelayout` over the
    candidate tables.
@@ -449,7 +450,8 @@ class TableSource(Protocol):
     implementation detail of `Table`, `Pruned`, `TableView` and `TableRelayout`
     that nothing else sees. The factory asks it only for the axes and edges it
     makes table-based; a `Lazy` axis reads `node.space` and `edge.reads`
-    instead."""
+    instead. One is built per graph and handed to `EnumerationFactory.strategy`
+    with it; the factory itself holds only configuration."""
     def menu(self, node: ResourceNode) -> tuple[CoreDivision, ...]: ...
     def view_table(self, edge: DependencyEdge) -> Pairs: ...  # empty: never alike
     def relayout_reads(self, edge: DependencyEdge) -> tuple[RelayoutRead, ...]: ...
@@ -685,22 +687,29 @@ AxisSetting = Literal["table", "lazy", "pruned"]
 
 @dataclass(frozen=True)
 class EnumerationFactory:
-    """Validates the configuration and builds a `Strategy` for a graph: picks
-    each node's enumerations from its fields and the per-axis settings, and
+    """Built from configuration only: which enumeration each axis uses and so
+    which strategy implementation encodes it. It is validated once at creation
+    and holds no graph. `strategy(graph, tables)` then builds a `Strategy` for
+    one graph: each node's enumerations from its fields and these settings, and
     each edge's relations from its two ends. Table-based ones draw their data
     from `tables`. The defaults reproduce today's model."""
-    tables: Optional[TableSource] = None     # Phase 1: AllocatorTables
     division: AxisSetting = "table"          # Phase 2 settings, from config.py (the
     tiling: AxisSetting = "table"            # names are Phase 2's); the defaults
     relayout: Literal["data", "pruned", "lazy"] = "data"  # reproduce today
 
-    def strategy(self, graph: SpyreOptimizationGraph) -> Strategy:
-        """Per node: a set decision -> Fixed(value) (so COMMITTED ->
+    def __post_init__(self) -> None:
+        """Rejects a combination of settings rule 5 does not allow."""
+
+    def strategy(
+        self, graph: SpyreOptimizationGraph, tables: Optional[TableSource] = None,
+    ) -> Strategy:
+        """`tables` is this graph's table data (Phase 1: AllocatorTables); only
+        needed when a setting is table-based. Per node: a set decision -> Fixed(value) (so COMMITTED ->
         Fixed(COMMITTED)); a "table" axis -> Table(tables.menu(node)); a "lazy"
         axis -> Lazy(node.space); residency and offset -> Open. Per edge: a
         TableView over tables.view_table(edge) when both ends are Table, else a
-        DerivedView over edge.reads. Raises ValueError for a combination rule 5
-        rejects, or a table-based axis with no `tables`."""
+        DerivedView over edge.reads. Raises ValueError for a table-based axis
+        with no `tables`."""
 
 # =============================================================================
 # Phase 3a: what solve() runs on
@@ -814,9 +823,10 @@ class GraphSolver(Protocol):
 The graph holds only incoming data and decisions. The `Strategy` holds every node's
 `Enumerations`, every edge's relations, the candidate copies and all CP state (a
 `NodeVars` per node and per candidate copy, the served literals per READ edge); the
-`EnumerationFactory` builds it from the graph and the config. Table-based enumerations
-and relations get their data from the factory's `TableSource`, an implementation
-detail nothing else sees (Phase 1: `AllocatorTables`). Per
+`EnumerationFactory`, built from configuration alone, builds it for a graph.
+Table-based enumerations and relations get their data from a `TableSource` handed in
+with the graph, an implementation detail nothing else sees (Phase 1:
+`AllocatorTables`). Per
 axis and per edge the strategy applies whichever the enumeration calls for: a `Table`
 applies its candidates, a `Lazy` axis applies constraints derived from the node's
 `space` and the edge's `reads`. The stages implement
@@ -1160,8 +1170,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 ### Stage 8. `graph.solve(model, cost_expr)`; honour pre-fixed decisions
 
 - `graph.solve` becomes the public entry point with the model and cost expression
-  `_run` takes today, plus the strategy (the factory's, with `AllocatorTables` as its
-  table source):
+  `_run` takes today, plus the strategy (the default factory's, given
+  `AllocatorTables` as the graph's table source):
   `_finalize(model, strategy)`, the objective ladder (with the fallback copy
   pin when `cost_expr` is `None` or fails to lower), extraction. It fills every open
   decision: `assignment` (so the tiling), `resident`, `offset` when resident,
@@ -1185,7 +1195,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   vars. Bottom-justify is skipped when any
   offset was pinned.
 - `_plan_layout_generic` calls `build_graph`, builds the strategy with
-  `EnumerationFactory(tables=AllocatorTables(graph, buffers)).strategy(graph)`, makes
+  `EnumerationFactory().strategy(graph, AllocatorTables(graph, buffers))`, makes
   the model, calls
   `graph.solve(model, cost_expr, strategy)` and writes the decisions back to the
   allocator's buffers: `address` in bytes, `spill_reason`, `chosen_division` only where the caller
@@ -1691,7 +1701,7 @@ constraints over small per-buffer domains, never per-pair tables.
       the builder; its build → price → pin → rebuild loop runs `add_node` inside the
       pricing loop.
     - Candidates (`_division_map`, `_enumerate_core_divisions`, `_tiling_candidates`,
-      `_division_space`, `_live_splits`) → the factory's table sources (menus) and
+      `_division_space`, `_live_splits`) → table sources (menus) and
       `node.space` (`Lazy`).
     - Pair derivations (`_cd_parent_matches`, `_cd_parent_relayouts`,
       `_cap_relayout_groups`, `_clone_divisions_and_matches`, `_loop_carry_*`,
