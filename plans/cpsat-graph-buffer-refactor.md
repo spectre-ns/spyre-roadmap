@@ -48,7 +48,7 @@ Goal: model the solve as a graph.
   edge) and returns the op-output nodes in execution order: the execution plan.
 - **The model side** — everything about *how* decisions are searched lives in the
   `Strategy`, not on nodes and edges: each axis's *enumeration* (`Fixed`, `Table`,
-  `Lazy`, `Pruned`, `Open`, with a `Table`'s candidates as its own data), the relations
+  `Lazy`, `Pruned`, with a `Table`'s candidates as its own data), the relations
   over each edge's ends (`ViewRelation`, `RelayoutRelation`, `NestRelation`) and all CP
   state. The strategy applies the incoming data to the CP model: a `Table` axis applies
   its candidates, a `Lazy` axis applies constraints built from the node's and edge's own
@@ -101,8 +101,10 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    Phase 2/3 work with its own agreement test.
 3. **`None` means an open decision.** A node has three decisions: `work_split` (core
    division and tiling), `resident` and `offset`. Each is open (`None`; the solver
-   decides) or set, and the factory realizes a set decision as a `Fixed` enumeration.
-   Decisions are set or pinned in three places:
+   decides) or set. A set `work_split` becomes a `Fixed` enumeration; a set `resident`
+   or `offset` pins its variable. Residency and offset are always constrained (capacity,
+   the 2-D no-overlap, merges, op constraints), so they are decisions the strategy
+   encodes, never enumerated. Decisions are set or pinned in three places:
    - **At construction, by `add_node`:** a node whose division was committed upstream
      by work division (in Phase 1, a buffer with no `core_divisions`) gets
      `work_split = WorkSplit.COMMITTED`, which becomes `Fixed(COMMITTED)` and posts
@@ -123,7 +125,7 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    (`offset` only when resident, `spill_reason` only when not). The structural
    `Optional`s are `produced_at` (`None`: a graph input), `space` (`None`: committed
    upstream) and `residency_reason` (`None`: no restriction). `Fixed` is an enumeration
-   on a decision axis, not a buffer type: it posts constants (or nothing) where an open
+   of the work split, not a buffer type: it posts constants (or nothing) where an open
    axis posts vars.
 4. **Build structure, then finalize once, through a strategy.** `add_node` /
    `add_child` / `add_successor` wire the graph and touch no model; nodes and edges are
@@ -132,9 +134,9 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    `apply_*` steps over the graph in a fixed order. All encoding, and every CP var and
    literal, lives in the strategy.
 5. **Enumeration is polymorphic, per decision axis.** Nodes do not carry
-   enumerations; the `Strategy` does. For each node and each decision axis (core
-   division, coarse tiling, residency, offset; from 2d, relayout choice per READ edge)
-   it holds an `Enumeration`, data plus `holds(value)` (a query, no model), built from
+   enumerations; the `Strategy` does. For each node and each enumerated axis (the work
+   split: core division and coarse tiling, one axis until 2b; from 2d, relayout choice
+   per READ edge) it holds an `Enumeration`, data plus `holds(value)` (a query, no model), built from
    the node's fields (and, for a `Table`, its table source), and it realizes that
    enumeration in the model:
    - `Fixed(value)` — known before the solve; posts constants. `Fixed(COMMITTED)` is a
@@ -147,7 +149,6 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
      Today's relayout group capping (`_cap_relayout_groups`) becomes a `Pruned`
      relayout enumeration in 2d; in Phase 1 it is part of the table strategy's
      candidate generation (rule 2).
-   - `Open` — no restriction; the model decides (residency and offset by default).
 
    The `EnumerationFactory` is created from configuration alone (which enumeration each
    axis uses) and validated then, for example `Lazy` tiling requires tiling to be its
@@ -466,12 +467,6 @@ class Fixed(Enumeration[T]):
         return value == self.value
 
 @dataclass(frozen=True)
-class Open(Enumeration[T]):
-    """No restriction: the model decides. The default for residency and offset."""
-    def holds(self, value: T) -> bool:
-        return True
-
-@dataclass(frozen=True)
 class Table(Enumeration[WorkSplit]):
     """An explicit list of candidate divisions (today's menu): the strategy posts
     an index var and element ties. The strategy generates the candidates from
@@ -499,13 +494,11 @@ def tileable(e: Enumeration[WorkSplit]) -> bool:
 
 @dataclass(frozen=True)
 class Enumerations:
-    """One node's enumeration per decision axis, held by the strategy. The division
-    axis carries tiling while it is a `Table`; 2d adds a relayout axis per
-    READ edge."""
-    division: Enumeration[WorkSplit]        # carries tiling while it is a Table
-    residency: Enumeration[bool]             # Open (apply_op_constraints may pin it)
-    offset: Enumeration[int]                 # Open
-                                             # 2d adds a relayout axis per READ edge
+    """One node's enumerations, held by the strategy: the work split (core
+    division and tiling, one axis while it is a `Table`, separate from 2b), and
+    from 2d a relayout axis per READ edge. Residency and offset are not
+    enumerated: they are always-constrained decisions the steps encode."""
+    division: Enumeration[WorkSplit]         # carries tiling while it is a Table
 
 # ---- relations: what an edge's ends must agree on; data plus queries --------
 class ViewRelation(ABC):
@@ -656,8 +649,9 @@ class EnumerationFactory:
         """A Strategy with these settings. Its steps then choose, for each graph
         they are given: per node, a set decision -> Fixed(value) (so COMMITTED
         -> Fixed(COMMITTED)); a "table" axis -> a Table over candidates it
-        generates from node.space; a "lazy" axis -> Lazy(node.space); residency
-        and offset -> Open. Per edge, a pair table when both ends are Table,
+        generates from node.space; a "lazy" axis -> Lazy(node.space). Residency
+        and offset are encoded, not enumerated. Per edge, a pair table when both
+        ends are Table,
         else a DerivedView over edge.reads."""
 
 # =============================================================================
@@ -936,7 +930,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
 - Implement the data types and queries of *The model*: aliases, `WorkSplit`, the
   relations, the edges, `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph,
-  plus the `Enumeration` kinds Phase 1 uses (`Fixed`, `Table`, `Open`),
+  plus the `Enumeration` kinds Phase 1 uses (`Fixed`, `Table`),
   `Enumerations`, and `Strategy` and `EnumerationFactory` without solver methods.
 - From the draft: `RelayoutRead` and `Pairs` go into the table strategy's internals;
   `spill_cost(node)` (from `read_count`, `first_use_is_read`, `boundary` and `size`)
@@ -1142,10 +1136,9 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   FEASIBLE raises `SolveError` naming the stage; a time-limited FEASIBLE incumbent is
   accepted; a lowering error re-raises when `_cpsat_warn_on_cost_expr` is off. Nothing
   is written to the nodes or edges.
-- Pre-fixed decisions are `Fixed` enumerations: a concrete `Fixed` division posts a
-  constant index (its edges keep their gates, with that side constant);
-  `Fixed(COMMITTED)` posts nothing, as above; `Fixed` residency / offset pin their
-  vars. Bottom-justify is skipped when any
+- A pre-set `work_split` is a `Fixed` enumeration: a concrete one posts a constant
+  index (its edges keep their gates, with that side constant); `Fixed(COMMITTED)` posts
+  nothing, as above. A pre-set `resident` / `offset` pins its var. Bottom-justify is skipped when any
   offset was pinned.
 - `_plan_layout_generic` calls `build_graph`, builds the strategy (the transitional
   table strategy until Stage 9), makes the model, calls `graph.solve(model,
