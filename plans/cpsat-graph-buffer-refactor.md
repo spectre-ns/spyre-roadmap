@@ -77,6 +77,144 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
 `BufferGraph`, `build_buffer_graph`, `SliceEdge`/`InPlaceEdge`/`CopyEdge`,
 `Timeline.runs`). Stages 1–2 rename and reshape it into the model below.
 
+## Interfaces
+
+Everything the allocator touches has one job:
+
+- **The allocator dispatches and applies.** It builds the graph (`build_graph`; from 3c
+  `add_node(op)`), creates the strategy and picks the solver from configuration, calls
+  `graph.solve`, and writes the decisions it finds on the nodes back to its own
+  structures. From Stage 9 it derives no candidates itself.
+- **The graph, `ResourceNode`, `DependencyEdge` and `ExecutionEdge` are the input**:
+  incoming data about the buffers and their ops, the edges between them, and the
+  decisions (pinned before the solve, filled by it). No candidates, relations or CP
+  state.
+- **`EnumerationFactory`** turns configuration into an `EncodingStrategy`.
+- **The `EncodingStrategy` encodes the graph** into our pywraplp-shaped `Backend`
+  protocol: pywraplp's API plus the reification, element / table, product, min / max,
+  interval and 2-D no-overlap operations pywraplp lacks. It encodes one node, edge or
+  copy at a time, in the order `_finalize` walks them. How each axis is enumerated and
+  the relations over each edge are its internals. The first implementation enumerates
+  directly (today's menus and pair tables, Phase 1); later ones post per-axis
+  sub-expressions instead (Phase 2). Until 3a it posts straight to `cp_model`, whose
+  `Add*` operations already match the protocol (`Model`).
+- **Backends solve the posted model** (`CpSat` first, then `Mip`, `Annealing`,
+  `BruteForce`, `Decomposed`); **graph solvers** solve the graph directly instead.
+
+```mermaid
+classDiagram
+    direction LR
+    class Allocator {
+        build the graph
+        configure strategy and solver
+        apply the decisions
+    }
+    class SpyreOptimizationGraph {
+        alignment: int
+        capacity: int
+        settings: SolveSettings
+        first: ResourceNode
+        add_node(source) ResourceNode
+        get_nodes() Iterator~ResourceNode~
+        execution_chain() Iterator~ExecutionEdge~
+        solve(model, cost_expr, strategy) list~ResourceNode~
+    }
+    class ResourceNode {
+        incoming data: size, lifetime, readers, op, space
+        work_split: WorkSplit
+        resident: bool
+        offset: int
+        spill_reason: str
+        relayouts: list~ResidentLayout~
+        add_child(child, in_place) DependencyEdge
+        add_successor(after) ExecutionEdge
+    }
+    class DependencyEdge {
+        src: ResourceNode
+        dst: ResourceNode
+        in_place: bool
+        chosen: RelayoutLayout
+    }
+    class ExecutionEdge {
+        before: ResourceNode
+        after: ResourceNode
+        contiguous: bool
+    }
+    class EnumerationFactory {
+        division, tiling, relayout settings
+        strategy() EncodingStrategy
+    }
+    class EncodingStrategy {
+        <<one per configuration>>
+        layouts: tuple~RelayoutLayout~
+        vars: dict~NodeVars~
+        prepare(graph)
+        encode_node(node, model)
+        encode_merge(edge, model)
+        encode_read(edge, model)
+        encode_nest(edge, model)
+        encode_no_overlap(graph, model)
+        encode_x(element, model) one per element kind
+    }
+    class NodeVars {
+        in_buffer, offset, eff_size
+        splits, tile_counts, merges
+        division_is(i)
+    }
+    class Backend {
+        <<interface>>
+        IntVar(lb, ub, name) Var
+        BoolVar(name) Var
+        Add(row) Constraint
+        AddElement / AddNoOverlap2D / ...
+        Minimize(expr)
+        Solve() SolveStatus
+    }
+    class GraphSolver {
+        <<interface>>
+        solve(graph, strategy, cost_expr)
+    }
+    Allocator ..> SpyreOptimizationGraph : builds, applies
+    Allocator ..> EnumerationFactory : configures
+    EnumerationFactory ..> EncodingStrategy : creates
+    SpyreOptimizationGraph "1" *-- "*" ResourceNode : nodes
+    ResourceNode "1" o-- "*" DependencyEdge : inputs / outputs
+    ResourceNode "1" o-- "0..2" ExecutionEdge : prev / next
+    SpyreOptimizationGraph ..> EncodingStrategy : solve() drives
+    EncodingStrategy "1" *-- "*" NodeVars
+    EncodingStrategy ..> Backend : posts to
+    SpyreOptimizationGraph ..> GraphSolver : or solves with
+    Backend <|.. CpSat
+    Backend <|.. Mip
+    Backend <|.. Annealing
+    Backend <|.. BruteForce
+    Backend <|.. Decomposed
+```
+
+One solve:
+
+```mermaid
+sequenceDiagram
+    participant A as Allocator
+    participant G as SpyreOptimizationGraph
+    participant S as EncodingStrategy
+    participant B as Backend
+    A->>G: build_graph(buffers) / add_node(op)
+    A->>S: EnumerationFactory(config).strategy()
+    A->>G: solve(model, cost_expr, strategy)
+    G->>S: prepare(graph)
+    loop _finalize, in today's emission order
+        G->>S: encode_node / encode_merge / encode_read / ...
+        S->>B: IntVar, BoolVar, Add(...).OnlyEnforceIf, AddElement, ...
+    end
+    loop objective ladder
+        G->>B: Minimize / Maximize, Solve
+    end
+    G->>G: extraction fills the decisions on nodes and edges
+    G-->>A: op outputs in execution order
+    A->>A: write back address, spill_reason, chosen_division, chosen_relayouts
+```
+
 ## Design rules
 
 1. **Relations, not tables.** Every relationship is an object over the two ends'
