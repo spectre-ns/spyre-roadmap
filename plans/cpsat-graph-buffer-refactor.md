@@ -1666,18 +1666,17 @@ constraints over small per-buffer domains, never per-pair tables.
   place in `graph.operations`, the op's `OpSplitSpace` as `space` (what `Lazy` generates
   from), each read's index map on its edges, and the residency reasons that
   `apply_op_constraints` reads from the op. Where an axis stays `Table`, the op's menu
-  comes from a `TableSource` built from the IR and attached as `graph.tables`,
-  not from the node. It also adds a node
-  with `produced_at = None` for each graph input the op reads (an `InputBuffer` or
-  constant is not an `Operation`). What it builds depends on the graph's division mode,
-  a build setting read from `co_optimizing_lx_planning` when the graph is constructed
-  and kept in its global context: sizes, lifetimes (drain plans), residency reasons,
-  in-place candidates, clones and the menu all differ between open and committed
-  divisions. The factory rejects an enumeration that contradicts the mode a node was
-  built with. In 3c the graph from the IR is built beside the allocator's buffers and
-  must agree with the graph built from them (same nodes and edges, identical proto) on
-  the corpus and the device graphs; the solvers and the commit path stay buffer-in,
-  buffer-out.
+  comes from a `TableSource` built from the IR and attached as `graph.tables`, not from
+  the node. It also adds a node with `produced_at = None` for each graph input the op
+  reads (an `InputBuffer` or constant is not an `Operation`). What it builds depends on
+  the graph's division mode, a build setting read from `co_optimizing_lx_planning` when
+  the graph is constructed and kept in its global context: sizes, lifetimes (drain
+  plans), residency reasons, in-place candidates, clones and the menu all differ between
+  open and committed divisions. A strategy step rejects an enumeration that contradicts
+  the mode the graph was built with. In 3c the graph from the IR is built beside the
+  allocator's buffers and must agree with the graph built from them (same nodes and
+  edges, identical proto) on the corpus and the device graphs; the solvers and the
+  commit path stay buffer-in, buffer-out.
 - **3d. Placement-only solvers** (greedy, first-fit/best-fit, SA, cooling_schedules,
   utils.plot_buffers) read a placement view of each node (name, size in bytes, uses,
   in-place parents, paired members) and write `address` back in bytes; the SA
