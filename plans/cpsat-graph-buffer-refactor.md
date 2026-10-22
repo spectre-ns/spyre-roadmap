@@ -182,7 +182,52 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
 
 ## The model
 
+Every type the plan introduces is defined here; the stages implement it piece by
+piece. Types already in torch-spyre are imported, not redefined.
+
 ```python
+# existing types
+from ortools.sat.python import cp_model
+from torch._inductor.ir import Operation
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    BufferType, CoreDivision, LifetimeBoundBuffer, RelayoutCandidate, SolveError,
+    TileSpec,
+)
+from torch_spyre._inductor.work_division import OpSplitSpace, ResidencyEdge
+
+# aliases
+Pairs = tuple[tuple[int, int], ...]          # (src, dst) menu-index pairs (the draft's)
+SplitKey = sympy.Symbol                      # CoreDivision.splits keys
+TileKey = tuple[int, bool]                   # sym_tile_counts keys (plan_solver.py:446)
+
+@dataclass(frozen=True)
+class Assignment:                            # a decided split
+    splits: Mapping[SplitKey, int]           # sym_core_divs keys
+    tiling: TileSpec
+    COMMITTED: ClassVar[Assignment]          # fixed upstream by work division; its
+                                             # splits are not visible to the solve
+
+# relations: data plus queries, no model. They answer through their edge's two
+# menus (an Assignment is unique in its menu), so the tables hold indices.
+class ViewRelation:                          # both ends own the buffer with the same view
+    table: Pairs                             # allocator's final pairs; empty = never alike
+    geometry: tuple[ResidencyEdge, ...] = () # 2c: each read's index map
+    def holds(self, src: Assignment, dst: Assignment) -> bool
+
+@dataclass(frozen=True)
+class RelayoutRead:                          # one src layout this read can go through
+    layout: RelayoutLayout
+    candidates: tuple[RelayoutCandidate, ...]  # its priced (src, dst) divisions
+
+class RelayoutRelation:                      # READ: src's layouts that can serve a
+    reads: tuple[RelayoutRead, ...]          # mismatch; allocator's capped candidates
+    def bridges(self, src: Assignment, dst: Assignment) -> tuple[RelayoutRead, ...]
+
+class NestRelation:                          # both ops run the same non-empty loop nest
+    def joins(self, before: Assignment, after: Assignment) -> bool
+                                             # equal, non-empty level_counts; no pair
+                                             # table (Phase 1 keeps loop_id, Stage 4)
+
 class DependencyKind(Enum):
     READ = auto()          # dst's op reads src
     IN_PLACE = auto()      # dst may take over src's storage at the shared tick
@@ -283,7 +328,7 @@ class SpyreOptimizationGraph:
     first: Optional[ResourceNode]            # start of the execution chain
 
     def add_node(
-        self, source: LifetimeBoundBuffer | torch._inductor.ir.Operation
+        self, source: LifetimeBoundBuffer | Operation
     ) -> ResourceNode
         # the graph fills the node's fields from either source: an allocator buffer
         # (or its CoreDivisionBuffer subclass) in Phase 1, an IR op from Phase 3
@@ -301,16 +346,106 @@ class SpyreOptimizationGraph:
                                               # raises SolveError as _run does
     def _finalize(self, model, strategy) -> None  # the strategy's apply_* steps,
                                                   # in today's order
+    def set_solver(self, solver: type[Backend] | GraphSolver) -> None  # 3a
+
+@dataclass(frozen=True)
+class SolveSettings:                         # interim, until 3a's CpSat backend
+    time_limit_seconds: Optional[float]
+    bottom_justify: bool
+    record: Callable[..., Any]               # _solve_and_record
+
+def build_graph(
+    buffers: Sequence[LifetimeBoundBuffer], alignment: int, capacity: int,
+    settings: SolveSettings,
+) -> SpyreOptimizationGraph
+
+# enumerations: one decision axis of one node; data plus a query, no model
+class Enumeration(ABC):
+    def holds(self, value) -> bool
+class Fixed(Enumeration):                    # known before the solve
+    value: Any                               # Fixed(COMMITTED) posts nothing
+class Table(Enumeration):                    # explicit candidates (the menu); division
+    candidates: Sequence[CoreDivision]       # and tiling share it until 2b
+class Lazy(Enumeration):                     # Phase 2: per-axis vars, legality as
+    space: OpSplitSpace                      # constraints, no candidates
+class Pruned(Enumeration):                   # Phase 2: generate, keep a shortlist,
+    space: OpSplitSpace                      # realize it as a Table
+    keep: int
+
+@dataclass(frozen=True)
+class Enumerations:                          # one node's enumeration per axis. Division
+    division: Enumeration                    # carries tiling while it is a Table;
+    residency: Enumeration                   # residency is open (apply_op_constraints
+    offset: Enumeration                      # may pin it). No relayout axis until 2d.
+
+class NodeVars:                              # the CP state of one node or layout
+    in_buffer: cp_model.IntVar               # residency literal
+    offset: cp_model.IntVar
+    merges: dict[str, cp_model.IntVar]       # per IN_PLACE input
+    division: cp_model.IntVar                # index into the menu (a constant for one
+    eff_size: cp_model.IntVar                # candidate); none of these for COMMITTED
+    core_cost: Optional[cp_model.IntVar]
+    cores: Optional[cp_model.IntVar]
+    splits: dict[SplitKey, cp_model.IntVar]
+    tile_counts: dict[TileKey, cp_model.IntVar]
+    buffer: Any                              # read-only view for cpsat_expr_printer:
+                                             # core_divisions, sym_core_divs,
+                                             # sym_division (until 2a)
+    def division_is(self, i: int) -> cp_model.IntVar  # cached, made on first call
+
+class Strategy:                              # encodes a graph; holds all CP state
+    enumerations: dict[ResourceNode, Enumerations]
+    vars: dict[ResourceNode | RelayoutLayout, NodeVars]
+    served: dict[DependencyEdge, dict[RelayoutLayout, cp_model.IntVar]]
+    def copy_order(self, graph) -> list[RelayoutLayout]  # (producer name, group)
+    # the steps, in _finalize order (Stage 5: the first; Stage 6: the rest)
+    def apply_core_division(self, graph, model) -> None
+    def apply_inplace(self, graph, model) -> None
+    def apply_placement(self, graph, model) -> None
+    def apply_op_constraints(self, node, model) -> None
+    def apply_reads(self, node, model) -> None
+    def apply_relayout(self, graph, model) -> None
+    def apply_coarse_tiling(self, graph, model) -> None
+    def apply_cloning(self, graph, model) -> None
+
+class EnumerationFactory:                    # validates the config, builds strategies
+    def strategy(self, graph: SpyreOptimizationGraph) -> Strategy
+        # default: today's model, from each node's fields (menu -> Table, a set
+        # decision -> Fixed(value), so COMMITTED -> Fixed(COMMITTED))
+
+# Phase 3a: what solve() runs on
+class Backend(Protocol):                     # shaped like pywraplp.Solver
+    def IntVar(self, lb: int, ub: int, name: str) -> Any
+    def BoolVar(self, name: str) -> Any
+    def Add(self, constraint) -> Any         # .OnlyEnforceIf(lit or its negation)
+    # plus element / enforced table, multiplication / division / min / max
+    # equality, bool_or / bool_and / at-most-one / implication, optional
+    # intervals and 2-D no-overlap
+    def Minimize(self, expr) -> None
+    def SetHint(self, vars, values) -> None
+    def Solve(self) -> SolveStatus           # OPTIMAL | FEASIBLE | INFEASIBLE | UNKNOWN
+    def solution_value(self, var) -> int
+class CpSat(Backend): ...                    # pass-through to cp_model
+class Mip(Backend): ...                      # pywraplp, linearized, gap 0
+class Annealing(Backend): ...                # SA over the recorded model
+class BruteForce(Backend): ...               # exact DFS over a CpModelProto, tests only
+class Decomposed(Backend):                   # Table axes enumerated around an inner
+    inner: Backend | GraphSolver             # backend or graph solver
+
+class GraphSolver(Protocol):                 # reads nodes and relation queries, writes
+    def solve(self, graph, strategy, cost_expr) -> None  # decisions (greedy, SA, ...)
+
+class SolveStatus(Enum):
+    OPTIMAL = auto(); FEASIBLE = auto(); INFEASIBLE = auto(); UNKNOWN = auto()
 ```
 
-`Assignment` and the three relations (`ViewRelation`, `RelayoutRelation`,
-`NestRelation`) are data the graph holds. The `Enumeration`s are held by the
-`Strategy`, which the `EnumerationFactory` builds from node fields and config. The
-strategy encodes everything and keeps all CP state: a `NodeVars` per node and per
-relayout layout, and the served literals per READ edge. Each stage below introduces
-only the part it needs (Stage 1: data and queries; Stage 5:
-`Strategy.apply_core_division` and `NodeVars`; Stage 6: the other `apply_*` steps;
-Phase 2: `Lazy` / `Pruned` and the mixed-pair encodings).
+`Assignment` and the three relations are data the graph holds. The `Enumeration`s
+are held by the `Strategy`, which the `EnumerationFactory` builds from node fields and
+config. The strategy encodes everything and keeps all CP state: a `NodeVars` per node
+and per relayout layout, and the served literals per READ edge. The stages implement
+these types in order: Stage 1 the data and queries, Stage 2 `build_graph`, Stage 5
+`NodeVars` and `apply_core_division`, Stage 6 the other steps, Stage 8 `solve` and
+`SolveSettings`, Phase 2 `Lazy` / `Pruned` and the mixed-pair encodings.
 
 Notes:
 
@@ -456,60 +591,10 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - Rename the draft (`CoreDivisionBoundBuffer` → `ResourceNode`, `BufferGraph` →
   `SpyreOptimizationGraph`, `build_buffer_graph` → `build_graph`) and reshape it into
   the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
-- The supporting types, data and queries only (no solver methods yet):
-
-  ```python
-  Pairs = tuple[tuple[int, int], ...]  # (src, dst) menu-index pairs (the draft's)
-  SplitKey = sympy.Symbol              # CoreDivision.splits keys
-  TileKey = tuple[int, bool]           # as the draft's sym_tile_counts keys
-
-  @dataclass(frozen=True)
-  class Assignment:                    # a decided split
-      splits: Mapping[SplitKey, int]   # sym_core_divs keys
-      tiling: TileSpec
-      COMMITTED: ClassVar[Assignment]  # fixed upstream by work division; its splits
-                                       # are not visible to the solve (placement-only)
-
-  class Enumeration(ABC):              # one decision axis of a node
-      def holds(self, value) -> bool
-  class Fixed(Enumeration):            # value known before the solve
-      value: Any
-  class Table(Enumeration):            # explicit candidates (the allocator's menu)
-      candidates: list[CoreDivision]   # division and tiling share it for now
-
-  @dataclass(frozen=True)
-  class Enumerations:                  # one node's enumeration per axis; held by
-      division: Enumeration            # the Strategy, not the node. Division carries
-      residency: Enumeration           # tiling while it is a Table; residency is
-      offset: Enumeration              # open (apply_op_constraints may pin it). No
-                                       # relayout axis until 2d.
-
-  class Strategy:                      # encodes a graph; methods arrive in Stages 5-6
-      enumerations: dict[ResourceNode, Enumerations]
-
-  class EnumerationFactory:            # validates the config and builds strategies
-      def strategy(self, graph: SpyreOptimizationGraph) -> Strategy
-          # default: today's model, from each node's fields (menu -> Table, a set
-          # decision -> Fixed(value), so COMMITTED -> Fixed(COMMITTED))
-
-  @dataclass(frozen=True)
-  class RelayoutRead:                  # one src layout this read can go through
-      layout: RelayoutLayout
-      candidates: tuple[RelayoutCandidate, ...]  # its priced (src, dst) divisions
-
-  # Relations answer through their edge's two menus (an Assignment is unique in
-  # its menu), so queries take Assignments while the tables hold indices.
-  class ViewRelation:                  # both ends own the buffer with the same view
-      table: Pairs                     # allocator's final pairs; empty = never alike
-      def holds(self, src: Assignment, dst: Assignment) -> bool
-  class RelayoutRelation:              # READ: src's relayout layouts that can serve
-      reads: tuple[RelayoutRead, ...]  # a mismatch; allocator's capped candidates
-      def bridges(self, src: Assignment, dst: Assignment) -> tuple[RelayoutRead, ...]
-  class NestRelation:                  # both ops run the same non-empty loop nest:
-      def joins(self, before: Assignment, after: Assignment) -> bool
-                                       # equal, non-empty level_counts; no pair
-                                       # table (Phase 1 keeps loop_id, Stage 4)
-  ```
+- Implement the data types and queries of *The model*: aliases, `Assignment`, the
+  relations, the edges, `RelayoutLayout`, `ResourceNode` and the graph, plus the
+  `Enumeration` kinds Phase 1 uses (`Fixed`, `Table`), `Enumerations`, and `Strategy`
+  and `EnumerationFactory` without solver methods.
 - The draft's `RelayoutRead.copy` becomes `layout` and its `pairs` goes. `spill_cost(node)`
   (from `read_count`, `first_use_is_read`, `boundary` and `size`) and the derived
   properties (`sym_is_lx`, `per_core_sizes`, `cores_used`, `shape_costs`, `tileable`)
@@ -523,8 +608,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   relation queries (`holds`, `bridges`, `joins`) agree with their tables, and an empty
   table never holds; `add_successor` links both ends, derives `contiguous`, and refuses
   a second neighbour; `joinable` is false across a tick gap and at untileable ops;
-  the chain ends have `prev` / `next` `None`; `tiling` is `None` while `assignment` is; `joins`
-  agrees with `loop_id` equality ∧ `tiled[after]`.
+  the chain ends have `prev` / `next` `None`; `tiling` is `None` while `assignment`
+  is; `joins` agrees with `loop_id` equality ∧ `tiled[after]`.
 
 ### Stage 2. Builder
 
