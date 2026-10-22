@@ -208,7 +208,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import (
     Callable, ClassVar, Generic, Iterator, Literal, Mapping, Optional, Protocol,
-    Sequence, TypeVar,
+    Sequence, TypeAlias, TypeVar,
 )
 
 import sympy
@@ -227,6 +227,8 @@ T = TypeVar("T")
 Pairs = tuple[tuple[int, int], ...]          # (src, dst) menu-index pairs
 SplitKey = sympy.Symbol                      # CoreDivision.splits keys
 TileKey = tuple[int, bool]                   # sym_tile_counts keys (plan_solver.py:446)
+Model: TypeAlias = "cp_model.CpModel | Backend"  # what the strategy posts to:
+                                             # cp_model until 3a, a Backend after
 
 # ---- a decided division ----------------------------------------------------
 @dataclass(frozen=True)
@@ -377,14 +379,14 @@ class SpyreOptimizationGraph:
 
     def solve(
         self,
-        model: cp_model.CpModel | Backend,
+        model: Model,
         cost_expr: Optional[sympy.Expr] = None,  # None or unlowerable: fallback ladder
         strategy: Optional[Strategy] = None,     # None: EnumerationFactory().strategy(
     ) -> ExecutionPlan:                          # self), which has no candidates
         """_finalize, the objective ladder, extraction. Leaves the graph as it
         was. Raises SolveError as _run does."""
 
-    def _finalize(self, model: cp_model.CpModel, strategy: Strategy) -> None:
+    def _finalize(self, model: Model, strategy: Strategy) -> None:
         """The strategy's apply_* steps in today's order (Finalization order)."""
 
 def build_graph(
@@ -630,27 +632,31 @@ class PrinterView:
 
 @dataclass(eq=False)
 class NodeVars:
-    """The CP variables of one node or candidate copy, made by the strategy in
+    """The variables of one node or candidate copy, made by the strategy in
     today's order: residency literal, offset, footprint, merge literals, the
     per-axis split and tile-count vars, and for a `Table` the candidate index
-    and its `division == i` literals. Nodes and edges never hold these."""
-    model: cp_model.CpModel
-    in_buffer: cp_model.IntVar               # residency literal (in_buffer_<name>)
-    offset: cp_model.IntVar                  # off_<name>
-    eff_size: cp_model.IntVar | int          # per-core footprint; a constant when
+    and its `division == i` literals. Backend-neutral: each field is whatever
+    handle the backend returned (a `cp_model.IntVar` for CP-SAT, which already
+    satisfies `Var`), so every backend that takes a posted model uses the same
+    record. Graph solvers post no model and use none. Nodes and edges never
+    hold these."""
+    model: Model                             # what made the vars (for division_is)
+    in_buffer: Var               # residency literal (in_buffer_<name>)
+    offset: Var                  # off_<name>
+    eff_size: Var | int          # per-core footprint; a constant when
                                              # the division is fixed
-    merges: dict[str, cp_model.IntVar] = field(default_factory=dict)
+    merges: dict[str, Var] = field(default_factory=dict)
                                              # merge_<parent>_<name>, per IN_PLACE input
-    splits: dict[SplitKey, cp_model.IntVar] = field(default_factory=dict)
-    tile_counts: dict[TileKey, cp_model.IntVar] = field(default_factory=dict)
-    cores: Optional[cp_model.IntVar] = None  # None for COMMITTED
-    core_cost: Optional[cp_model.IntVar] = None
-    division: Optional[cp_model.IntVar] = None  # Table only: the candidate index
+    splits: dict[SplitKey, Var] = field(default_factory=dict)
+    tile_counts: dict[TileKey, Var] = field(default_factory=dict)
+    cores: Optional[Var] = None  # None for COMMITTED
+    core_cost: Optional[Var] = None
+    division: Optional[Var] = None  # Table only: the candidate index
                                                 # (constant 0 for one candidate)
     buffer: Optional[PrinterView] = None        # Table only, until 2a
-    _is: dict[int, cp_model.IntVar] = field(default_factory=dict)
+    _is: dict[int, Var] = field(default_factory=dict)
 
-    def division_is(self, i: int) -> cp_model.IntVar:
+    def division_is(self, i: int) -> Var:
         """Table only: cached literal `division == i`, made on first call (today's
         `_division_is`); a constant for a one-candidate menu."""
 
@@ -669,7 +675,7 @@ class Strategy:
     relayouts: dict[DependencyEdge, RelayoutRelation]
     nests: dict[ExecutionEdge, NestRelation]
     vars: dict[ResourceNode | RelayoutLayout, NodeVars] = field(default_factory=dict)
-    served: dict[DependencyEdge, dict[RelayoutLayout, cp_model.IntVar]] = field(
+    served: dict[DependencyEdge, dict[RelayoutLayout, Var]] = field(
         default_factory=dict)                # served literals, per READ edge
 
     def joinable(self, edge: ExecutionEdge) -> bool:
@@ -680,21 +686,21 @@ class Strategy:
 
     # the steps, in _finalize order (Stage 5: the first; Stage 6: the rest)
     def apply_core_division(
-        self, graph: SpyreOptimizationGraph, model: cp_model.CpModel) -> None: ...
+        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
     def apply_inplace(
-        self, graph: SpyreOptimizationGraph, model: cp_model.CpModel) -> None: ...
+        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
     def apply_placement(
-        self, graph: SpyreOptimizationGraph, model: cp_model.CpModel) -> None: ...
+        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
     def apply_op_constraints(
-        self, node: ResourceNode, model: cp_model.CpModel) -> None: ...
+        self, node: ResourceNode, model: Model) -> None: ...
     def apply_reads(
-        self, node: ResourceNode, model: cp_model.CpModel) -> None: ...
+        self, node: ResourceNode, model: Model) -> None: ...
     def apply_relayout(
-        self, graph: SpyreOptimizationGraph, model: cp_model.CpModel) -> None: ...
+        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
     def apply_coarse_tiling(
-        self, graph: SpyreOptimizationGraph, model: cp_model.CpModel) -> None: ...
+        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
     def apply_cloning(
-        self, graph: SpyreOptimizationGraph, model: cp_model.CpModel) -> None: ...
+        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
 
 AxisSetting = Literal["table", "lazy", "pruned"]
 
