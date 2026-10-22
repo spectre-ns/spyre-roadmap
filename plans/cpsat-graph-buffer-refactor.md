@@ -86,7 +86,8 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    model), constraints over per-axis vars otherwise (Phase 2). Nests keep today's
    per-node `loop_id` until 2b. Outside the strategy's own encodings (`Table` index
    vars and element ties, `loop_id`) and, until 2a, `cpsat_expr_printer`, nothing reads
-   menu indices; queries take `WorkSplit`s.
+   menu indices; decisions are `WorkSplit`s. Relations are enforced only by the
+   strategy's encoding; there is no public query API over them.
 2. **Phase 1 derives nothing the allocator decided.** Match tables (including the
    loop-carry intersection and input-clone overrides, `allocator.py:4160-4240`),
    capped relayouts and the copies built from them, read counts (`read_count`:
@@ -240,7 +241,7 @@ class WorkSplit:
     """How one op's work is split: across cores (the core division, a split
     factor per loop symbol) and into coarse tiles (the tiling). It is the
     selected value of a node's division axis, whatever enumeration produced
-    it, so relation queries and decisions speak in WorkSplits, never in menu
+    it, so decisions speak in WorkSplits, never in menu
     indices. `COMMITTED` stands for a split fixed upstream by work division,
     which the solve does not see."""
     splits: tuple[tuple[SplitKey, int], ...] # split symbol -> factor
@@ -561,19 +562,6 @@ class Strategy:
         """The node's tile-count term vars."""
     def encode_clone(self, node: ResourceNode, model: Model) -> None:
         """Graph input: its relation to its consumers (a no-op in Phase 1; 2c)."""
-    # ---- queries over its relations (no model): for tests and graph solvers ----
-    def views_agree(
-        self, edge: DependencyEdge, src: WorkSplit, dst: WorkSplit) -> bool:
-        """Do the two ends own the buffer with the same per-core view?"""
-    def bridges(
-        self, edge: DependencyEdge, src: WorkSplit, dst: WorkSplit,
-    ) -> tuple[RelayoutLayout, ...]:
-        """The candidate copies that can serve this read under (src, dst)."""
-    def joins(
-        self, edge: ExecutionEdge, before: WorkSplit, after: WorkSplit) -> bool:
-        """Do the two ops run the same non-empty loop nest?"""
-    def joinable(self, edge: ExecutionEdge) -> bool:
-        """contiguous, and both ends' work splits can be tiled."""
 
 AxisSetting = Literal["table", "lazy", "pruned"]
 
@@ -698,9 +686,9 @@ class Decomposed:
 
 class GraphSolver(Protocol):
     """3a: a solver that works on the graph directly instead of a posted model
-    (greedy, first-fit, best-fit, SA). It reads nodes, asks the strategy's
-    queries (`views_agree`, `bridges`, `joins`) and fills the nodes' decisions,
-    as `solve()` does."""
+    (greedy, first-fit, best-fit, SA). It reads the nodes, enforces the rules
+    a strategy would encode itself (it is built for one configuration, which
+    `accepts` checks), and fills the nodes' decisions, as `solve()` does."""
     def accepts(self, strategy: Strategy) -> bool: ...  # can it handle these axes?
     def solve(
         self, graph: SpyreOptimizationGraph, strategy: Strategy,
@@ -716,10 +704,10 @@ enumerated (internally), every edge's relations, the candidate copies and all CP
 table-based axes the strategy generates the candidates and tables itself (until Stage 9
 it is given the allocator's); no node or edge sees them. Per axis and per edge the
 strategy applies whichever the enumeration calls for: a `Table` applies its candidates,
-a `Lazy` axis applies constraints derived from the node's `space` and the edge's
-`reads`. The stages implement these types in order: Stage 1 the data and queries, Stage
-2 `build_graph`, Stage 5 `NodeVars`, `prepare`, `encode_node` and `encode_layout`, Stage
-6 the other methods, Stage 8 `solve` and `SolveSettings`, Stage 9 the table strategy's
+a `Lazy` axis applies constraints derived from the node's `space` and the two nodes'
+ops. The stages implement these types in order: Stage 1 the data types, Stage 2
+`build_graph`, Stage 5 `NodeVars`, `prepare`, `encode_node` and `encode_layout`, Stage 6
+the other methods, Stage 8 `solve` and `SolveSettings`, Stage 9 the table strategy's
 candidate generation, Phase 2 `Lazy` / `Pruned` and the mixed-pair encodings, 3a the
 backend protocol, backends and graph solvers, 3c `division_mode`.
 
@@ -750,8 +738,8 @@ Notes:
   to relink a node that already has a neighbour; `_finalize` asserts every node with a
   `produced_at` is on it. The chain ends have no edge (`prev` / `next` is `None`),
   which the coarse-tiling walk treats like a non-joinable edge. `contiguous` is
-  derived as today (consecutive `produced_at` ticks); `Strategy.joinable` adds whether
-  both ends' division axes can be tiled.
+  derived as today (consecutive `produced_at` ticks); whether an edge is joinable (both
+  ends' work splits can be tiled) is the strategy's internal decision.
 - Inside the table strategy, a missing match entry is an **empty** table, never
   `None`: today
   `.get(parent, [])` (`ilp_solver_ortools.py:410`) gives an empty table, which
@@ -884,10 +872,10 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - Rename the draft (`CoreDivisionBoundBuffer` → `ResourceNode`, `BufferGraph` →
   `SpyreOptimizationGraph`, `build_buffer_graph` → `build_graph`) and reshape it into
   the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
-- Implement the data types and queries of *The model*: aliases, `WorkSplit`, the
-  relations, the edges, `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph,
-  plus `Strategy` and `EnumerationFactory` without solver methods. The fixed and
-  table enumerations Phase 1 uses are internal to the default strategy.
+- Implement the data types of *The model*: aliases, `WorkSplit`, the edges,
+  `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph, plus `Strategy` and
+  `EnumerationFactory` without solver methods. The fixed and table enumerations Phase 1
+  uses are internal to the default strategy.
 - From the draft: `RelayoutRead` and `Pairs` go into the table strategy's internals;
   `spill_cost(node)` (from `read_count`, `first_use_is_read`, `boundary` and `size`)
   and `sym_is_lx` stay on the node; the per-candidate properties (`per_core_sizes`,
@@ -902,11 +890,9 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   check-all-configs`): `add_node` order; `add_child` puts one edge object on both ends
   only, and a second edge between one pair is refused; nodes and edges carry no
   candidate data; `add_successor` links both ends, derives
-  `contiguous`, and refuses a second neighbour; `Strategy.joinable` is false across a
-  tick gap and at ends whose division axis cannot be tiled; the chain ends have `prev` /
-  `next` `None`. The strategy's queries (`views_agree`, `bridges`, `joins`) are tested
-  with the default strategy in Stage 6: they agree with its tables, an empty table never
-  agrees, and `joins` matches `loop_id` equality ∧ `tiled[after]`.
+  `contiguous`, and refuses a second neighbour; the chain ends have `prev` / `next`
+  `None`. The relations have no public API: they are checked through the encoding (the
+  proto diff from Stage 6, the Phase 2 agreement tests, `BruteForce`).
 
 ### Stage 2. Builder
 
@@ -1530,8 +1516,9 @@ constraints over small per-buffer domains, never per-pair tables.
       leaves scored by today's HBM bytes as its cost expression), so 3g's same-plans
       check holds; switching it to the real `cost_expr` is a later step of its own
       that lists the tests whose expectations change.
-  - **Graph solvers.** A second kind behind `set_solver`: solvers that read nodes,
-    the strategy's queries directly and fill the nodes' decisions (greedy,
+  - **Graph solvers.** A second kind behind `set_solver`: solvers that read nodes
+    directly, enforce the rules a strategy would encode themselves (each built for one
+    configuration), and fill the nodes' decisions (greedy,
     first-fit, best-fit, SA placement, `SaCoOptimizingSolver`, `Decomposed`'s heuristic
     inner solver). `graph.solve` runs them in place of `_finalize` and the ladder; the
     greedy fallback after a `SolveError` is the greedy graph solver.
