@@ -133,11 +133,11 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    `SpyreOptimizationGraph._finalize(model, strategy)`, which runs the `Strategy`'s
    `apply_*` steps over the graph in a fixed order. All encoding, and every CP var and
    literal, lives in the strategy.
-5. **Enumeration is polymorphic, per decision axis.** Nodes do not carry
-   enumerations; the `Strategy` does. For each node and each enumerated axis (the work
-   split: core division and coarse tiling, one axis until 2b; from 2d, relayout choice
-   per READ edge) it holds an `Enumeration`, data plus `holds(value)` (a query, no model), built from
-   the node's fields (and, for a `Table`, its table source), and it realizes that
+5. **Enumeration is polymorphic, per decision axis.** Nodes do not carry enumerations;
+   the `Strategy` does. For each node and each enumerated axis (the work split: core
+   division and coarse tiling, one axis until 2b; from 2d, relayout choice per READ
+   edge) it holds an `Enumeration`, data plus `holds(value)` (a query, no model), built
+   from the node's fields (and, for a `Table`, its table source), and it realizes that
    enumeration in the model:
    - `Fixed(value)` — known before the solve; posts constants. `Fixed(COMMITTED)` is a
      placement-only buffer: committed upstream by work division, posts nothing.
@@ -1136,10 +1136,10 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   FEASIBLE raises `SolveError` naming the stage; a time-limited FEASIBLE incumbent is
   accepted; a lowering error re-raises when `_cpsat_warn_on_cost_expr` is off. Nothing
   is written to the nodes or edges.
-- A pre-set `work_split` is a `Fixed` enumeration: a concrete one posts a constant
-  index (its edges keep their gates, with that side constant); `Fixed(COMMITTED)` posts
-  nothing, as above. A pre-set `resident` / `offset` pins its var. Bottom-justify is skipped when any
-  offset was pinned.
+- A pre-set `work_split` is a `Fixed` enumeration: a concrete one posts a constant index
+  (its edges keep their gates, with that side constant); `Fixed(COMMITTED)` posts
+  nothing, as above. A pre-set `resident` / `offset` pins its var. Bottom-justify is
+  skipped when any offset was pinned.
 - `_plan_layout_generic` calls `build_graph`, builds the strategy (the transitional
   table strategy until Stage 9), makes the model, calls `graph.solve(model,
   cost_expr, strategy)` and writes the decisions back to the allocator's buffers:
