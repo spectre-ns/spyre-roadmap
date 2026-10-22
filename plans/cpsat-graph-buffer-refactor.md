@@ -128,7 +128,7 @@ classDiagram
         resident: bool
         offset: int
         spill_reason: str
-        transforms: list~PlacedTransform~
+        chosen_transforms() list~Transform~
         add_child(child, in_place) DependencyEdge
         add_successor(after) ExecutionEdge
     }
@@ -470,9 +470,6 @@ class ResourceNode:
     offset: Optional[int] = None             # alignment units; only when resident
     spill_reason: Optional[str] = None       # set by solve() when not resident: the
                                              # residency_reason or _SOLVER_CHOSE_SPILL
-    transforms: list[PlacedTransform] = field(default_factory=list)
-                                             # set by solve(): the transforms of
-                                             # this output to insert
     # structure
     prev: Optional[ExecutionEdge] = None     # set by add_successor; None for a graph
     next: Optional[ExecutionEdge] = None     # input and at the chain ends
@@ -482,6 +479,11 @@ class ResourceNode:
     @property
     def tiling(self) -> Optional[TileSpec]:  # once work_split is set; None
         return self.work_split.tiling if self.work_split else None  # if COMMITTED
+
+    def chosen_transforms(self) -> list[Transform]:
+        """The distinct transforms this output's edges read through, in copy
+        order: what realization inserts. Derived from `edge.transform`, never
+        stored."""
 
     @property
     def sym_is_lx(self) -> sympy.Symbol:
@@ -562,14 +564,6 @@ def build_graph(
     settings: SolveSettings,
 ) -> SpyreOptimizationGraph: ...             # Stage 2
 
-@dataclass(frozen=True)
-class PlacedTransform:
-    """A transform `solve()` chose: which one, and where its copy lives (an LX
-    offset, or None when it lands in HBM, as a cut's copy-out does). Realizing
-    the plan inserts its op."""
-    transform: Transform
-    offset: Optional[int]                    # alignment units; None = HBM
-
 # =============================================================================
 # The model side: CP state and the strategy. How each axis is enumerated
 # (fixed, a table of candidates, lazy, pruned) and the relations over each
@@ -589,8 +583,9 @@ class Transform:
     edge that needs that conversion, priced once, and alive from the slot it
     runs in to the last read through it. The strategy generates the candidates
     (today's capped, priced relayout groups) and keeps their pricing
-    internally; an edge may also require one up front. `solve()` puts the
-    chosen ones on the producer's `transforms`. Phase 1 takes relayouts from
+    internally; an edge may also require one up front. Like a node it carries
+    its own decisions: set before the solve to pin, `None` = open, filled by
+    `solve()` for every transform an edge chose. Phase 1 takes relayouts from
     the allocator's `RelayoutCopyBuffer`s."""
     kind: TransformKind
     producer: ResourceNode
@@ -601,6 +596,10 @@ class Transform:
     division: Optional[CoreDivision]         # the target's one division (RELAYOUT)
     start_time: int                          # today's fixed lifetime
     end_time: int                            # [first reader tick, last + 1)
+    # decisions (None = open; solve() fills them for a chosen transform)
+    resident: Optional[bool] = None          # in LX; a chosen relayout is resident,
+                                             # a copy-out never is (it lands in HBM)
+    offset: Optional[int] = None             # alignment units; only when resident
 
     @property
     def sym_is_lx(self) -> sympy.Symbol:
@@ -901,16 +900,17 @@ Notes:
 - **Graph inputs are nodes** with `produced_at = None`: no producing op and not on
   the execution chain (their first use is another op's read tick). Their menu (today's
   clone menu) is table data; residency as for any node.
-- **Transforms live on edges, not as nodes.** An edge can define a transform between
-  its two ops: the read goes through a converted copy of the producer's output (a
-  relayout today; a cut's copy-out with #5246; transposes and restickification later,
-  see *Future work*). One `Transform` exists per (producer, kind, target) and every edge
-  needing that conversion points at it (`edge.transform`), so it is priced and placed
-  once. Candidates are the strategy's (`EncodingStrategy.transforms`); an edge may also
-  require one up front. `solve` puts the chosen ones on their producer's `transforms`
-  (`PlacedTransform`), and realizing the plan inserts their ops (a relayout's shuffle
-  directly before its first reader). Copies do not break tiling runs today, and with no
-  copy node on the chain that stays exact.
+- **Transforms live on edges, not as nodes.** An edge can define a transform between its
+  two ops: the read goes through a converted copy of the producer's output (a relayout
+  today; a cut's copy-out with #5246; transposes and restickification later, see *Future
+  work*). One `Transform` exists per (producer, kind, target) and every edge needing
+  that conversion points at it (`edge.transform`), so it is priced and placed once.
+  Candidates are the strategy's (`EncodingStrategy.transforms`); an edge may also
+  require one up front. Like a node, a transform carries its own decisions (`resident`,
+  `offset`), pinned or filled by `solve`. Realization collects each producer's
+  `chosen_transforms()` (the distinct `edge.transform` values) and inserts their ops (a
+  relayout's shuffle directly before its first reader). Copies do not break tiling runs
+  today, and with no copy node on the chain that stays exact.
 - **Copy order** is every candidate transform sorted by (producer name, `group`), after
   all nodes: today's `sorted(groups.items())` (`allocator.py:4444`), with copies
   appended after every other buffer. `EncodingStrategy.transforms` holds them in that
@@ -1177,7 +1177,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   | `cd_parent_matches`, `cd_parent_relayouts` | the table strategy's view and relayout tables per edge |
   | `in_place_parents` | `in_place` on the edge |
   | `RelayoutCopyBuffer` (whole buffer) | a candidate relayout `Transform` in the table strategy, with its name, group, size, read count, division and lifetime |
-  | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | node decisions, `transforms` and edge `transform`, written back to the buffers by Stage 8 |
+  | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | node and transform decisions and edge `transform`, written back to the buffers by Stage 8 |
   | `residency_edges`, `division_space` | not carried (the strategy rebuilds residency edges from `node.op`); `node.space`, read by Stage 9 and Phase 2 |
   | `tile_reads` | not carried; Phase 2b |
   | `op_position` | replaced by `produced_at` and execution edges |
@@ -1299,8 +1299,9 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   allocator's candidates): `_finalize(model, strategy)`, the objective ladder (with the
   fallback copy pin when `cost_expr` is `None` or fails to lower), extraction. It fills
   every open decision: `work_split` (so the tiling), `resident`, `offset` when resident,
-  `spill_reason` when not, the chosen transforms on `transforms`, and `transform` on edges
-  (`None`: read directly). It returns the op-output nodes along the execution chain;
+  `spill_reason` when not, `transform` on edges
+  (`None`: read directly), and each chosen transform's `resident` / `offset`. It returns
+  the op-output nodes along the execution chain;
   that list is the execution plan.
 - It builds the CP-SAT solver as `_run` does (time limit, workers from deterministic
   mode or the CPU count, `random_seed=0`, presolve off past
