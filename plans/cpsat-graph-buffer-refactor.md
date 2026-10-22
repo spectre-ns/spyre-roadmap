@@ -111,7 +111,7 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
      nothing.
    - **By the caller** (Stage 8): pinned `work_split`, `resident` or `offset`.
    - **At finalization, by the strategy's op constraints.**
-     `strategy.apply_op_constraints(graph, model)` applies, per node, the restrictions
+     `strategy.encode_op_constraints(node, model)` applies the restrictions
      for the node's kind of op (its `residency_reason`: an op not allowed in LX, a
      mutation target, an empty tensor, min footprint over LX capacity, and so on). The
      default strategy pins `resident=False` in the model and records the reason; `solve`
@@ -320,7 +320,7 @@ class ResourceNode:
                                              # are generated from; None: committed
                                              # upstream
     residency_reason: Optional[str] = None   # Phase 1: excluded(buffer); Phase 3: from
-                                             # the op; applied by apply_op_constraints
+                                             # the op; applied by encode_op_constraints
     # decisions: set before the solve to pin, None = open; solve() fills the rest
     work_split: Optional[WorkSplit] = None   # core division + coarse tiling;
                                              # COMMITTED when fixed upstream
@@ -396,6 +396,9 @@ class SpyreOptimizationGraph:
         """In add_node order. Edges are reached through node.inputs /
         node.outputs, never listed."""
 
+    def execution_chain(self) -> Iterator[ExecutionEdge]:
+        """The execution edges from `first` along `next`, in order."""
+
     def set_solver(self, solver: type[Backend] | GraphSolver) -> None: ...  # 3a
 
     def solve(
@@ -410,7 +413,8 @@ class SpyreOptimizationGraph:
         writing nothing."""
 
     def _finalize(self, model: Model, strategy: Strategy) -> None:
-        """The strategy's apply_* steps in today's order (Finalization order)."""
+        """Walk the graph in today's emission order, calling the strategy once
+        per node, edge or copy (Finalization order)."""
 
 def build_graph(
     buffers: Sequence[LifetimeBoundBuffer], alignment: int, capacity: int,
@@ -580,56 +584,87 @@ class NodeVars:
 # ---- the strategy: decides per axis and per edge how to apply the data ------
 @dataclass(eq=False)
 class Strategy:
-    """Encodes a graph into a CP model. Created by the factory from
-    configuration alone (which enumeration each axis uses), it holds no graph:
-    `solve` injects the graph into every `apply_*` step, in `_finalize`'s order.
-    From that graph the steps build the per-solve state below (each node's
-    enumerations, each edge's relations, the candidate copies, the variables).
-    For a table-based axis the strategy generates its candidates itself from
-    the graph's incoming data (menus from `node.space`, match tables from
-    `edge.reads`, priced copies from the ops), the work the allocator does
-    today; those tables are its implementation detail. Per axis and per edge
-    the steps apply whichever the enumeration calls for (a `Table`'s
-    candidates, or a `Lazy` axis's constraints). The state is reset at the
-    start of each solve, so one strategy serves any number of graphs."""
+    """Encodes a graph into a CP model, one node, edge or copy at a time.
+    Created by the factory from configuration alone (which enumeration each
+    axis uses), it holds no graph. `_finalize` walks the graph in today's
+    emission order and calls one method per element; only three hooks see the
+    whole graph (`prepare`, `encode_no_overlap`, `tiling_segments`). Each
+    method reads the per-solve state below (the two ends' enumerations and
+    vars) and adds to it; nodes and edges stay pure data. For a table-based
+    axis the strategy generates its candidates itself from the graph's
+    incoming data (menus from `node.space`, match tables from `edge.reads`,
+    priced copies from the ops), the work the allocator does today; those
+    tables are its implementation detail."""
     division: AxisSetting                    # the configuration, from the factory
     tiling: AxisSetting
     relayout: Literal["data", "pruned", "lazy"]
-    # per-solve state, built by the steps from the injected graph
+    # per-solve state, reset by prepare() and filled by the encode_* methods
     enumerations: dict[ResourceNode, Enumerations] = field(default_factory=dict)
     views: dict[DependencyEdge, ViewRelation] = field(default_factory=dict)
                                              # a pair table when both ends are
                                              # Table, DerivedView otherwise
     relayouts: dict[DependencyEdge, RelayoutRelation] = field(default_factory=dict)
     nests: dict[ExecutionEdge, NestRelation] = field(default_factory=dict)
-    layouts: tuple[RelayoutLayout, ...] = () # candidate copies it generated
+    layouts: tuple[RelayoutLayout, ...] = () # candidate copies, in copy order
     vars: dict[ResourceNode | RelayoutLayout, NodeVars] = field(default_factory=dict)
     served: dict[DependencyEdge, dict[RelayoutLayout, Var]] = field(
         default_factory=dict)                # served literals, per READ edge
 
+    # ---- whole-graph hooks (the only methods that take the graph) ----
+    def prepare(self, graph: SpyreOptimizationGraph) -> None:
+        """Reset the per-solve state, build each node's enumerations, and for
+        table-based axes generate the candidates (menus, match tables, candidate
+        copies in copy order). Graph-wide because the pricing loop spans it."""
+    def encode_no_overlap(
+        self, graph: SpyreOptimizationGraph, model: Model) -> None:
+        """The 2-D no-overlap over every node's and copy's rectangle, with the
+        incoming-merge tick shortening."""
+    def tiling_segments(
+        self, graph: SpyreOptimizationGraph) -> Mapping[ResourceNode, int]:
+        """Walk the execution chain: a new segment at the first op and wherever an
+        edge is not joinable."""
+
+    # ---- per element, called by _finalize in today's order ----
+    def encode_node(self, node: ResourceNode, model: Model) -> None:
+        """The node's vars: residency literal, offset, a merge literal per
+        IN_PLACE input, then the work split's vars and element ties."""
+    def encode_layout(self, layout: RelayoutLayout, model: Model) -> None:
+        """A candidate copy's vars (one fixed division)."""
+    def encode_merge(self, edge: DependencyEdge, model: Model) -> None:
+        """IN_PLACE edge: offset equality, both ends resident, then eff_size
+        equality and the view gate when the child chooses a work split."""
+    def limit_merges(
+        self, node: ResourceNode, model: Model, incoming: bool) -> None:
+        """At most one merge into (or out of) the node."""
+    def encode_capacity(
+        self, item: ResourceNode | RelayoutLayout, model: Model) -> None:
+        """offset + eff_size <= capacity while resident."""
+    def encode_op_constraints(
+        self, item: ResourceNode | RelayoutLayout, model: Model) -> None:
+        """The restrictions for the item's kind of op; the default pins
+        resident=False with the reason."""
+    def encode_read(self, edge: DependencyEdge, model: Model) -> None:
+        """READ edge: the served literals (one per candidate copy that can
+        serve it) and the view gate, "match or served"."""
+    def encode_relayout(self, layout: RelayoutLayout, model: Model) -> None:
+        """A copy needs its producer resident under a priced source work split
+        and must serve some read; pinned out when it cannot."""
+    def encode_tiling_vars(
+        self, item: ResourceNode | RelayoutLayout, model: Model) -> None:
+        """loop_id / tiled for an item with a work split."""
+    def encode_nest(self, edge: ExecutionEdge, model: Model) -> None:
+        """same_nest, joined and the group step along one execution edge."""
+    def encode_cuts(
+        self, node: ResourceNode, segments: Mapping[ResourceNode, int],
+        model: Model) -> None:
+        """The node's cut literal: apart literals for READ consumers in its
+        segment; unshareable if one is outside it or it is a graph output."""
+    def encode_tile_counts(self, node: ResourceNode, model: Model) -> None:
+        """The node's tile-count term vars."""
+    def encode_clone(self, node: ResourceNode, model: Model) -> None:
+        """Graph input: its relation to its consumers (a no-op in Phase 1; 2c)."""
     def joinable(self, edge: ExecutionEdge) -> bool:
-        """contiguous, and both ends' division axes are tileable."""
-
-    def copy_order(self) -> list[RelayoutLayout]:
-        """Every candidate layout, sorted by (producer name, group)."""
-
-    # the steps, in _finalize order (Stage 5: the first; Stage 6: the rest)
-    def apply_core_division(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
-    def apply_inplace(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
-    def apply_placement(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
-    def apply_op_constraints(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
-    def apply_reads(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
-    def apply_relayout(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
-    def apply_coarse_tiling(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
-    def apply_cloning(
-        self, graph: SpyreOptimizationGraph, model: Model) -> None: ...
+        """contiguous, and both ends' work splits can be tiled."""
 
 AxisSetting = Literal["table", "lazy", "pruned"]
 
@@ -768,16 +803,15 @@ The graph holds only incoming data and decisions. The `Strategy` holds every nod
 `Enumerations`, every edge's relations, the candidate copies and all CP state (a
 `NodeVars` per node and per candidate copy, the served literals per READ edge); the
 `EnumerationFactory`, built from configuration alone, creates it with no graph, and
-`solve` injects the graph into each step, which builds that state from it.
-For table-based axes the strategy generates the candidates and tables itself (until
-Stage 9 it is given the allocator's); no node or edge sees them. Per
-axis and per edge the strategy applies whichever the enumeration calls for: a `Table`
-applies its candidates, a `Lazy` axis applies constraints derived from the node's
-`space` and the edge's `reads`. The stages implement
-these types in order: Stage 1 the data and queries, Stage 2 `build_graph`, Stage 5
-`NodeVars` and `apply_core_division`, Stage 6 the other steps, Stage 8 `solve` and
-`SolveSettings`, Stage 9 the table strategy's candidate generation, Phase 2 `Lazy` /
-`Pruned` and the mixed-pair encodings, 3a the
+`solve` injects the graph into each step, which builds that state from it. For
+table-based axes the strategy generates the candidates and tables itself (until Stage 9
+it is given the allocator's); no node or edge sees them. Per axis and per edge the
+strategy applies whichever the enumeration calls for: a `Table` applies its candidates,
+a `Lazy` axis applies constraints derived from the node's `space` and the edge's
+`reads`. The stages implement these types in order: Stage 1 the data and queries, Stage
+2 `build_graph`, Stage 5 `NodeVars`, `prepare`, `encode_node` and `encode_layout`, Stage
+6 the other methods, Stage 8 `solve` and `SolveSettings`, Stage 9 the table strategy's
+candidate generation, Phase 2 `Lazy` / `Pruned` and the mixed-pair encodings, 3a the
 backend protocol, backends and graph solvers, 3c `division_mode`.
 
 Notes:
@@ -828,61 +862,71 @@ Notes:
 
 ### Finalization order
 
-`_finalize(model, strategy)` runs the strategy step by step across all nodes, not node
-by node, because today's model is built step by step (`_run`,
-`ilp_solver_ortools.py:945-1000`). Steps that today post across all buffers take the
-graph:
+`_finalize(model, strategy)` owns the walk; the strategy encodes one element per call.
+Today's model is built step by step across all buffers (`_run`,
+`ilp_solver_ortools.py:945-1000`), so `_finalize` loops step by step too, and the
+emission order the proto diff checks lives here, in one place:
 
 ```python
 def _finalize(self, model, strategy):
-    strategy.apply_core_division(self, model)
-    strategy.apply_inplace(self, model)
-    strategy.apply_placement(self, model)
-    strategy.apply_op_constraints(self, model)
-    strategy.apply_reads(self, model)
-    strategy.apply_relayout(self, model)
-    strategy.apply_coarse_tiling(self, model)
-    strategy.apply_cloning(self, model)
+    nodes = list(self.get_nodes())                        # add_node order
+    strategy.prepare(self)                                # reset; candidates
+    copies = strategy.layouts                             # copy order
+    for n in nodes: strategy.encode_node(n, model)        # 1. vars
+    for c in copies: strategy.encode_layout(c, model)
+    for e in in_place_edges(nodes): strategy.encode_merge(e, model)   # 2. merges
+    for n in nodes: strategy.limit_merges(n, model, incoming=True)
+    for n in merge_sources(nodes): strategy.limit_merges(n, model, incoming=False)
+    for x in (*nodes, *copies): strategy.encode_capacity(x, model)   # 3. placement
+    strategy.encode_no_overlap(self, model)
+    for x in (*nodes, *copies): strategy.encode_op_constraints(x, model)  # 4.
+    for e in read_edges(nodes): strategy.encode_read(e, model)        # 5. reads
+    for c in copies: strategy.encode_relayout(c, model)              # 6. relayouts
+    for x in (*divided(nodes), *copies): strategy.encode_tiling_vars(x, model)  # 7.
+    for e in self.execution_chain(): strategy.encode_nest(e, model)
+    segments = strategy.tiling_segments(self)
+    for n in nodes: strategy.encode_cuts(n, segments, model)
+    for n in nodes: strategy.encode_tile_counts(n, model)
+    for n in graph_inputs(nodes): strategy.encode_clone(n, model)    # 8. clones
 ```
 
 Each step in emission order:
 
-1. **`apply_core_division(graph)`**: each node's `NodeVars` in `add_node` order, as
+1. **`encode_node` / `encode_layout`**: each node's `NodeVars` in `add_node` order, as
    today's wrappers make them: `in_buffer`, `off`, a `merge_*` literal per IN_PLACE
    input, then `div`, `eff_size`, `core_cost`, `occ` (cores), split and tile-count vars
    each with its element, then the `eff_size` / `cores` / `core_cost` elements
-   (`:216-394`); cached constants for a one-candidate `Table`, and only `in_buffer`, `off`
-   and merges for `COMMITTED`. Then each relayout layout's vars, in copy order.
-2. **`apply_inplace(graph)`**: every merge row first, per destination in `add_node`
-   order and per IN_PLACE input in `in_place_parents` order: offset equality, merge ⇒
-   parent resident, merge ⇒ child resident, then, when the child chooses a division,
-   `eff_size` equality and the view gate. Then at-most-one over each node's incoming
-   merges, then over each node's outgoing merges (first-seen order)
-   (`:1200-1240`).
-3. **`apply_placement(graph)`**: capacity (`offset + eff_size <= M` under the
-   residency literal) per node, then per layout; then the 2-D no-overlap over both,
-   with the incoming-merge tick shortening.
-4. **`apply_op_constraints(graph)`**, per node in `add_node` order: the restrictions for
-   the node's kind of op. In the default strategy these are today's exclusion pins
-   (`resident=False` with the reason), posted where they are today, after the no-overlap
-   and before any read gate (`_add_core_division`); a layout the capacity check excludes
-   is pinned after the nodes.
-5. **`apply_reads(graph)`**, per node in `add_node` order, over its READ `outputs`
-   (parent order, then child order, then the child's `parents` order): per edge, the
-   served literals (one per layout that can serve the read: "this read goes through that
-   layout") in sorted relayout-group order (`:441`) and the view gate, which is "match
-   or served", interleaved as today's `constrain_residency` does.
-6. **`apply_relayout(graph)`**, per layout in copy order: if the producer chooses no
-   division, pin the layout out; otherwise layout resident ⇒ producer resident,
-   `bool_or(division_is(i) for i in sorted(priced))` enforced by the layout's literal,
+   (`:216-394`); cached constants for a one-candidate `Table`, and only `in_buffer`,
+   `off` and merges for `COMMITTED`. Then each candidate copy's vars, in copy order.
+2. **`encode_merge` / `limit_merges`**: every merge row first, one IN_PLACE edge at a
+   time, per destination in `add_node` order and per input in `in_place_parents` order:
+   offset equality, merge ⇒ parent resident, merge ⇒ child resident, then, when the
+   child chooses a work split, `eff_size` equality and the view gate. Then at-most-one
+   over each node's incoming merges, then over each node's outgoing merges (sources in
+   first-seen order) (`:1200-1240`).
+3. **`encode_capacity` / `encode_no_overlap`**: capacity (`offset + eff_size <= M`
+   under the residency literal) per node, then per copy; then the 2-D no-overlap over
+   both, with the incoming-merge tick shortening (the one graph-wide constraint).
+4. **`encode_op_constraints`**, per node in `add_node` order, then per copy: today's
+   exclusion pins (`resident=False` with the reason), posted where they are today,
+   after the no-overlap and before any read gate (`_add_core_division`).
+5. **`encode_read`**, one READ edge at a time, per producer in `add_node` order over its
+   `outputs` (parent order, then child order, then the child's `parents` order): the
+   served literals (one per candidate copy that can serve the read: "this read goes
+   through that copy") in sorted relayout-group order (`:441`) and the view gate, which
+   is "match or served", interleaved as today's `constrain_residency` does.
+6. **`encode_relayout`**, per copy in copy order: if the producer chooses no work
+   split, pin the copy out; otherwise copy resident ⇒ producer resident,
+   `bool_or(division_is(i) for i in sorted(priced))` enforced by the copy's literal,
    then `bool_or(serves)` enforced by it, or the pin when no read can use it
    (`_constrain_relayout_copies`).
-7. **`apply_coarse_tiling(graph)`**: `loop_id`/`tiled` per node with a `Table` and per
-   layout (today's one-candidate copies), then execution edges along the chain
-   (`same_nest`, `joined`, group step), then cuts, then tile counts.
-8. **`apply_cloning(graph)`**: input clones. A no-op in Phase 1, where a clone's
-   matches are ordinary READ-edge tables; in Phase 2c it posts the clone's relation
-   derived from its consumers.
+7. **Coarse tiling**: `encode_tiling_vars` (`loop_id` / `tiled`) per node with a
+   `Table` and per copy (today's one-candidate copies); `encode_nest` per execution
+   edge along the chain (`same_nest`, `joined`, group step); `tiling_segments` once
+   (the chain walk); then `encode_cuts` and `encode_tile_counts` per node.
+8. **`encode_clone`**: per graph input. A no-op in Phase 1, where a clone's matches are
+   ordinary READ-edge tables; in Phase 2c it posts the clone's relation derived from
+   its consumers.
 
 The fallback copy pin (`:1044-1048`) is not here: it depends on whether `cost_expr`
 lowered, so it stays in the ladder inside `solve`. Stage 0's proto diff is the check
@@ -971,7 +1015,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
     `Output` (today's fallback, `ilp_solver_ortools.py:263-270`). Each node's
     `residency_reason` is `MemoryPlanSolver.excluded(buffer)`: the allocator's reason,
     else the capacity check (`record_exclusions`, `ilp_solver_ortools.py:630`), for
-    `apply_op_constraints` to apply and Stage 8 to write back as `spill_reason`.
+    `encode_op_constraints` to apply and Stage 8 to write back as `spill_reason`.
   - `produced_at = uses[0]` for op outputs (today's filter: has `uses`, not
     `first_use_is_read`, not a copy), `None` for graph inputs; then `add_successor`
     over those nodes in `produced_at` order, with `graph.first` the earliest.
@@ -998,7 +1042,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   |---|---|
   | `name`, `size`, `first_use_is_read`, `boundary` | node fields |
   | `uses`, `lifetime_*_override` | `start_time` / `end_time` / `read_count`; `uses[0]` → `produced_at` |
-  | `residency_reason` (or the capacity check) | `residency_reason` = `excluded(buffer)`, applied by `apply_op_constraints` |
+  | `residency_reason` (or the capacity check) | `residency_reason` = `excluded(buffer)`, applied by `encode_op_constraints` |
   | `core_divisions` (with each `.tiling`) | the table strategy's candidates (division and tiling shared) |
   | `parents` | READ edges |
   | `cd_parent_matches`, `cd_parent_relayouts` | the table strategy's view and relayout tables per READ edge |
@@ -1027,8 +1071,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 
 ### Stage 4. Tiling groups on execution edges
 
-- One per-edge function owns an execution edge's coarse-tiling encoding (it moves
-  into `Strategy.apply_coarse_tiling` in Stage 6): `same_nest`
+- One per-edge function owns an execution edge's coarse-tiling encoding (it becomes
+  `Strategy.encode_nest` in Stage 6): `same_nest`
   and `joined` (today's `samenest_*` / `joined_*`) and the group step
   (`group[after] = group[before] + 1 - joined`). A non-joinable edge starts a new
   segment with group 0. `same_nest` keeps today's `loop_id` encoding, `tile_group_*`
@@ -1036,8 +1080,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   a menu (copies included, last), in today's order.
 - `_tiling_group_ids` becomes a walk along the execution chain from `graph.first`,
   starting a new segment at the first op and wherever an edge is not `joinable`; the
-  segments are local to the coarse-tiling encoding (in `Strategy.apply_coarse_tiling`
-  from Stage 6), not a graph method. Its `uses[0]` logic and `RelayoutCopyBuffer` check
+  segments are local to the coarse-tiling encoding (`Strategy.tiling_segments` from
+  Stage 6), not a graph method. Its `uses[0]` logic and `RelayoutCopyBuffer` check
   go away.
 - `_cut_literals`: for each tiled node, consumers on its READ edges in the same segment
   get an `apart` literal gated on the edge's view relation; a consumer outside the
@@ -1045,11 +1089,13 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   nodes.
 - Proto diff empty (coarse-tiling corpus with `auto_coarse_tiling` on).
 
-### Stage 5. `Strategy.apply_core_division`: the strategy makes node vars
+### Stage 5. `Strategy.encode_node`: the strategy makes node vars
 
-- Gives the Stage 1 `Strategy` its first method, the default strategy's
-  `apply_core_division(graph, model)`. It makes and keeps a `NodeVars` per node, then
-  per layout in copy order, in today's emission order (*Finalization order*, step 1):
+- Gives the Stage 1 `Strategy` its first methods: `prepare(graph)` (reset and build
+  the enumerations) and the default strategy's `encode_node(node, model)` /
+  `encode_layout(layout, model)`, which `_finalize` calls per node, then per copy in
+  copy order. Each makes and keeps a `NodeVars` in today's emission order
+  (*Finalization order*, step 1):
   `in_buffer`, `offset`, merge literals, `division`, `eff_size`, `core_cost`, `cores`,
   split and tile-count vars. It dispatches on the node's division enumeration,
   replacing the variable-making half of both wrappers: `Table` posts today's index var,
@@ -1067,25 +1113,25 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 
 ### Stage 6. The rest of the strategy; delete the wrappers
 
-- The default strategy gains the remaining steps, with the table encodings of the
+- The default strategy gains the remaining methods, with the table encodings of the
   three relations (today's `_gate_divisions` for views, the served literals for
   relayouts, the Stage 4 `same_nest` literal for nests):
-  - `apply_inplace(graph)`: every merge row (per IN_PLACE input, using the step-1
-    merge literal: offset equality, both-resident implications, then `eff_size`
-    equality and the view gate when the child chooses a division), then the
+  - `encode_merge(edge)` per IN_PLACE edge (using the step-1 merge literal: offset
+    equality, both-resident implications, then `eff_size` equality and the view gate
+    when the child chooses a work split), and `limit_merges(node, incoming)` for the
     at-most-ones.
-  - `apply_placement(graph)`: capacity for nodes and layouts, then the 2-D no-overlap
-    with tick shortening.
-  - `apply_op_constraints(graph)`: the exclusion pins, in today's position.
-  - `apply_reads(graph)`: per READ output, served literals and "match or served"; the
-    strategy keeps the served literals by edge and tallies them per layout.
-  - `apply_relayout(graph)`: today's `_constrain_relayout_copies`, per layout in copy
-    order (*Finalization order*, step 6).
-  - `apply_coarse_tiling(graph)`: takes over the Stage 4 function, cuts and tile
-    counts.
-  - `apply_cloning(graph)`: a no-op in Phase 1.
-- `SpyreOptimizationGraph._finalize(model, strategy)` runs them in the order under
-  *The model*.
+  - `encode_capacity(node | copy)`, and `encode_no_overlap(graph)` with tick
+    shortening.
+  - `encode_op_constraints(node | copy)`: the exclusion pins, in today's position.
+  - `encode_read(edge)` per READ edge: served literals and "match or served"; the
+    strategy keeps the served literals by edge and tallies them per copy.
+  - `encode_relayout(copy)`: today's `_constrain_relayout_copies` for one copy
+    (*Finalization order*, step 6).
+  - `encode_tiling_vars(node | copy)`, `encode_nest(execution edge)` (the Stage 4
+    function), `tiling_segments(graph)`, `encode_cuts(node)`, `encode_tile_counts(node)`.
+  - `encode_clone(node)`: a no-op in Phase 1.
+- `SpyreOptimizationGraph._finalize(model, strategy)` walks the graph and calls them
+  in the order under *Finalization order*.
 - `free_copies` (presolve threshold) keeps today's rule: every relayout layout whose
   node chooses a division.
 - The wrappers' other readers move onto `NodeVars` and the layouts' vars:
@@ -1423,7 +1469,7 @@ constraints over small per-buffer domains, never per-pair tables.
   strategy's `DerivedView` encodes views from it wherever an end is not a `Table`. Loop
   carries are the conjunction of the read and update relations.
 
-  **Input clones** (`apply_cloning`). Today `_clone_divisions_and_matches`
+  **Input clones** (`encode_clone`). Today `_clone_divisions_and_matches`
   (`allocator.py`) builds a clone's menu as the distinct non-broadcast read views of
   its consumers, each projected onto the symbols the read indexes, and each consumer's
   table as "my read view equals that clone view". A clone has no write view of its
@@ -1439,7 +1485,7 @@ constraints over small per-buffer domains, never per-pair tables.
     the input lacks would read stale scratchpad on the cores without a copy, and today
     such a view is skipped.
   - A consumer with no `MemoryDep` read of the input or no `MemoryDep` write is an op
-    constraint (`apply_op_constraints`): it keeps the clone out of LX, as today's empty
+    constraint (`encode_op_constraints`): it keeps the clone out of LX, as today's empty
     table does.
   - Today's table reads only each consumer's first `MemoryDep` read of the input;
     conjoining every read is a behaviour change the agreement test reports. Not probed:
@@ -1577,7 +1623,7 @@ constraints over small per-buffer domains, never per-pair tables.
     greedy fallback after a `SolveError` is the greedy graph solver.
   - **Ground truth.** `BruteForce` on tiny models: the default strategy's encodings,
     then each Phase 2 relation (`Table` vs `Lazy`, the relayout closed form inside a
-    model, `apply_op_constraints`), as an oracle independent of CP-SAT next to Phase
+    model, `encode_op_constraints`), as an oracle independent of CP-SAT next to Phase
     2's agreement tests, and each backend adapter. `CpSat` must match it there, and is
     then the ground truth on real models. `Annealing`, `Mip` and `Decomposed` are
     measured against `CpSat`.
@@ -1614,7 +1660,7 @@ constraints over small per-buffer domains, never per-pair tables.
   straight from the torch IR (once per op): its fields from the op's layout and its
   place in `graph.operations`, the op's `OpSplitSpace` as `space` (what `Lazy` generates
   from), each read's index map on its edges, and the residency reasons that
-  `apply_op_constraints` reads from the op. Where an axis stays `Table`, the op's menu
+  `encode_op_constraints` reads from the op. Where an axis stays `Table`, the op's menu
   comes from the table strategy's own generation (Stage 9), not from the node. It also
   adds a node with `produced_at = None` for each graph input the op reads (an
   `InputBuffer` or constant is not an `Operation`). What it builds depends on the
