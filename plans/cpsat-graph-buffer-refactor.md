@@ -57,10 +57,11 @@ Goal: model the solve as a graph.
 
 Three phases, each stage its own PR that leaves the full suite green:
 
-- **Phase 1 — re-representation (CP-SAT internals).** The graph carries the
-  allocator's final data and every relation uses its *table* encoding, which is
-  today's model. Each stage except Stage 7 is proven by an identical CP model (see
-  *Verification*).
+- **Phase 1 — re-representation, and candidate generation into the strategy (CP-SAT
+  internals).** The graph carries the allocator's incoming data, and the default
+  strategy encodes today's model by direct enumeration over today's menus and pair
+  tables. Stage 9 then moves the allocator's candidate derivations into that strategy.
+  Each stage except Stage 7 is proven by an identical CP model (see *Verification*).
   The allocator's three classes stay the external contract.
 - **Phase 2 — constraint encodings (CP-SAT internals).** Each axis gains a `Lazy`
   enumeration and each relation a constraint encoding over per-axis split / per-level tile
@@ -227,19 +228,23 @@ sequenceDiagram
    vars and element ties, `loop_id`) and, until 2a, `cpsat_expr_printer`, nothing reads
    menu indices; decisions are `WorkSplit`s. Relations are enforced only by the
    strategy's encoding; there is no public query API over them.
-2. **Phase 1 derives nothing the allocator decided.** Match tables (including the
-   loop-carry intersection and input-clone overrides, `allocator.py:4160-4240`),
-   capped relayouts and the copies built from them, read counts (`read_count`:
-   `len(uses)` less the producing write, `plan_solver.py:155`; extern and
-   placement-only readers included), lifetimes and their overrides, and exclusions
-   (`MemoryPlanSolver.excluded(buffer)`: the allocator's `residency_reason`, else the
-   capacity check) all come in as data. Candidate data (menus, match tables, priced
-   copies) is the table strategy's implementation detail, never on a node or edge:
-   through Stage 8 the table strategy takes the allocator's final candidates as given;
-   Stage 9 moves their derivation into the strategy, which then generates them from
-   the graph's incoming data. From then the allocator only dispatches the solve and
-   applies the solved graph. Moving any other derivation out of the allocator is
-   Phase 2/3 work with its own agreement test.
+2. **Allocator scope moves into the strategy in steps, each proven equal.** Phase 1
+   takes over part of the allocator's work, but never silently re-derives it:
+   - **Incoming data stays the allocator's, as given:** read counts (`read_count`:
+     `len(uses)` less the producing write, `plan_solver.py:155`; extern and
+     placement-only readers included), lifetimes and their overrides, and exclusions
+     (`MemoryPlanSolver.excluded(buffer)`: the allocator's `residency_reason`, else the
+     capacity check) land on nodes and edges.
+   - **Candidate derivation moves into the table strategy:** menus, match tables
+     (including the loop-carry intersection and input-clone overrides,
+     `allocator.py:4160-4240`), capped relayouts and the copies built from them, and
+     the pricing behind them. Through Stage 8 the table strategy takes the allocator's
+     final candidates as given; Stage 9 moves their derivation into it, checked by
+     agreement with the allocator's output and an identical proto. From then the
+     allocator only dispatches the solve and applies the solved graph.
+   - Moving anything else out of the allocator (residency reasons, lifetimes, the
+     derivations Phase 2 replaces with constraints) is later work, each move with its
+     own agreement test.
 3. **`None` means an open decision.** A node has three decisions: `work_split` (core
    division and tiling), `resident` and `offset`. Each is open (`None`; the solver
    decides) or set. A set `work_split` becomes a `Fixed` enumeration; a set `resident`
