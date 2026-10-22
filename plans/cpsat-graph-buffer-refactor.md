@@ -232,8 +232,7 @@ classDiagram
     direction LR
     class x["x = arg0_1 : ResourceNode"]
     x : produced_at = None, input
-    x : work_split = 16 x 2, 32 cores
-    x : resident = False
+    x : resident = False, not cloned
     class buf0["buf0 = x @ u : ResourceNode"]
     buf0 : produced_at = 0
     buf0 : work_split = 4 x 8, 32 cores
@@ -277,8 +276,9 @@ classDiagram
     T1 ..> buf4 : e6 reads through
 ```
 
-- **Nodes** are the six buffers: the graph input `x` (`produced_at = None`, spilled) and
-  five op outputs, each with its decisions. The weights are not in this solve.
+- **Nodes** are the six buffers: the graph input `x` (`produced_at = None`) and five op
+  outputs, each with its decisions. An input has a core division only when it is cloned
+  into LX; `x` stays in HBM, so it has none. The weights are not in this solve.
 - **Dependency edges** are one per pair, showing only what the solve decided: no read
   reuses its producer's storage (`in_place = False` on every edge), so each buffer has
   its own offset.
