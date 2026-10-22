@@ -166,7 +166,8 @@ classDiagram
         IntVar(lb, ub, name) Var
         BoolVar(name) Var
         Add(row) Constraint
-        AddElement / AddNoOverlap2D / ...
+        AddElement(index, values, target) Constraint
+        AddNoOverlap2D(x, y) Constraint
         Minimize(expr)
         Solve() SolveStatus
     }
