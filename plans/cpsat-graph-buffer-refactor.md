@@ -137,7 +137,8 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    the `Strategy` does. For each node and each enumerated axis (the work split: core
    division and coarse tiling, one axis until 2b; from 2d, relayout choice per READ
    edge) it holds an `Enumeration`, data plus `holds(value)` (a query, no model), built
-   from the node's fields (and, for a `Table`, its table source), and it realizes that
+   from the node's fields (and, for a `Table`, the candidates it generates), and it
+   realizes that
    enumeration in the model:
    - `Fixed(value)` — known before the solve; posts constants. `Fixed(COMMITTED)` is a
      placement-only buffer: committed upstream by work division, posts nothing.
