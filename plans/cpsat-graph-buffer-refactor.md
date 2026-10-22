@@ -1875,9 +1875,22 @@ constraints over small per-buffer domains, never per-pair tables.
 Both are transforms on a dependency edge (`TransformKind.TRANSPOSE`, `RESTICKIFY`),
 decided by the solve and encoded by a strategy like the relayouts edges already define:
 one shared `Transform` per (producer, target layout), read by every edge that needs it,
-with its lifetime bounded as under *Lifetimes*. Neither
-changes the graph types: the ops' index maps (`node.op`) already say how each side reads
-and writes.
+with its lifetime bounded as under *Lifetimes*. The ops' index maps (`node.op`) already
+say how each side reads and writes.
+
+Both bring **cascading transforms** (producer → restickify → transpose → reader), which
+today's code never produces: a relayout reads only an op's output
+(`_cd_parent_relayouts` takes sources from `op_by_name`) and never a tiled one, and a
+restickify is an upstream op, so its node → relayout → reader is a single transform. A
+cascade needs:
+- `Transform.source` = the producer or another transform (a shared `Resource` base
+  for nodes and transforms), unique per (source, kind, target), so a producer's
+  transforms form a tree and readers share common prefixes; the edge points at the leaf;
+- presence chained (`present(t2) ⇒ present(t1)`), each step with its own residency;
+- lifetimes chained: a step starts once its source is complete, its source stays live
+  until it runs (`t1.end > t2.start`), and a downstream step counts as a reader;
+- the strategy generating only valid sequences (restickify before transpose) and
+  pricing each step.
 
 - **Dim-order conversions (transposes) for memory locality.** A consumer whose loop
   order walks a buffer across its contiguous dimension reads with poor locality
