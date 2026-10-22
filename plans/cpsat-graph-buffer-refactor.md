@@ -31,7 +31,7 @@ Goal: model the solve as a graph.
   relayout is not a node: it is a second layout of the producer's output, live from the
   first read it serves to the last, and realizing the plan inserts the copy. A node
   holds the incoming data about its op (size, lifetime, read count, the op's split
-  space, …) and its decisions (`assignment`, `resident`, `offset`), each fixed ahead of
+  space, …) and its decisions (`work_split`, `resident`, `offset`), each fixed ahead of
   time or `None` for the solver to find. It holds no menu.
 - **`DependencyEdge`** — every data dependency between two nodes (reads, in-place
   reuse; in Phase 1 only between nodes that both choose a division, as today). It
@@ -85,7 +85,7 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    model), constraints over per-axis vars otherwise (Phase 2). Nests keep today's
    per-node `loop_id` until 2b. Outside the strategy's own encodings (`Table` index
    vars and element ties, `loop_id`) and, until 2a, `cpsat_expr_printer`, nothing reads
-   menu indices; queries take `Assignment`s.
+   menu indices; queries take `WorkSplit`s.
 2. **Phase 1 derives nothing the allocator decided.** Match tables (including the
    loop-carry intersection and input-clone overrides, `allocator.py:4160-4240`),
    capped relayouts and the copies built from them, read counts (`read_count`:
@@ -99,15 +99,15 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    the graph's incoming data. From then the allocator only dispatches the solve and
    applies the solved graph. Moving any other derivation out of the allocator is
    Phase 2/3 work with its own agreement test.
-3. **`None` means an open decision.** A node has three decisions: `assignment` (core
+3. **`None` means an open decision.** A node has three decisions: `work_split` (core
    division and tiling), `resident` and `offset`. Each is open (`None`; the solver
    decides) or set, and the factory realizes a set decision as a `Fixed` enumeration.
    Decisions are set or pinned in three places:
    - **At construction, by `add_node`:** a node whose division was committed upstream
      by work division (in Phase 1, a buffer with no `core_divisions`) gets
-     `assignment = Assignment.COMMITTED`, which becomes `Fixed(COMMITTED)` and posts
+     `work_split = WorkSplit.COMMITTED`, which becomes `Fixed(COMMITTED)` and posts
      nothing.
-   - **By the caller** (Stage 8): pinned `assignment`, `resident` or `offset`.
+   - **By the caller** (Stage 8): pinned `work_split`, `resident` or `offset`.
    - **At finalization, by the strategy's op constraints.**
      `strategy.apply_op_constraints(graph, model)` applies, per node, the restrictions
      for the node's kind of op (its `residency_reason`: an op not allowed in LX, a
@@ -236,23 +236,24 @@ Model: TypeAlias = "cp_model.CpModel | Backend"  # what the strategy posts to:
 
 # ---- a decided division ----------------------------------------------------
 @dataclass(frozen=True)
-class Assignment:
-    """A decided core division of one op: the split factor of each loop symbol
-    and the coarse tiling. It is the value of a node's division axis, whatever
-    enumeration produced it, so relation queries and the plan speak in
-    Assignments, never in menu indices. `COMMITTED` stands for a division fixed
-    upstream by work division, whose splits the solve does not see."""
+class WorkSplit:
+    """How one op's work is split: across cores (the core division, a split
+    factor per loop symbol) and into coarse tiles (the tiling). It is the
+    selected value of a node's division axis, whatever enumeration produced
+    it, so relation queries and decisions speak in WorkSplits, never in menu
+    indices. `COMMITTED` stands for a split fixed upstream by work division,
+    which the solve does not see."""
     splits: tuple[tuple[SplitKey, int], ...] # split symbol -> factor
     tiling: Optional[TileSpec]               # None only for COMMITTED
     committed: bool = False                  # fixed upstream by work division; its
                                              # splits are not visible to the solve
-    COMMITTED: ClassVar[Assignment]
+    COMMITTED: ClassVar[WorkSplit]
 
     @staticmethod
-    def of(cd: CoreDivision) -> Assignment:
-        return Assignment(tuple(sorted(cd.splits.items(), key=str)), cd.tiling)
+    def of(cd: CoreDivision) -> WorkSplit:
+        return WorkSplit(tuple(sorted(cd.splits.items(), key=str)), cd.tiling)
 
-Assignment.COMMITTED = Assignment(splits=(), tiling=None, committed=True)
+WorkSplit.COMMITTED = WorkSplit(splits=(), tiling=None, committed=True)
 
 # =============================================================================
 # The graph: incoming data only. No menus, pair tables or candidate copies.
@@ -319,7 +320,8 @@ class ResourceNode:
     residency_reason: Optional[str] = None   # Phase 1: excluded(buffer); Phase 3: from
                                              # the op; applied by apply_op_constraints
     # decisions: set before the solve to pin, None = open; solve() fills the rest
-    assignment: Optional[Assignment] = None  # COMMITTED when division is fixed upstream
+    work_split: Optional[WorkSplit] = None   # core division + coarse tiling;
+                                             # COMMITTED when fixed upstream
     resident: Optional[bool] = None
     offset: Optional[int] = None             # alignment units; only when resident
     spill_reason: Optional[str] = None       # set by solve() when not resident: the
@@ -334,8 +336,8 @@ class ResourceNode:
     outputs: list[DependencyEdge] = field(default_factory=list)
 
     @property
-    def tiling(self) -> Optional[TileSpec]:  # once assignment is set; None for
-        return self.assignment.tiling if self.assignment else None  # COMMITTED
+    def tiling(self) -> Optional[TileSpec]:  # once work_split is set; None
+        return self.work_split.tiling if self.work_split else None  # if COMMITTED
 
     @property
     def sym_is_lx(self) -> sympy.Symbol:
@@ -458,8 +460,8 @@ class Enumeration(ABC, Generic[T]):
 @dataclass(frozen=True)
 class Fixed(Enumeration[T]):
     """The value is known before the solve; the strategy posts constants.
-    `Fixed(Assignment.COMMITTED)` posts nothing (a placement-only node)."""
-    value: T                                 # Fixed(Assignment.COMMITTED) posts nothing
+    `Fixed(WorkSplit.COMMITTED)` posts nothing (a placement-only node)."""
+    value: T                                 # Fixed(WorkSplit.COMMITTED) posts nothing
     def holds(self, value: T) -> bool:
         return value == self.value
 
@@ -470,28 +472,28 @@ class Open(Enumeration[T]):
         return True
 
 @dataclass(frozen=True)
-class Table(Enumeration[Assignment]):
+class Table(Enumeration[WorkSplit]):
     """An explicit list of candidate divisions (today's menu): the strategy posts
     an index var and element ties. The strategy generates the candidates from
     the node's `space` and keeps them, with any tables over them, as its own
     implementation detail. Division and tiling share one `Table` until 2b."""
-    def holds(self, value: Assignment) -> bool: ...  # one of the candidates
+    def holds(self, value: WorkSplit) -> bool: ...  # one of the candidates
 
 @dataclass(frozen=True)
-class Lazy(Enumeration[Assignment]):
+class Lazy(Enumeration[WorkSplit]):
     """Phase 2: no candidates. The strategy posts per-axis split vars over the
     op's split space and states legality as constraints."""
     space: OpSplitSpace                      # the node's space
-    def holds(self, value: Assignment) -> bool: ...  # the space admits it
+    def holds(self, value: WorkSplit) -> bool: ...  # the space admits it
 
 @dataclass(frozen=True)
-class Pruned(Enumeration[Assignment]):
+class Pruned(Enumeration[WorkSplit]):
     """Phase 2: generate from the space, keep a shortlist, and realize it as a
     `Table` (today's relayout capping is one). How it ranks and stores the
     shortlist is the strategy's."""
-    def holds(self, value: Assignment) -> bool: ...  # in the shortlist
+    def holds(self, value: WorkSplit) -> bool: ...  # in the shortlist
 
-def tileable(e: Enumeration[Assignment]) -> bool:
+def tileable(e: Enumeration[WorkSplit]) -> bool:
     """Some value the division axis allows is tiled (Fixed: its tiling; Table: a
     candidate's; Lazy / Pruned: the space's)."""
 
@@ -500,7 +502,7 @@ class Enumerations:
     """One node's enumeration per decision axis, held by the strategy. The division
     axis carries tiling while it is a `Table`; 2d adds a relayout axis per
     READ edge."""
-    division: Enumeration[Assignment]        # carries tiling while it is a Table
+    division: Enumeration[WorkSplit]        # carries tiling while it is a Table
     residency: Enumeration[bool]             # Open (apply_op_constraints may pin it)
     offset: Enumeration[int]                 # Open
                                              # 2d adds a relayout axis per READ edge
@@ -512,7 +514,7 @@ class ViewRelation(ABC):
     view gate. When both ends are `Table` it is today's pair table over the
     candidates, internal to the strategy; otherwise a `DerivedView`."""
     @abstractmethod
-    def holds(self, src: Assignment, dst: Assignment) -> bool: ...
+    def holds(self, src: WorkSplit, dst: WorkSplit) -> bool: ...
 
 @dataclass(frozen=True)
 class DerivedView(ViewRelation):
@@ -520,7 +522,7 @@ class DerivedView(ViewRelation):
     per-axis splits through the edge's read index maps. Used when an end is not
     a `Table`."""
     reads: tuple[ResidencyEdge, ...]         # the edge's read index maps
-    def holds(self, src: Assignment, dst: Assignment) -> bool: ...
+    def holds(self, src: WorkSplit, dst: WorkSplit) -> bool: ...
 
 class RelayoutRelation(ABC):
     """Which candidate copies can bridge a view mismatch on a READ edge, under
@@ -529,7 +531,7 @@ class RelayoutRelation(ABC):
     copy are its internal data."""
     @abstractmethod
     def bridges(
-        self, src: Assignment, dst: Assignment) -> tuple[RelayoutLayout, ...]: ...
+        self, src: WorkSplit, dst: WorkSplit) -> tuple[RelayoutLayout, ...]: ...
 
 @dataclass(frozen=True)
 class NestRelation:
@@ -537,7 +539,7 @@ class NestRelation:
     share a tiling group. No data in Phase 1, where the encoding keeps today's
     `loop_id`; 2b encodes it on per-level tile vars."""
 
-    def joins(self, before: Assignment, after: Assignment) -> bool:
+    def joins(self, before: WorkSplit, after: WorkSplit) -> bool:
         lb = before.tiling.level_counts if before.tiling else ()
         la = after.tiling.level_counts if after.tiling else ()
         return lb == la != ()
@@ -932,7 +934,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - Rename the draft (`CoreDivisionBoundBuffer` → `ResourceNode`, `BufferGraph` →
   `SpyreOptimizationGraph`, `build_buffer_graph` → `build_graph`) and reshape it into
   the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
-- Implement the data types and queries of *The model*: aliases, `Assignment`, the
+- Implement the data types and queries of *The model*: aliases, `WorkSplit`, the
   relations, the edges, `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph,
   plus the `Enumeration` kinds Phase 1 uses (`Fixed`, `Table`, `Open`),
   `Enumerations`, and `Strategy` and `EnumerationFactory` without solver methods.
@@ -961,7 +963,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   `SpyreOptimizationGraph`. It calls `add_node(buffer)` for each allocator buffer
   except copies, in the allocator's order, then adds the edges through `add_child`.
   `add_node` fills the node's incoming data; a buffer without `core_divisions` gets
-  `assignment = Assignment.COMMITTED`. No candidate data goes on a node or edge.
+  `work_split = WorkSplit.COMMITTED`. No candidate data goes on a node or edge.
   `settings` is the interim `SolveSettings` (Stage 8). The final data copied:
   - READ edges only between nodes that both choose a division, i.e. neither is
     `COMMITTED` (today's no-op `constrain_residency` on placement-only wrappers).
@@ -1013,7 +1015,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   | `op_position` | replaced by `produced_at` and execution edges |
   | `paired_with`, `lx_view`, `lx_relayout_plans` | not read by CP-SAT; Phase 3b |
 
-  A `LifetimeBoundBuffer` maps the same way with no menu, `assignment = COMMITTED` and
+  A `LifetimeBoundBuffer` maps the same way with no menu, `work_split = COMMITTED` and
   `boundary = Input if first_use_is_read else Intermediate`.
 
 ### Stage 3. Solver reads relationships from the graph
@@ -1109,7 +1111,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 
 - Parallelism, shape and tile-count terms come only from nodes whose division
   enumeration has more than one value (a `Table` of two or more; later `Lazy`), keyed on
-  the strategy, not on `assignment is None`. Layouts contribute none. A ladder stage
+  the strategy, not on `work_split is None`. Layouts contribute none. A ladder stage
   with only constant terms is skipped. A placement-only solve already runs only the
   residency stage (`ilp_solver_ortools.py:1077-1088`); what goes are the constant-term
   re-solves of joint solves whose division-carrying buffers all have one candidate,
@@ -1125,7 +1127,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   given the allocator's candidates):
   `_finalize(model, strategy)`, the objective ladder (with the fallback copy
   pin when `cost_expr` is `None` or fails to lower), extraction. It fills every open
-  decision: `assignment` (so the tiling), `resident`, `offset` when resident,
+  decision: `work_split` (so the tiling), `resident`, `offset` when resident,
   `spill_reason` when not, the resident copies on `relayouts`, and `chosen` on READ
   edges (`None`: read directly). It returns the op-output nodes along the execution
   chain; that list is the execution plan.
@@ -1219,7 +1221,7 @@ Each stage adds an enumeration or encoding, selectable through the
 `EnumerationFactory` from settings declared in `torch_spyre/_inductor/config.py` (so
 they enter the FX graph cache key; default `Table`; names and any default flip belong
 to Phase 2's own plan), and an **agreement test** against the table encoding:
-- a relation: the same feasible (src, dst) assignments;
+- a relation: the same feasible (src, dst) work splits;
 - a node axis: the `Lazy` space equals the menu, per node and tiling. Same optimum
   alone does not certify legality: the probe's L2, a relaxation, matched every proven
   optimum;
