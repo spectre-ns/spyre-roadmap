@@ -269,9 +269,9 @@ classDiagram
 
     x --> buf0 : e1
     x --> buf1 : e2
-    buf1 --> buf2 : e3 in_place, merged = False
-    buf0 --> buf3 : e4 in_place, merged = False
-    buf2 --> buf3 : e5 in_place, merged = False
+    buf1 --> buf2 : e3
+    buf0 --> buf3 : e4
+    buf2 --> buf3 : e5
     buf3 --> buf4 : e6 transform = T1
     buf3 ..> T1 : producer
     T1 ..> buf4 : e6 reads through
@@ -279,9 +279,9 @@ classDiagram
 
 - **Nodes** are the six buffers: the graph input `x` (`produced_at = None`, spilled) and
   five op outputs, each with its decisions. The weights are not in this solve.
-- **Dependency edges** are one per pair. `e3`–`e5` are in-place candidates (`in_place =
-  True`: `silu` over `x @ g`, the product over either operand); the solver took none
-  (`merged = False`), so each buffer has its own offset.
+- **Dependency edges** are one per pair, showing only what the solve decided: no read
+  reuses its producer's storage (`in_place = False` on every edge), so each buffer has
+  its own offset.
 - **A transform** sits on `e6`: `buf3` is sliced 4 × 8 across the cores, but the second
   matmul reads it split only along d1, into 4 parts replicated on all 32 cores. `e6`
   points at `T1`, a relayout copy of `buf3` resident at offset 0 (free again once `buf0`
