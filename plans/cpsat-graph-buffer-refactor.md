@@ -136,6 +136,7 @@ classDiagram
         src: ResourceNode
         dst: ResourceNode
         in_place: bool
+        merged: bool
         transform: Transform
     }
     class ExecutionEdge {
@@ -268,9 +269,9 @@ classDiagram
 
     x --> buf0 : e1
     x --> buf1 : e2
-    buf1 --> buf2 : e3 in_place
-    buf0 --> buf3 : e4 in_place
-    buf2 --> buf3 : e5 in_place
+    buf1 --> buf2 : e3 in_place, merged = False
+    buf0 --> buf3 : e4 in_place, merged = False
+    buf2 --> buf3 : e5 in_place, merged = False
     buf3 --> buf4 : e6 transform = T1
     buf3 ..> T1 : producer
     T1 ..> buf4 : e6 reads through
@@ -278,9 +279,9 @@ classDiagram
 
 - **Nodes** are the six buffers: the graph input `x` (`produced_at = None`, spilled) and
   five op outputs, each with its decisions. The weights are not in this solve.
-- **Dependency edges** are one per pair. `e3`–`e5` are in-place candidates (`silu` over
-  `x @ g`, the product over either operand); the solver took none of the merges, so each
-  buffer has its own offset.
+- **Dependency edges** are one per pair. `e3`–`e5` are in-place candidates (`in_place =
+  True`: `silu` over `x @ g`, the product over either operand); the solver took none
+  (`merged = False`), so each buffer has its own offset.
 - **A transform** sits on `e6`: `buf3` is sliced 4 × 8 across the cores, but the second
   matmul reads it split only along d1, into 4 parts replicated on all 32 cores. `e6`
   points at `T1`, a relayout copy of `buf3` resident at offset 0 (free again once `buf0`
@@ -488,9 +489,12 @@ class DependencyEdge:
     `Transform` when they need the same conversion of the same producer."""
     src: ResourceNode
     dst: ResourceNode
-    in_place: bool = False                   # dst may reuse src's storage
-    transform: Optional[Transform] = None    # set before the solve to require one,
-                                             # else by solve(); None = reads src
+    in_place: bool = False                   # dst may reuse src's storage (data)
+    # decisions (None = open; set before the solve to pin, else filled by solve())
+    merged: Optional[bool] = None            # in-place only: dst took over src's
+                                             # storage (same offset, one unit)
+    transform: Optional[Transform] = None    # the transform this read goes through;
+                                             # None = reads src
 
 @dataclass(eq=False)
 class ExecutionEdge:
@@ -1368,7 +1372,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   allocator's candidates): `_finalize(model, strategy)`, the objective ladder (with the
   fallback copy pin when `cost_expr` is `None` or fails to lower), extraction. It fills
   every open decision: `work_split` (so the tiling), `resident`, `offset` when resident,
-  `spill_reason` when not, `transform` on edges
+  `spill_reason` when not, `merged` and `transform` on edges
   (`None`: read directly), and each chosen transform's `resident` / `offset`. It returns
   the op-output nodes along the execution chain;
   that list is the execution plan.
