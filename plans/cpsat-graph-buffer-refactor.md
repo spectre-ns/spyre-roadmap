@@ -25,11 +25,13 @@ is `[start_time, end_time)`.
 
 Goal: model the solve as a graph.
 
-- **`ResourceNode`** — the main object of the graph: everything else (edges, relayout
-  layouts, decisions) is reached from a node, and the graph hands out nodes
-  (`get_nodes()`). A node is every resource an op needs: op outputs and graph inputs. A
-  relayout is not a node: it is a second layout of the producer's output, live from the
-  first read it serves to the last, and realizing the plan inserts the copy. A node
+- **`ResourceNode`** — the main object of the graph: everything else (edges, the
+  transforms of its output, decisions) is reached from a node, and the graph hands out
+  nodes (`get_nodes()`). A node is every resource an op needs: op outputs and graph
+  inputs. A transform (a relayout today) is not a node: an edge defines it between two
+  ops, as a converted copy of the producer's output that every edge needing the same
+  conversion shares, live from the slot it runs in to the last read through it;
+  realizing the plan inserts its op. A node
   holds the incoming data about its op (size, lifetime, read count, the op's split
   space, …) and its decisions (`work_split`, `resident`, `offset`), each fixed ahead of
   time or `None` for the solver to find. It holds no menu.
@@ -126,7 +128,7 @@ classDiagram
         resident: bool
         offset: int
         spill_reason: str
-        relayouts: list~ResidentLayout~
+        transforms: list~PlacedTransform~
         add_child(child, in_place) DependencyEdge
         add_successor(after) ExecutionEdge
     }
@@ -134,7 +136,7 @@ classDiagram
         src: ResourceNode
         dst: ResourceNode
         in_place: bool
-        chosen: RelayoutLayout
+        transform: Transform
     }
     class ExecutionEdge {
         before: ResourceNode
@@ -147,7 +149,7 @@ classDiagram
     }
     class EncodingStrategy {
         <<one per configuration>>
-        layouts: tuple~RelayoutLayout~
+        transforms: tuple~Transform~
         vars: dict~NodeVars~
         prepare(graph)
         encode_node(node, model)
@@ -159,6 +161,7 @@ classDiagram
     }
     class NodeVars {
         in_buffer, offset, eff_size
+        start, end
         splits, tile_counts, merges
         division_is(i)
     }
@@ -409,12 +412,16 @@ class DependencyEdge:
     in-place child always reads its parent). At most one edge joins a pair. The
     same object sits in `src.outputs` and `dst.inputs` and nowhere else. It
     carries no candidate data: whether the two ends' views agree is the
-    strategy's relation for this edge, derived from the two nodes' ops."""
+    strategy's relation for this edge, derived from the two nodes' ops. An
+    edge can define a transform between the two ops (a relayout, a cut's
+    copy-out; later a transpose or restickify): the read goes through a
+    converted copy of `src` instead of `src` itself. Several edges share one
+    `Transform` when they need the same conversion of the same producer."""
     src: ResourceNode
     dst: ResourceNode
     in_place: bool = False                   # dst may reuse src's storage
-    chosen: Optional[RelayoutLayout] = None  # set by solve(): the copy this read
-                                             # goes through; None = directly
+    transform: Optional[Transform] = None    # set before the solve to require one,
+                                             # else by solve(); None = reads src
 
 @dataclass(eq=False)
 class ExecutionEdge:
@@ -463,9 +470,9 @@ class ResourceNode:
     offset: Optional[int] = None             # alignment units; only when resident
     spill_reason: Optional[str] = None       # set by solve() when not resident: the
                                              # residency_reason or _SOLVER_CHOSE_SPILL
-    relayouts: list[ResidentLayout] = field(default_factory=list)
-                                             # set by solve(): copies of this output
-                                             # to insert
+    transforms: list[PlacedTransform] = field(default_factory=list)
+                                             # set by solve(): the transforms of
+                                             # this output to insert
     # structure
     prev: Optional[ExecutionEdge] = None     # set by add_successor; None for a graph
     next: Optional[ExecutionEdge] = None     # input and at the chain ends
@@ -492,7 +499,7 @@ class ResourceNode:
         """The only way to add an execution edge: sets self.next and after.prev,
         derives contiguous; refuses a node that already has that neighbour."""
 
-def spill_cost(node: ResourceNode | RelayoutLayout, size: Optional[int] = None) -> int:
+def spill_cost(node: ResourceNode | Transform, size: Optional[int] = None) -> int:
     """HBM traffic a spill adds over residency (the draft's rule): the reads
     residency would serve, plus the producer's write for an intermediate."""
 
@@ -542,7 +549,7 @@ class SpyreOptimizationGraph:
         strategy: Optional[EncodingStrategy] = None,  # None: EnumerationFactory()
     ) -> list[ResourceNode]:                     # .strategy(), today's model
         """_finalize, the objective ladder, extraction. Fills every open decision
-        on the nodes and `chosen` on edges, and returns the op outputs in
+        on the nodes and `transform` on edges, and returns the op outputs in
         execution order: the execution plan. Raises SolveError as _run does,
         writing nothing."""
 
@@ -556,11 +563,12 @@ def build_graph(
 ) -> SpyreOptimizationGraph: ...             # Stage 2
 
 @dataclass(frozen=True)
-class ResidentLayout:
-    """A relayout copy `solve()` made resident: which candidate copy, and its LX
-    offset. Realizing the plan inserts its copy op."""
-    layout: RelayoutLayout
-    offset: int                              # alignment units
+class PlacedTransform:
+    """A transform `solve()` chose: which one, and where its copy lives (an LX
+    offset, or None when it lands in HBM, as a cut's copy-out does). Realizing
+    the plan inserts its op."""
+    transform: Transform
+    offset: Optional[int]                    # alignment units; None = HBM
 
 # =============================================================================
 # The model side: CP state and the strategy. How each axis is enumerated
@@ -568,22 +576,31 @@ class ResidentLayout:
 # edge's ends (views, relayouts, nests) live inside the strategy
 # implementations, not here.
 # =============================================================================
+class TransformKind(Enum):
+    RELAYOUT = auto()                        # another per-core view (LX to LX)
+    COPY_OUT = auto()                        # a cut tile's full buffer, to HBM (#5246)
+    TRANSPOSE = auto()                       # future: another dim order
+    RESTICKIFY = auto()                      # future: another stick dimension
+
 @dataclass(eq=False)
-class RelayoutLayout:
-    """A candidate relayout copy: the producer's output re-laid-out into another
-    per-core view, held as a second buffer in LX from the first read it serves
-    to the last (today's copy lifetime, `build_relayout_copy`). The strategy
-    generates the candidates (today's capped, priced relayout groups) and keeps
-    their pricing internally; `solve()` puts the ones it makes resident on the
-    producer's `relayouts`."""
+class Transform:
+    """A converted copy of the producer's output that one or more edges read
+    instead of the producer: one per (producer, kind, target), shared by every
+    edge that needs that conversion, priced once, and alive from the slot it
+    runs in to the last read through it. The strategy generates the candidates
+    (today's capped, priced relayout groups) and keeps their pricing
+    internally; an edge may also require one up front. `solve()` puts the
+    chosen ones on the producer's `transforms`. Phase 1 takes relayouts from
+    the allocator's `RelayoutCopyBuffer`s."""
+    kind: TransformKind
     producer: ResourceNode
     name: str                                # today's copy name (var names, is_lx_*)
-    group: int                               # destination view (today's group)
+    group: int                               # target view (today's relayout group)
     size: int                                # alignment units
     read_count: int
-    division: CoreDivision                   # the destination's one division
-    start_time: int                          # [first consumer tick, last + 1): inside
-    end_time: int                            # the producer's lifetime
+    division: Optional[CoreDivision]         # the target's one division (RELAYOUT)
+    start_time: int                          # today's fixed lifetime
+    end_time: int                            # [first reader tick, last + 1)
 
     @property
     def sym_is_lx(self) -> sympy.Symbol:
@@ -600,7 +617,7 @@ class PrinterView:
 
 @dataclass(eq=False)
 class NodeVars:
-    """The variables of one node or candidate copy, made by the strategy in
+    """The variables of one node or candidate transform, made by the strategy in
     today's order: residency literal, offset, footprint, merge literals, the
     per-axis split and tile-count vars, and for a `Table` the candidate index
     and its `division == i` literals. Backend-neutral: each field is whatever
@@ -611,6 +628,8 @@ class NodeVars:
     model: Model                             # what made the vars (for division_is)
     in_buffer: Var               # residency literal (in_buffer_<name>)
     offset: Var                  # off_<name>
+    start: Var                   # lifetime [start, end): the rectangle's
+    end: Var                     # time side; constants until #5246
     eff_size: Var | int          # per-core footprint; a constant when
                                              # the division is fixed
     merges: dict[str, Var] = field(default_factory=dict)
@@ -658,9 +677,9 @@ class EncodingStrategy:
     tiling: AxisSetting
     relayout: Literal["data", "pruned", "lazy"]
     # per-solve state, reset by prepare() and filled by the encode_* methods
-    layouts: tuple[RelayoutLayout, ...] = () # candidate copies, in copy order
-    vars: dict[ResourceNode | RelayoutLayout, NodeVars] = field(default_factory=dict)
-    served: dict[DependencyEdge, dict[RelayoutLayout, Var]] = field(
+    transforms: tuple[Transform, ...] = ()   # candidate transforms, in copy order
+    vars: dict[ResourceNode | Transform, NodeVars] = field(default_factory=dict)
+    served: dict[DependencyEdge, dict[Transform, Var]] = field(
         default_factory=dict)                # served literals, per edge
     provenance: list[Provenance] = field(default_factory=list)
                                              # one entry per call that posted
@@ -668,12 +687,14 @@ class EncodingStrategy:
     # ---- whole-graph hooks (the only methods that take the graph) ----
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
         """Reset the per-solve state, decide how each node's axes are enumerated,
-        and for table-based axes generate the candidates (menus, match tables, candidate
-        copies in copy order). Graph-wide because the pricing loop spans it."""
+        and for table-based axes generate the candidates (menus, match tables,
+        candidate transforms in copy order). Graph-wide because the pricing
+        loop spans it."""
     def encode_no_overlap(
         self, graph: SpyreOptimizationGraph, model: Model) -> None:
-        """The 2-D no-overlap over every node's and copy's rectangle, with the
-        incoming-merge tick shortening."""
+        """The 2-D no-overlap over every node's and LX transform's rectangle,
+        [start, end) by [offset, offset + eff_size), with the incoming-merge
+        tick shortening."""
     def tiling_segments(
         self, graph: SpyreOptimizationGraph) -> Mapping[ResourceNode, int]:
         """Walk the execution chain: a new segment at the first op and wherever an
@@ -683,8 +704,8 @@ class EncodingStrategy:
     def encode_node(self, node: ResourceNode, model: Model) -> None:
         """The node's vars: residency literal, offset, a merge literal per
         in-place input, then the work split's vars and element ties."""
-    def encode_layout(self, layout: RelayoutLayout, model: Model) -> None:
-        """A candidate copy's vars (one fixed division)."""
+    def encode_transform(self, transform: Transform, model: Model) -> None:
+        """A candidate transform's vars (one fixed division)."""
     def encode_merge(self, edge: DependencyEdge, model: Model) -> None:
         """In-place edge: offset equality, both ends resident, then eff_size
         equality and the view gate when the child chooses a work split."""
@@ -692,20 +713,21 @@ class EncodingStrategy:
         self, node: ResourceNode, model: Model, incoming: bool) -> None:
         """At most one merge into (or out of) the node."""
     def encode_capacity(
-        self, item: ResourceNode | RelayoutLayout, model: Model) -> None:
+        self, item: ResourceNode | Transform, model: Model) -> None:
         """offset + eff_size <= capacity while resident."""
     def encode_op_constraints(
-        self, item: ResourceNode | RelayoutLayout, model: Model) -> None:
+        self, item: ResourceNode | Transform, model: Model) -> None:
         """The restrictions for the item's kind of op; the default pins
         resident=False with the reason."""
     def encode_read(self, edge: DependencyEdge, model: Model) -> None:
-        """edge: the served literals (one per candidate copy that can
+        """edge: the served literals (one per candidate transform that can
         serve it) and the view gate, "match or served"."""
-    def encode_relayout(self, layout: RelayoutLayout, model: Model) -> None:
-        """A copy needs its producer resident under a priced source work split
-        and must serve some read; pinned out when it cannot."""
+    def encode_transform_use(self, transform: Transform, model: Model) -> None:
+        """A transform needs its producer live (resident, for a relayout) under
+        a priced source work split and must serve some read; pinned out when
+        it cannot."""
     def encode_tiling_vars(
-        self, item: ResourceNode | RelayoutLayout, model: Model) -> None:
+        self, item: ResourceNode | Transform, model: Model) -> None:
         """loop_id / tiled for an item with a work split."""
     def encode_nest(self, edge: ExecutionEdge, model: Model) -> None:
         """same_nest, joined and the group step along one execution edge."""
@@ -716,6 +738,10 @@ class EncodingStrategy:
         segment; unshareable if one is outside it or it is a graph output."""
     def encode_tile_counts(self, node: ResourceNode, model: Model) -> None:
         """The node's tile-count term vars."""
+    def encode_lifetime(
+        self, item: ResourceNode | Transform, model: Model) -> None:
+        """One-sided bounds on start / end (Lifetimes); nothing while
+        lifetimes are today's constants."""
     def encode_clone(self, node: ResourceNode, model: Model) -> None:
         """Graph input: its relation to its consumers (a no-op in Phase 1; 2c)."""
 
@@ -856,36 +882,63 @@ class GraphSolver(Protocol):
 ```
 
 The graph holds only incoming data and decisions. The `EncodingStrategy` holds how each
-axis is enumerated (internally), every edge's relations, the candidate copies and all CP
-state (a `NodeVars` per node and per candidate copy, the served literals per edge); the
-`EnumerationFactory`, built from configuration alone, creates it with no graph, and
-`solve` injects the graph into each step, which builds that state from it. For
-table-based axes the strategy generates the candidates and tables itself (until Stage 9
-it is given the allocator's); no node or edge sees them. Per axis and per edge the
-strategy applies whichever the enumeration calls for: a `Table` applies its candidates,
-a `Lazy` axis applies constraints derived from the node's `space` and the two nodes'
-ops. The stages implement these types in order: Stage 1 the data types, Stage 2
-`build_graph`, Stage 5 `NodeVars`, `prepare`, `encode_node` and `encode_layout`, Stage 6
-the other methods, Stage 8 `solve` and `SolveSettings`, Stage 9 the table strategy's
-candidate generation, Phase 2 `Lazy` / `Pruned` and the mixed-pair encodings, 3a the
-backend protocol, backends and graph solvers, 3c `division_mode`.
+axis is enumerated (internally), every edge's relations, the candidate transforms and
+all CP state (a `NodeVars` per node and per candidate transform, the served literals per
+edge); the `EnumerationFactory`, built from configuration alone, creates it with no
+graph, and `solve` injects the graph into each step, which builds that state from it.
+For table-based axes the strategy generates the candidates and tables itself (until
+Stage 9 it is given the allocator's); no node or edge sees them. Per axis and per edge
+the strategy applies whichever the enumeration calls for: a `Table` applies its
+candidates, a `Lazy` axis applies constraints derived from the node's `space` and the
+two nodes' ops. The stages implement these types in order: Stage 1 the data types, Stage
+2 `build_graph`, Stage 5 `NodeVars`, `prepare`, `encode_node` and `encode_transform`,
+Stage 6 the other methods, Stage 8 `solve` and `SolveSettings`, Stage 9 the table
+strategy's candidate generation, Phase 2 `Lazy` / `Pruned` and the mixed-pair encodings,
+3a the backend protocol, backends and graph solvers, 3c `division_mode`.
 
 Notes:
 
 - **Graph inputs are nodes** with `produced_at = None`: no producing op and not on
   the execution chain (their first use is another op's read tick). Their menu (today's
   clone menu) is table data; residency as for any node.
-- **Relayouts are layouts, not nodes.** A candidate `RelayoutLayout` is the producer's
-  output in a destination view, with its own residency and offset, live from the first
-  read it serves to the last. Candidates are table data (the strategy's `layouts`);
-  `solve` puts the resident ones on their producer's `relayouts` (`ResidentLayout`), and
-  realizing the plan inserts their copy ops (the shuffle directly before its first
-  consumer). Copies do not break tiling runs today, and with no copy node on the chain
-  that stays exact.
-- **Copy order** is every candidate layout sorted by (producer name, `group`), after all
-  nodes: today's `sorted(groups.items())` (`allocator.py:4444`), with copies appended
-  after every other buffer. `EncodingStrategy.layouts` holds them in that order; every
-  copy-dependent step uses it.
+- **Transforms live on edges, not as nodes.** An edge can define a transform between
+  its two ops: the read goes through a converted copy of the producer's output (a
+  relayout today; a cut's copy-out with #5246; transposes and restickification later,
+  see *Future work*). One `Transform` exists per (producer, kind, target) and every edge
+  needing that conversion points at it (`edge.transform`), so it is priced and placed
+  once. Candidates are the strategy's (`EncodingStrategy.transforms`); an edge may also
+  require one up front. `solve` puts the chosen ones on their producer's `transforms`
+  (`PlacedTransform`), and realizing the plan inserts their ops (a relayout's shuffle
+  directly before its first reader). Copies do not break tiling runs today, and with no
+  copy node on the chain that stays exact.
+- **Copy order** is every candidate transform sorted by (producer name, `group`), after
+  all nodes: today's `sorted(groups.items())` (`allocator.py:4444`), with copies
+  appended after every other buffer. `EncodingStrategy.transforms` holds them in that
+  order; every transform-dependent step uses it.
+- **Lifetimes are `start` / `end` vars** in each node's and transform's `NodeVars`;
+  they are the time side of its rectangle in the 2-D no-overlap. `encode_lifetime`
+  bounds them one-sidedly (a longer life only costs space, so the solve keeps them
+  tight; only an in-place merge pins an end exactly):
+  - a node: `start` = its write for an op output (at most its first read for a graph
+    input, earlier when hoisted into a nest); `end` ≥ every read that takes it
+    directly, and ≥ that reader's nest end when the reader is tiled (re-read every
+    pass). Its untiled lifetime (`start_time`, `end_time`) is the bound while it is not
+    tiled; a tiled node holds one tile, so only readers inside its nest extend it.
+  - a transform: `start` ≥ the moment its input is complete (the producer's write;
+    the end of the producer's nest when the producer is tiled, except a cut's copy-out,
+    which runs per tile right after the write) and `start` ≤ the read of every edge
+    that chose it, so it exists before its first reader; `end` ≥ the read (or the
+    tiled reader's nest end) of every edge that chose it. The producer must be live
+    when the transform runs: `producer.end` > `transform.start` while the transform
+    reads it from LX.
+  - presence: a transform in LX (a relayout, later a transpose) has a rectangle when
+    it is resident; a copy-out lands in HBM and has none, but still extends its tile's
+    life to the copy slot.
+
+  Today every lifetime is a constant (copies: [first reader tick, last + 1)), so in
+  Phase 1 the vars are fixed and `encode_lifetime` posts nothing: the proto is
+  unchanged. The bounds go live with #5246 (tiling moves lifetimes; time doubles into
+  slots so a transform can run between two ops) and with 2d (shared lazy relayouts).
 - `eq=False` on nodes and edges: they reference each other, so they compare by
   identity and get a short custom `__repr__` (name, or `src->dst:kind`).
 - At most one edge joins a pair of nodes; `add_child` refuses a second. An in-place
@@ -929,9 +982,9 @@ emission order the proto diff checks lives here, in one place:
 def _finalize(self, model, strategy):
     nodes = list(self.get_nodes())                        # add_node order
     strategy.prepare(self)                                # reset; candidates
-    copies = strategy.layouts                             # copy order
+    copies = strategy.transforms                          # copy order
     for n in nodes: strategy.encode_node(n, model)        # 1. vars
-    for c in copies: strategy.encode_layout(c, model)
+    for c in copies: strategy.encode_transform(c, model)
     for e in in_place_edges(nodes): strategy.encode_merge(e, model)   # 2. merges
     for n in nodes: strategy.limit_merges(n, model, incoming=True)
     for n in merge_sources(nodes): strategy.limit_merges(n, model, incoming=False)
@@ -939,18 +992,19 @@ def _finalize(self, model, strategy):
     strategy.encode_no_overlap(self, model)
     for x in (*nodes, *copies): strategy.encode_op_constraints(x, model)  # 4.
     for e in read_edges(nodes): strategy.encode_read(e, model)        # 5. reads
-    for c in copies: strategy.encode_relayout(c, model)              # 6. relayouts
+    for c in copies: strategy.encode_transform_use(c, model)         # 6. transforms
     for x in (*divided(nodes), *copies): strategy.encode_tiling_vars(x, model)  # 7.
     for e in self.execution_chain(): strategy.encode_nest(e, model)
     segments = strategy.tiling_segments(self)
     for n in nodes: strategy.encode_cuts(n, segments, model)
     for n in nodes: strategy.encode_tile_counts(n, model)
     for n in graph_inputs(nodes): strategy.encode_clone(n, model)    # 8. clones
+    for x in (*nodes, *copies): strategy.encode_lifetime(x, model)   # 9. lifetimes
 ```
 
 Each step in emission order:
 
-1. **`encode_node` / `encode_layout`**: each node's `NodeVars` in `add_node` order, as
+1. **`encode_node` / `encode_transform`**: each node's `NodeVars` in `add_node` order, as
    today's wrappers make them: `in_buffer`, `off`, a `merge_*` literal per in-place
    input, then `div`, `eff_size`, `core_cost`, `occ` (cores), split and tile-count vars
    each with its element, then the `eff_size` / `cores` / `core_cost` elements
@@ -973,8 +1027,8 @@ Each step in emission order:
    served literals (one per candidate copy that can serve the read: "this read goes
    through that copy") in sorted relayout-group order (`:441`) and the view gate, which
    is "match or served", interleaved as today's `constrain_residency` does.
-6. **`encode_relayout`**, per copy in copy order: if the producer chooses no work
-   split, pin the copy out; otherwise copy resident ⇒ producer resident,
+6. **`encode_transform_use`**, per transform in copy order: if the producer chooses no
+   work split, pin the copy out; otherwise copy resident ⇒ producer resident,
    `bool_or(division_is(i) for i in sorted(priced))` enforced by the copy's literal,
    then `bool_or(serves)` enforced by it, or the pin when no read can use it
    (`_constrain_relayout_copies`).
@@ -985,6 +1039,10 @@ Each step in emission order:
 8. **`encode_clone`**: per graph input. A no-op in Phase 1, where a clone's matches are
    ordinary edge tables; in Phase 2c it posts the clone's relation derived from
    its consumers.
+9. **`encode_lifetime`**, per node then per transform: the one-sided bounds on `start`
+   and `end` (*Lifetimes*). Posts nothing while lifetimes are today's constants. With
+   #5246 the lifetime vars feed the no-overlap, so coarse tiling and lifetimes move
+   before placement and the order here follows that `main`.
 
 The fallback copy pin (`:1044-1048`) is not here: it depends on whether `cost_expr`
 lowered, so it stays in the ladder inside `solve`. Stage 0's proto diff is the check
@@ -1044,7 +1102,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   `SpyreOptimizationGraph`, `build_buffer_graph` → `build_graph`) and reshape it into
   the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
 - Implement the data types of *The model*: aliases, `WorkSplit`, the edges,
-  `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph, plus `EncodingStrategy`
+  `Transform`, `ResourceNode`, `spill_cost` and the graph, plus `EncodingStrategy`
   and `EnumerationFactory` without solver methods. The fixed and table enumerations
   Phase 1 uses are internal to the default strategy.
 - From the draft: `RelayoutRead` and `Pairs` go into the table strategy's internals;
@@ -1094,13 +1152,13 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   when `_plan_layout_generic` creates it, through a constructor of that implementation
   (not part of the model) that reads each buffer once: menus from `core_divisions`
   (clone menus for graph inputs), view tables from `cd_parent_matches.get(src, ())`,
-  relayout candidates from `cd_parent_relayouts.get(src, ())` filtered to groups with
-  a copy in this solve, and a `RelayoutLayout` per `RelayoutCopyBuffer` (with its name,
-  group, size, read count, division and lifetime) in copy order, including copies no
-  edge can use (pinned out, as today).
+  relayout candidates from `cd_parent_relayouts.get(src, ())` filtered to groups with a
+  copy in this solve, and a relayout `Transform` per `RelayoutCopyBuffer` (with its
+  name, group, size, read count, division and lifetime) in copy order, including copies
+  no edge can use (pinned out, as today).
 - Tests, while the functions still exist: on every corpus graph the `in_place` edges
   equal `in_place_parents`, the edges equal `_get_children` restricted to pairs where
-  both ends are in the solve, and the strategy's candidate copies
+  both ends are in the solve, and the strategy's candidate transforms
   equal `_relayout_copies`.
   Stage 3 deletes those functions, and from then the proto diff covers the edges.
 
@@ -1118,8 +1176,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   | `parents` | the node's edges (`inputs` / `outputs`) |
   | `cd_parent_matches`, `cd_parent_relayouts` | the table strategy's view and relayout tables per edge |
   | `in_place_parents` | `in_place` on the edge |
-  | `RelayoutCopyBuffer` (whole buffer) | a candidate `RelayoutLayout` in the table strategy, with its name, group, size, read count, division and lifetime |
-  | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | node decisions, `relayouts` and edge `chosen`, written back to the buffers by Stage 8 |
+  | `RelayoutCopyBuffer` (whole buffer) | a candidate relayout `Transform` in the table strategy, with its name, group, size, read count, division and lifetime |
+  | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | node decisions, `transforms` and edge `transform`, written back to the buffers by Stage 8 |
   | `residency_edges`, `division_space` | not carried (the strategy rebuilds residency edges from `node.op`); `node.space`, read by Stage 9 and Phase 2 |
   | `tile_reads` | not carried; Phase 2b |
   | `op_position` | replaced by `produced_at` and execution edges |
@@ -1133,7 +1191,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - `_plan_layout_generic` builds the `SpyreOptimizationGraph` next to the existing
   wrappers.
 - `_get_children` → `node.outputs`; `_relayout_copies` →
-  the strategy's candidate copies in copy order (the group-key → wrapper map is built
+  the strategy's candidate transforms in copy order (the group-key → wrapper map is built
   in that order); the
   `in_place_parents` loop in
   `_add_inplace_relaxation` → each node's `inputs` with `in_place`.
@@ -1164,14 +1222,14 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 
 - Gives the Stage 1 `EncodingStrategy` its first methods: `prepare(graph)` (reset and
   build the enumerations) and the default strategy's `encode_node(node, model)` /
-  `encode_layout(layout, model)`, which `_finalize` calls per node, then per copy in
-  copy order. Each makes and keeps a `NodeVars` in today's emission order (*Finalization
-  order*, step 1): `in_buffer`, `offset`, merge literals, `division`, `eff_size`,
-  `core_cost`, `cores`, split and tile-count vars. It dispatches on the node's division
-  enumeration, replacing the variable-making half of both wrappers: `Table` posts
-  today's index var, element ties and single-candidate constants; `Fixed(COMMITTED)`
-  posts no split vars, which is today's placement-only model (`cores`, `core_cost`
-  `None`, no gates).
+  `encode_transform(transform, model)`, which `_finalize` calls per node, then per
+  transform in copy order. Each makes and keeps a `NodeVars` in today's emission order
+  (*Finalization order*, step 1): `in_buffer`, `offset`, merge literals, `division`,
+  `eff_size`, `core_cost`, `cores`, split and tile-count vars. It dispatches on the
+  node's division enumeration, replacing the variable-making half of both wrappers:
+  `Table` posts today's index var, element ties and single-candidate constants;
+  `Fixed(COMMITTED)` posts no split vars, which is today's placement-only model
+  (`cores`, `core_cost` `None`, no gates).
 - `NodeVars` carries `cpsat_expr_printer`'s contract until Phase 2a: `buffer`, a
   read-only view exposing exactly `core_divisions` (the `Table` candidates),
   `sym_core_divs` and `sym_division` (`cpsat_expr_printer.py:249`, `:840`,
@@ -1196,7 +1254,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   - `encode_op_constraints(node | copy)`: the exclusion pins, in today's position.
   - `encode_read(edge)` per edge: served literals and "match or served"; the
     strategy keeps the served literals by edge and tallies them per copy.
-  - `encode_relayout(copy)`: today's `_constrain_relayout_copies` for one copy
+  - `encode_transform_use(transform)`: today's `_constrain_relayout_copies` for one copy
     (*Finalization order*, step 6).
   - `encode_tiling_vars(node | copy)`, `encode_nest(execution edge)` (the Stage 4
     function), `tiling_segments(graph)`, `encode_cuts(node)`, `encode_tile_counts(node)`.
@@ -1207,11 +1265,11 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   node chooses a division.
 - `_finalize` and the ladder record the `Provenance` table (*Finalization order*), and
   the debug dump writes it next to the proto.
-- The wrappers' other readers move onto `NodeVars` and the layouts' vars:
+- The wrappers' other readers move onto `NodeVars` and the transforms' vars:
   `_minimize_cost_expr`'s `sym_map` / `buffer_map` (including `_division_of_*` and
   `is_lx_<copy>`), the ladder's term collection and fallback copy pin (layout terms
   last, in copy order), and `_extract`, which now fills the nodes' decisions (justify
-  units include layouts; `chosen` per edge).
+  units include transforms; `transform` per edge).
 - Delete `_LifetimeBufferWithCpVars`, `_CoreDivisionBufferWithCpVars`, `_wrap`,
   `_add_core_division`, `_add_inplace_relaxation`, `_constrain_relayout_copies`, every
   `isinstance(..., RelayoutCopyBuffer/CoreDivisionBuffer)` and every
@@ -1241,7 +1299,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   allocator's candidates): `_finalize(model, strategy)`, the objective ladder (with the
   fallback copy pin when `cost_expr` is `None` or fails to lower), extraction. It fills
   every open decision: `work_split` (so the tiling), `resident`, `offset` when resident,
-  `spill_reason` when not, the resident copies on `relayouts`, and `chosen` on edges
+  `spill_reason` when not, the chosen transforms on `transforms`, and `transform` on edges
   (`None`: read directly). It returns the op-output nodes along the execution chain;
   that list is the execution plan.
 - It builds the CP-SAT solver as `_run` does (time limit, workers from deterministic
@@ -1727,7 +1785,7 @@ constraints over small per-buffer domains, never per-pair tables.
     Stage 6 on. `Decomposed` follows in 3g.
 - **3b. Node absorbs the fields Phase 1 left with the allocator**: `lx_view`,
   `lx_relayout_plans` and `paired_with` (greedy only). Greedy's relayout plans become
-  `RelayoutLayout`s on the source (fixed view, all-or-nothing residency), not paired
+  relayout `Transform`s on the source (fixed view, all-or-nothing residency), not paired
   nodes. The rest are mapped in Stage 2 and Phase 2. Sizes stay in alignment units on
   the node as the draft has them; `address` is written back in bytes.
 - **3c. The graph builds nodes from the IR.** `graph.add_node(op)` builds a node
@@ -1814,8 +1872,10 @@ constraints over small per-buffer domains, never per-pair tables.
 
 ## Future work (not planned)
 
-Both are conversions of the data flowing along a dependency edge, decided by the solve
-and encoded by a strategy, next to the relayouts the edge already carries. Neither
+Both are transforms on a dependency edge (`TransformKind.TRANSPOSE`, `RESTICKIFY`),
+decided by the solve and encoded by a strategy like the relayouts edges already define:
+one shared `Transform` per (producer, target layout), read by every edge that needs it,
+with its lifetime bounded as under *Lifetimes*. Neither
 changes the graph types: the ops' index maps (`node.op`) already say how each side reads
 and writes.
 
