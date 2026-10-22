@@ -628,6 +628,17 @@ class NodeVars:
         """Table only: cached literal `division == i`, made on first call (today's
         `_division_is`); a constant for a one-candidate menu."""
 
+@dataclass(frozen=True)
+class Provenance:
+    """Debugging side table: which call posted a range of the model. `_finalize`
+    and the objective ladder record the model's variable and constraint counts
+    before and after each call, so the encode methods need not cooperate. Dumped
+    next to the proto; it never changes the model."""
+    source: str                              # "encode_read", "ladder:residency", ...
+    element: str                             # "buf3->buf9", "buf7", "graph"
+    variables: range                         # indices this call added
+    constraints: range
+
 # ---- the strategy: decides per axis and per edge how to apply the data ------
 @dataclass(eq=False)
 class EncodingStrategy:
@@ -651,6 +662,8 @@ class EncodingStrategy:
     vars: dict[ResourceNode | RelayoutLayout, NodeVars] = field(default_factory=dict)
     served: dict[DependencyEdge, dict[RelayoutLayout, Var]] = field(
         default_factory=dict)                # served literals, per edge
+    provenance: list[Provenance] = field(default_factory=list)
+                                             # one entry per call that posted
 
     # ---- whole-graph hooks (the only methods that take the graph) ----
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
@@ -787,6 +800,8 @@ class Backend(Protocol):
     def Maximize(self, expr: LinearExpr) -> None: ...
     def SetHint(self, vars: Sequence[Var], values: Sequence[int]) -> None: ...
     def Solve(self) -> SolveStatus: ...
+    def NumVariables(self) -> int: ...       # for the provenance table
+    def NumConstraints(self) -> int: ...
     def Value(self, var: LinearExpr) -> int: ...
     def ObjectiveValue(self) -> float: ...
 
@@ -975,6 +990,16 @@ The fallback copy pin (`:1044-1048`) is not here: it depends on whether `cost_ex
 lowered, so it stays in the ladder inside `solve`. Stage 0's proto diff is the check
 on every claim in this list.
 
+**Provenance.** Around every call above, and every ladder stage's additions (the copy
+pin, the objective locks), `_finalize` and the ladder record the model's variable and
+constraint counts before and after and append a `Provenance` entry (source method or
+ladder stage, element, the index ranges it added) to the strategy. The table is dumped
+next to the proto and never changes the model, so the proto diff is unaffected. With it
+a dump reads as "rows 812–819: `encode_read(buf3 → buf9)`": a binding or conflicting
+row maps back to a node or edge, an infeasibility can be traced to the elements that
+posted it, and a proto diff can be grouped by method and element instead of row
+number.
+
 ## Phase 1 — re-representation
 
 **Sequencing.** Two open torch-spyre PRs change the model Phase 1 freezes as
@@ -998,7 +1023,9 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   (`model.export_to_file(...)` or `str(model.proto)`; OR-Tools 9.15's pybind proto has
   no `SerializeToString`), residency, chosen division, offset and chosen relayouts. A
   **proto diff** compares all of these with the baseline, ladder stage by ladder stage;
-  "proto diff empty" means identical.
+  "proto diff empty" means identical. From Stage 6 the harness also dumps the strategy's
+  `Provenance` table and reports a non-empty diff grouped by the method and element that
+  posted each differing row.
 - Corpus: `synthetic_cooptimization_graphs`, the `cooptimization_capture_loader`
   graphs, cases from `test_solver_relayout_decision` (copies, relayouts), the
   coarse-tiling tests, `plan_layout` (placement-only buffers) and solves with a
@@ -1178,6 +1205,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   in the order under *Finalization order*.
 - `free_copies` (presolve threshold) keeps today's rule: every relayout layout whose
   node chooses a division.
+- `_finalize` and the ladder record the `Provenance` table (*Finalization order*), and
+  the debug dump writes it next to the proto.
 - The wrappers' other readers move onto `NodeVars` and the layouts' vars:
   `_minimize_cost_expr`'s `sym_map` / `buffer_map` (including `_division_of_*` and
   `is_lx_<copy>`), the ladder's term collection and fallback copy pin (layout terms
