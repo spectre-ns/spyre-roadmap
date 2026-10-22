@@ -419,11 +419,11 @@ class ResidentLayout:
 @dataclass(eq=False)
 class RelayoutLayout:
     """A candidate relayout copy: the producer's output re-laid-out into another
-    per-core view, held as a second buffer in LX from the first read it serves to the last
-    (today's copy lifetime, `build_relayout_copy`). It is table data, supplied by a
-    `TableSource`; `solve()` puts the ones it makes resident on the producer's
-    `relayouts`. Phase 1 takes it from the allocator's `RelayoutCopyBuffer`; 2d
-    generates it."""
+    per-core view, held as a second buffer in LX from the first read it serves
+    to the last (today's copy lifetime, `build_relayout_copy`). It is table
+    data, supplied by a `TableSource`; `solve()` puts the ones it makes
+    resident on the producer's `relayouts`. Phase 1 takes it from the
+    allocator's `RelayoutCopyBuffer`; 2d generates it."""
     producer: ResourceNode
     name: str                                # today's copy name (var names, is_lx_*)
     group: int                               # destination view (today's group)
@@ -704,11 +704,12 @@ class EnumerationFactory:
         self, graph: SpyreOptimizationGraph, tables: Optional[TableSource] = None,
     ) -> Strategy:
         """`tables` is this graph's table data (Phase 1: AllocatorTables); only
-        needed when a setting is table-based. Per node: a set decision -> Fixed(value) (so COMMITTED
-        -> Fixed(COMMITTED)); a "table" axis -> Table(tables.menu(node)); a "lazy" axis
-        -> Lazy(node.space); residency and offset -> Open. Per edge: a TableView over
-        tables.view_table(edge) when both ends are Table, else a DerivedView over
-        edge.reads. Raises ValueError for a table-based axis with no `tables`."""
+        needed when a setting is table-based. Per node: a set decision ->
+        Fixed(value) (so COMMITTED -> Fixed(COMMITTED)); a "table" axis ->
+        Table(tables.menu(node)); a "lazy" axis -> Lazy(node.space); residency
+        and offset -> Open. Per edge: a TableView over tables.view_table(edge)
+        when both ends are Table, else a DerivedView over edge.reads. Raises
+        ValueError for a table-based axis with no `tables`."""
 
 # =============================================================================
 # Phase 3a: what solve() runs on
