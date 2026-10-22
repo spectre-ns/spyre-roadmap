@@ -33,11 +33,12 @@ Goal: model the solve as a graph.
   holds the incoming data about its op (size, lifetime, read count, the op's split
   space, …) and its decisions (`work_split`, `resident`, `offset`), each fixed ahead of
   time or `None` for the solver to find. It holds no menu.
-- **`DependencyEdge`** — every data dependency between two nodes (reads, in-place
-  reuse; in Phase 1 only between nodes that both choose a division, as today). It
-  holds the incoming data about the dependency (its kind, each read's index map into
-  the source) and no pair table. Edges are shared: the same edge object sits in its
-  source's `outputs` and its destination's `inputs`, so either end can walk it.
+- **`DependencyEdge`** — the data dependency between two nodes: the destination's op
+  reads the source, and with `in_place` may also take over its storage (an in-place
+  child always reads its parent). At most one edge joins a pair. It holds no pair table;
+  the strategy derives each edge's relations from the two nodes' ops. Edges are shared:
+  the same edge object sits in its source's `outputs` and its destination's `inputs`, so
+  either end can walk it.
 - **`ExecutionEdge`** — links each op output (a node with a `produced_at` tick) to its
   chronological neighbours (`node.prev` / `node.next`). Coarse tiling is decided
   along these edges: whether the two ops run the same loop nest, whether they join
@@ -135,7 +136,7 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    literal, lives in the strategy.
 5. **Enumeration is polymorphic, per decision axis.** Nodes do not carry enumerations;
    the `Strategy` does. For each node and each enumerated axis (the work split: core
-   division and coarse tiling, one axis until 2b; from 2d, relayout choice per READ
+   division and coarse tiling, one axis until 2b; from 2d, relayout choice per
    edge) it holds an `Enumeration`, data plus `holds(value)` (a query, no model), built
    from the node's fields (and, for a `Table`, the candidates it generates), and it
    realizes that
@@ -179,9 +180,9 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
 
    Every cell is posted under the edge's enforcement literal (`in_buffer` for a view
    gate, the match or served literal when relayouts serve the read, the merge literal
-   for IN_PLACE), as `_gate_divisions` does today. "Checked at build": a compatible
-   fixed pair posts nothing, an incompatible one forces that literal false, as an empty
-   table does today.
+   for an in-place edge), as `_gate_divisions` does today. "Checked at build": a
+   compatible fixed pair posts nothing, an incompatible one forces that literal false,
+   as an empty table does today.
 
    **Composing enumerations across axes.** The strategy realizes every enumeration onto
    the same per-axis vars, so composing them is a conjunction of constraints over those
@@ -226,7 +227,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType, CoreDivision, LifetimeBoundBuffer, SolveError, TileSpec,
     division_symbol,
 )
-from torch_spyre._inductor.work_division import OpSplitSpace, ResidencyEdge
+from torch_spyre._inductor.work_division import OpSplitSpace
 
 T = TypeVar("T")
 
@@ -260,25 +261,18 @@ WorkSplit.COMMITTED = WorkSplit(splits=(), tiling=None, committed=True)
 # =============================================================================
 # The graph: incoming data only. No menus, pair tables or candidate copies.
 # =============================================================================
-class DependencyKind(Enum):
-    """Why two nodes are linked: the destination's op reads the source (READ),
-    or the destination may reuse the source's storage at the tick they share
-    (IN_PLACE). A pair of nodes can be linked both ways."""
-    READ = auto()                            # dst's op reads src
-    IN_PLACE = auto()                        # dst may take over src's storage at the
-                                             # shared tick
-
 @dataclass(eq=False)
 class DependencyEdge:
-    """One data dependency between two nodes, as incoming data. The same object
-    sits in `src.outputs` and `dst.inputs` and nowhere else. It carries no
-    candidate data: whether the two ends' views agree is the strategy's
-    relation for this edge, which the strategy builds from this data."""
+    """The data dependency between two nodes: `dst`'s op reads `src`, and with
+    `in_place` it may also take over `src`'s storage at the tick they share (an
+    in-place child always reads its parent). At most one edge joins a pair. The
+    same object sits in `src.outputs` and `dst.inputs` and nowhere else. It
+    carries no candidate data: whether the two ends' views agree is the
+    strategy's relation for this edge, derived from the two nodes' ops."""
     src: ResourceNode
     dst: ResourceNode
-    kind: DependencyKind
-    reads: tuple[ResidencyEdge, ...] = ()    # each read's index map into src
-    chosen: Optional[RelayoutLayout] = None  # set by solve(): the copy this READ
+    in_place: bool = False                   # dst may reuse src's storage
+    chosen: Optional[RelayoutLayout] = None  # set by solve(): the copy this read
                                              # goes through; None = directly
 
 @dataclass(eq=False)
@@ -348,11 +342,10 @@ class ResourceNode:
     def add_child(
         self,
         child: ResourceNode,
-        kind: DependencyKind = DependencyKind.READ,
-        reads: tuple[ResidencyEdge, ...] = (),
+        in_place: bool = False,
     ) -> DependencyEdge:
         """The only way to add an edge: one object, on self.outputs and
-        child.inputs, nowhere else."""
+        child.inputs, nowhere else. Refuses a second edge between the pair."""
 
     def add_successor(self, after: ResourceNode) -> ExecutionEdge:
         """The only way to add an execution edge: sets self.next and after.prev,
@@ -408,7 +401,7 @@ class SpyreOptimizationGraph:
         strategy: Optional[Strategy] = None,     # None: EnumerationFactory()
     ) -> list[ResourceNode]:                     # .strategy(), today's model
         """_finalize, the objective ladder, extraction. Fills every open decision
-        on the nodes and `chosen` on READ edges, and returns the op outputs in
+        on the nodes and `chosen` on edges, and returns the op outputs in
         execution order: the execution plan. Raises SolveError as _run does,
         writing nothing."""
 
@@ -501,7 +494,7 @@ def tileable(e: Enumeration[WorkSplit]) -> bool:
 class Enumerations:
     """One node's enumerations, held by the strategy: the work split (core
     division and tiling, one axis while it is a `Table`, separate from 2b), and
-    from 2d a relayout axis per READ edge. Residency and offset are not
+    from 2d a relayout axis per edge. Residency and offset are not
     enumerated: they are always-constrained decisions the steps encode."""
     division: Enumeration[WorkSplit]         # carries tiling while it is a Table
 
@@ -517,14 +510,13 @@ class ViewRelation(ABC):
 @dataclass(frozen=True)
 class DerivedView(ViewRelation):
     """2c: the view relation as derived-view equality, computed from each end's
-    per-axis splits through the edge's read index maps. Used when an end is not
-    a `Table`."""
-    reads: tuple[ResidencyEdge, ...]         # the edge's read index maps
+    per-axis splits through the read index maps the strategy takes from the two
+    nodes' ops. Used when an end is not a `Table`."""
     def holds(self, src: WorkSplit, dst: WorkSplit) -> bool: ...
 
 class RelayoutRelation(ABC):
-    """Which candidate copies can bridge a view mismatch on a READ edge, under
-    given divisions. The strategy holds one per READ edge and encodes it as
+    """Which candidate copies can bridge a view mismatch on a edge, under
+    given divisions. The strategy holds one per edge and encodes it as
     the served literals; today's priced (source, consumer) division pairs per
     copy are its internal data."""
     @abstractmethod
@@ -567,7 +559,7 @@ class NodeVars:
     eff_size: Var | int          # per-core footprint; a constant when
                                              # the division is fixed
     merges: dict[str, Var] = field(default_factory=dict)
-                                             # merge_<parent>_<name>, per IN_PLACE input
+                                             # merge_<parent>_<name>, per in-place input
     splits: dict[SplitKey, Var] = field(default_factory=dict)
     tile_counts: dict[TileKey, Var] = field(default_factory=dict)
     cores: Optional[Var] = None  # None for COMMITTED
@@ -592,7 +584,7 @@ class Strategy:
     method reads the per-solve state below (the two ends' enumerations and
     vars) and adds to it; nodes and edges stay pure data. For a table-based
     axis the strategy generates its candidates itself from the graph's
-    incoming data (menus from `node.space`, match tables from `edge.reads`,
+    incoming data (menus from `node.space`, match tables from the two ops'
     priced copies from the ops), the work the allocator does today; those
     tables are its implementation detail."""
     division: AxisSetting                    # the configuration, from the factory
@@ -608,7 +600,7 @@ class Strategy:
     layouts: tuple[RelayoutLayout, ...] = () # candidate copies, in copy order
     vars: dict[ResourceNode | RelayoutLayout, NodeVars] = field(default_factory=dict)
     served: dict[DependencyEdge, dict[RelayoutLayout, Var]] = field(
-        default_factory=dict)                # served literals, per READ edge
+        default_factory=dict)                # served literals, per edge
 
     # ---- whole-graph hooks (the only methods that take the graph) ----
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
@@ -627,11 +619,11 @@ class Strategy:
     # ---- per element, called by _finalize in today's order ----
     def encode_node(self, node: ResourceNode, model: Model) -> None:
         """The node's vars: residency literal, offset, a merge literal per
-        IN_PLACE input, then the work split's vars and element ties."""
+        in-place input, then the work split's vars and element ties."""
     def encode_layout(self, layout: RelayoutLayout, model: Model) -> None:
         """A candidate copy's vars (one fixed division)."""
     def encode_merge(self, edge: DependencyEdge, model: Model) -> None:
-        """IN_PLACE edge: offset equality, both ends resident, then eff_size
+        """In-place edge: offset equality, both ends resident, then eff_size
         equality and the view gate when the child chooses a work split."""
     def limit_merges(
         self, node: ResourceNode, model: Model, incoming: bool) -> None:
@@ -644,7 +636,7 @@ class Strategy:
         """The restrictions for the item's kind of op; the default pins
         resident=False with the reason."""
     def encode_read(self, edge: DependencyEdge, model: Model) -> None:
-        """READ edge: the served literals (one per candidate copy that can
+        """edge: the served literals (one per candidate copy that can
         serve it) and the view gate, "match or served"."""
     def encode_relayout(self, layout: RelayoutLayout, model: Model) -> None:
         """A copy needs its producer resident under a priced source work split
@@ -657,7 +649,7 @@ class Strategy:
     def encode_cuts(
         self, node: ResourceNode, segments: Mapping[ResourceNode, int],
         model: Model) -> None:
-        """The node's cut literal: apart literals for READ consumers in its
+        """The node's cut literal: apart literals for consumers in its
         segment; unshareable if one is outside it or it is a graph output."""
     def encode_tile_counts(self, node: ResourceNode, model: Model) -> None:
         """The node's tile-count term vars."""
@@ -688,7 +680,7 @@ class EnumerationFactory:
         generates from node.space; a "lazy" axis -> Lazy(node.space). Residency
         and offset are encoded, not enumerated. Per edge, a pair table when both
         ends are Table,
-        else a DerivedView over edge.reads."""
+        else a DerivedView."""
 
 # =============================================================================
 # Phase 3a: what solve() runs on
@@ -801,7 +793,7 @@ class GraphSolver(Protocol):
 
 The graph holds only incoming data and decisions. The `Strategy` holds every node's
 `Enumerations`, every edge's relations, the candidate copies and all CP state (a
-`NodeVars` per node and per candidate copy, the served literals per READ edge); the
+`NodeVars` per node and per candidate copy, the served literals per edge); the
 `EnumerationFactory`, built from configuration alone, creates it with no graph, and
 `solve` injects the graph into each step, which builds that state from it. For
 table-based axes the strategy generates the candidates and tables itself (until Stage 9
@@ -832,8 +824,10 @@ Notes:
   step uses it.
 - `eq=False` on nodes and edges: they reference each other, so they compare by
   identity and get a short custom `__repr__` (name, or `src->dst:kind`).
-- A pair of nodes can share more than one edge (an in-place child usually reads its
-  parent too). The solver iterates edges by kind, so there is no `isinstance` dispatch.
+- At most one edge joins a pair of nodes; `add_child` refuses a second. An in-place
+  child's edge is its read edge with `in_place=True`. Loop carries, where today one
+  storage is governed by two read relations (`allocator.py:4160-4200`), stay a special
+  case inside the table strategy until they need modelling.
 - `add_child` puts the one edge object on both ends and nowhere else; the graph keeps
   no edge list. `add_successor` links one chain, starting at `graph.first`, and refuses
   to relink a node that already has a neighbour; `_finalize` asserts every node with a
@@ -857,7 +851,7 @@ Notes:
   stage*.
 - Coarse tiling splits across the two edge types the way the data does: group
   membership is decided on `ExecutionEdge`s, and whether a tiled value must be cut to
-  HBM by checking its READ edges against those groups.
+  HBM by checking its edges against those groups.
 - Out of scope: solver-chosen op order. Execution order is an input (`add_successor`).
 
 ### Finalization order
@@ -893,12 +887,12 @@ def _finalize(self, model, strategy):
 Each step in emission order:
 
 1. **`encode_node` / `encode_layout`**: each node's `NodeVars` in `add_node` order, as
-   today's wrappers make them: `in_buffer`, `off`, a `merge_*` literal per IN_PLACE
+   today's wrappers make them: `in_buffer`, `off`, a `merge_*` literal per in-place
    input, then `div`, `eff_size`, `core_cost`, `occ` (cores), split and tile-count vars
    each with its element, then the `eff_size` / `cores` / `core_cost` elements
    (`:216-394`); cached constants for a one-candidate `Table`, and only `in_buffer`,
    `off` and merges for `COMMITTED`. Then each candidate copy's vars, in copy order.
-2. **`encode_merge` / `limit_merges`**: every merge row first, one IN_PLACE edge at a
+2. **`encode_merge` / `limit_merges`**: every merge row first, one in-place edge at a
    time, per destination in `add_node` order and per input in `in_place_parents` order:
    offset equality, merge ⇒ parent resident, merge ⇒ child resident, then, when the
    child chooses a work split, `eff_size` equality and the view gate. Then at-most-one
@@ -910,7 +904,7 @@ Each step in emission order:
 4. **`encode_op_constraints`**, per node in `add_node` order, then per copy: today's
    exclusion pins (`resident=False` with the reason), posted where they are today,
    after the no-overlap and before any read gate (`_add_core_division`).
-5. **`encode_read`**, one READ edge at a time, per producer in `add_node` order over its
+5. **`encode_read`**, one edge at a time, per producer in `add_node` order over its
    `outputs` (parent order, then child order, then the child's `parents` order): the
    served literals (one per candidate copy that can serve the read: "this read goes
    through that copy") in sorted relayout-group order (`:441`) and the view gate, which
@@ -925,7 +919,7 @@ Each step in emission order:
    edge along the chain (`same_nest`, `joined`, group step); `tiling_segments` once
    (the chain walk); then `encode_cuts` and `encode_tile_counts` per node.
 8. **`encode_clone`**: per graph input. A no-op in Phase 1, where a clone's matches are
-   ordinary READ-edge tables; in Phase 2c it posts the clone's relation derived from
+   ordinary edge tables; in Phase 2c it posts the clone's relation derived from
    its consumers.
 
 The fallback copy pin (`:1044-1048`) is not here: it depends on whether `cost_expr`
@@ -989,12 +983,12 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - Tests (`tests/inductor/test_buffer_graph.py`, device-free logic; the inductor conftest
   still opens the card), registered in a `tests/configs/` shard in the same PR (`make
   check-all-configs`): `add_node` order; `add_child` puts one edge object on both ends
-  only, and two kinds can join one pair; nodes and edges carry no candidate data;
-  relation queries (`holds`, `bridges`, `joins`) agree with their tables, and an empty
-  table never holds; `add_successor` links both ends, derives `contiguous`, and refuses
-  a second neighbour; `Strategy.joinable` is false across a tick gap and at ends whose
-  division axis cannot be tiled; the chain ends have `prev` / `next` `None`; `joins`
-  agrees with `loop_id` equality ∧ `tiled[after]`.
+  only, and a second edge between one pair is refused; nodes and edges carry no
+  candidate data; relation queries (`holds`, `bridges`, `joins`) agree with their
+  tables, and an empty table never holds; `add_successor` links both ends, derives
+  `contiguous`, and refuses a second neighbour; `Strategy.joinable` is false across a
+  tick gap and at ends whose division axis cannot be tiled; the chain ends have `prev` /
+  `next` `None`; `joins` agrees with `loop_id` equality ∧ `tiled[after]`.
 
 ### Stage 2. Builder
 
@@ -1004,11 +998,13 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   `add_node` fills the node's incoming data; a buffer without `core_divisions` gets
   `work_split = WorkSplit.COMMITTED`. No candidate data goes on a node or edge.
   `settings` is the interim `SolveSettings` (Stage 8). The final data copied:
-  - READ edges only between nodes that both choose a division, i.e. neither is
-    `COMMITTED` (today's no-op `constrain_residency` on placement-only wrappers).
-  - IN_PLACE edges likewise (ungated when the child is `COMMITTED`).
-  - `division_space` → `node.space`, `residency_edges` → `edge.reads`, and the
-    producing op → `node.op`: what Stage 9's candidate generation and Phase 2 read.
+  - One edge per (producer, consumer) pair where the consumer reads the producer
+    (`parents`), with `in_place=True` when the producer is in `in_place_parents`. The
+    strategy gates a read only when both ends choose a work split (today's no-op
+    `constrain_residency` on placement-only wrappers) and leaves an in-place edge
+    ungated when the child is `COMMITTED`.
+  - `division_space` → `node.space` and the producing op → `node.op`: what Stage 9's
+    candidate generation and Phase 2 read (the read index maps come from the ops).
   - Graph inputs become nodes with `produced_at = None`.
   - `read_count`, lifetimes and overrides as given. A plain `LifetimeBoundBuffer` has no
     `boundary`; it maps to `Input` if `first_use_is_read`, else `Intermediate`, never
@@ -1027,9 +1023,9 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   a copy in this solve, and a `RelayoutLayout` per `RelayoutCopyBuffer` (with its name,
   group, size, read count, division and lifetime) in copy order, including copies no
   edge can use (pinned out, as today).
-- Tests, while the functions still exist: on every corpus graph IN_PLACE edges equal
-  `in_place_parents`, READ edges equal `_get_children` restricted to pairs where both
-  ends are in the solve and choose a division, and the strategy's candidate copies
+- Tests, while the functions still exist: on every corpus graph the `in_place` edges
+  equal `in_place_parents`, the edges equal `_get_children` restricted to pairs where
+  both ends are in the solve, and the strategy's candidate copies
   equal `_relayout_copies`.
   Stage 3 deletes those functions, and from then the proto diff covers the edges.
 
@@ -1044,12 +1040,12 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   | `uses`, `lifetime_*_override` | `start_time` / `end_time` / `read_count`; `uses[0]` → `produced_at` |
   | `residency_reason` (or the capacity check) | `residency_reason` = `excluded(buffer)`, applied by `encode_op_constraints` |
   | `core_divisions` (with each `.tiling`) | the table strategy's candidates (division and tiling shared) |
-  | `parents` | READ edges |
-  | `cd_parent_matches`, `cd_parent_relayouts` | the table strategy's view and relayout tables per READ edge |
-  | `in_place_parents` | IN_PLACE edges |
+  | `parents` | the node's edges (`inputs` / `outputs`) |
+  | `cd_parent_matches`, `cd_parent_relayouts` | the table strategy's view and relayout tables per edge |
+  | `in_place_parents` | `in_place` on the edge |
   | `RelayoutCopyBuffer` (whole buffer) | a candidate `RelayoutLayout` in the table strategy, with its name, group, size, read count, division and lifetime |
   | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | node decisions, `relayouts` and edge `chosen`, written back to the buffers by Stage 8 |
-  | `residency_edges`, `division_space` | `edge.reads`, `node.space`; read by Stage 9 and Phase 2 |
+  | `residency_edges`, `division_space` | not carried (the strategy rebuilds residency edges from `node.op`); `node.space`, read by Stage 9 and Phase 2 |
   | `tile_reads` | not carried; Phase 2b |
   | `op_position` | replaced by `produced_at` and execution edges |
   | `paired_with`, `lx_view`, `lx_relayout_plans` | not read by CP-SAT; Phase 3b |
@@ -1061,11 +1057,11 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 
 - `_plan_layout_generic` builds the `SpyreOptimizationGraph` next to the existing
   wrappers.
-- `_get_children` → `node.outputs` of kind READ; `_relayout_copies` →
+- `_get_children` → `node.outputs`; `_relayout_copies` →
   the strategy's candidate copies in copy order (the group-key → wrapper map is built
   in that order); the
   `in_place_parents` loop in
-  `_add_inplace_relaxation` → each node's IN_PLACE `inputs`.
+  `_add_inplace_relaxation` → each node's `inputs` with `in_place`.
 - Delete `_get_children` and `_relayout_copies`. The wrappers still own the CP vars.
 - Proto diff empty.
 
@@ -1083,7 +1079,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   segments are local to the coarse-tiling encoding (`Strategy.tiling_segments` from
   Stage 6), not a graph method. Its `uses[0]` logic and `RelayoutCopyBuffer` check
   go away.
-- `_cut_literals`: for each tiled node, consumers on its READ edges in the same segment
+- `_cut_literals`: for each tiled node, consumers on its edges in the same segment
   get an `apart` literal gated on the edge's view relation; a consumer outside the
   segment, or a graph output, makes the node unshareable. `_tile_count_terms` iterates
   nodes.
@@ -1116,14 +1112,14 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - The default strategy gains the remaining methods, with the table encodings of the
   three relations (today's `_gate_divisions` for views, the served literals for
   relayouts, the Stage 4 `same_nest` literal for nests):
-  - `encode_merge(edge)` per IN_PLACE edge (using the step-1 merge literal: offset
+  - `encode_merge(edge)` per in-place edge (using the step-1 merge literal: offset
     equality, both-resident implications, then `eff_size` equality and the view gate
     when the child chooses a work split), and `limit_merges(node, incoming)` for the
     at-most-ones.
   - `encode_capacity(node | copy)`, and `encode_no_overlap(graph)` with tick
     shortening.
   - `encode_op_constraints(node | copy)`: the exclusion pins, in today's position.
-  - `encode_read(edge)` per READ edge: served literals and "match or served"; the
+  - `encode_read(edge)` per edge: served literals and "match or served"; the
     strategy keeps the served literals by edge and tallies them per copy.
   - `encode_relayout(copy)`: today's `_constrain_relayout_copies` for one copy
     (*Finalization order*, step 6).
@@ -1138,7 +1134,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   `_minimize_cost_expr`'s `sym_map` / `buffer_map` (including `_division_of_*` and
   `is_lx_<copy>`), the ladder's term collection and fallback copy pin (layout terms
   last, in copy order), and `_extract`, which now fills the nodes' decisions (justify
-  units include layouts; `chosen` per READ edge).
+  units include layouts; `chosen` per edge).
 - Delete `_LifetimeBufferWithCpVars`, `_CoreDivisionBufferWithCpVars`, `_wrap`,
   `_add_core_division`, `_add_inplace_relaxation`, `_constrain_relayout_copies`, every
   `isinstance(..., RelayoutCopyBuffer/CoreDivisionBuffer)` and every
@@ -1163,15 +1159,14 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 
 ### Stage 8. `graph.solve(model, cost_expr)`; honour pre-fixed decisions
 
-- `graph.solve` becomes the public entry point with the model and cost expression
-  `_run` takes today, plus the strategy (until Stage 9, the default table strategy
-  given the allocator's candidates):
-  `_finalize(model, strategy)`, the objective ladder (with the fallback copy
-  pin when `cost_expr` is `None` or fails to lower), extraction. It fills every open
-  decision: `work_split` (so the tiling), `resident`, `offset` when resident,
-  `spill_reason` when not, the resident copies on `relayouts`, and `chosen` on READ
-  edges (`None`: read directly). It returns the op-output nodes along the execution
-  chain; that list is the execution plan.
+- `graph.solve` becomes the public entry point with the model and cost expression `_run`
+  takes today, plus the strategy (until Stage 9, the default table strategy given the
+  allocator's candidates): `_finalize(model, strategy)`, the objective ladder (with the
+  fallback copy pin when `cost_expr` is `None` or fails to lower), extraction. It fills
+  every open decision: `work_split` (so the tiling), `resident`, `offset` when resident,
+  `spill_reason` when not, the resident copies on `relayouts`, and `chosen` on edges
+  (`None`: read directly). It returns the op-output nodes along the execution chain;
+  that list is the execution plan.
 - It builds the CP-SAT solver as `_run` does (time limit, workers from deterministic
   mode or the CPU count, `random_seed=0`, presolve off past
   `config.lx_solver_relayout_presolve_max_copies` free copies) and solves every
@@ -1203,7 +1198,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 ### Stage 9. The table strategy generates its candidates
 
 - The candidate derivations move from the allocator into the table strategy, reading
-  the graph's incoming data (`node.space`, `node.op`, `edge.reads`): menus
+  the graph's incoming data (`node.space`, `node.op`): menus
   (`_division_map`, `_enumerate_core_divisions`, `_tiling_candidates`), match tables
   (`_cd_parent_matches` with the loop-carry intersection and input-clone overrides,
   `_clone_divisions_and_matches`, `_parent_residency_edges`), relayout candidates and
@@ -1465,9 +1460,9 @@ constraints over small per-buffer domains, never per-pair tables.
     keys; 2c records each read's index map and derives them, and the agreement test
     lists what they miss.
 
-  The edge already carries each read's index map (`edge.reads`, from Stage 2); the
-  strategy's `DerivedView` encodes views from it wherever an end is not a `Table`. Loop
-  carries are the conjunction of the read and update relations.
+  The strategy takes each read's index map from the two nodes' ops (`node.op`, from
+  Stage 2); its `DerivedView` encodes views from them wherever an end is not a `Table`.
+  Loop carries (two read relations on one storage) stay the strategy's special case.
 
   **Input clones** (`encode_clone`). Today `_clone_divisions_and_matches`
   (`allocator.py`) builds a clone's menu as the distinct non-broadcast read views of
@@ -1476,7 +1471,7 @@ constraints over small per-buffer domains, never per-pair tables.
   own: its view *is* the one its consumers read with. As constraints:
   - The clone's division axis is a view, not a split: per-device-dim (factor, stride)
     vars plus a core count, with no op behind them and no reduction split.
-  - Each READ edge from the clone posts, gated by the clone's residency, the
+  - Each edge from the clone posts, gated by the clone's residency, the
     consumer's read view (from its split vars through its read map, as above) equal
     to the clone's view. Together these say every consumer reads it alike, which is
     today's "must match all consumers to be placed".
@@ -1494,7 +1489,7 @@ constraints over small per-buffer domains, never per-pair tables.
   Agreement: the feasible pairs equal the allocator's final `cd_parent_matches`,
   carries and clones included.
 - **2d. Relayouts as constraints.** One optional relayout layout per (parent, consumer)
-  READ edge whose view is the consumer's; sharing between consumers by reified view
+  edge whose view is the consumer's; sharing between consumers by reified view
   equality. A layout either owns a copy or reuses an earlier owner of the same parent
   whose view is equal; the owner's end is a variable ≥ every user's tick + 1, its
   rectangle is the one in the no-overlap, and the price is charged once. So `group`,
