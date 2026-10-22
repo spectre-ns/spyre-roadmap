@@ -49,9 +49,9 @@ Goal: model the solve as a graph.
   edge) and returns the op-output nodes in execution order: the execution plan.
 - **The model side** — everything about *how* decisions are searched lives in the
   `Strategy`, not on nodes and edges: each axis's *enumeration* (`Fixed`, `Table`,
-  `Lazy`, `Pruned`, with a `Table`'s candidates as its own data), the relations
-  over each edge's ends (`ViewRelation`, `RelayoutRelation`, `NestRelation`) and all CP
-  state. The strategy applies the incoming data to the CP model: a `Table` axis applies
+  `Lazy`, `Pruned`, with a `Table`'s candidates as its own data), the relations over
+  each edge's ends (views, relayouts, nests) and all CP state, none of them model
+  types. The strategy applies the incoming data to the CP model: a `Table` axis applies
   its candidates, a `Lazy` axis applies constraints built from the node's and edge's own
   data instead.
 
@@ -211,7 +211,6 @@ piece. Types already in torch-spyre are imported, not redefined.
 ```python
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import (
@@ -420,9 +419,10 @@ class ResidentLayout:
     offset: int                              # alignment units
 
 # =============================================================================
-# The model side: relations, CP state and the strategy. How each axis is
-# enumerated (fixed, a table of candidates, lazy, pruned) lives inside the
-# strategy implementations, not here.
+# The model side: CP state and the strategy. How each axis is enumerated
+# (fixed, a table of candidates, lazy, pruned) and the relations over each
+# edge's ends (views, relayouts, nests) live inside the strategy
+# implementations, not here.
 # =============================================================================
 @dataclass(eq=False)
 class RelayoutLayout:
@@ -444,42 +444,6 @@ class RelayoutLayout:
     @property
     def sym_is_lx(self) -> sympy.Symbol:
         return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
-
-# ---- relations: what an edge's ends must agree on; data plus queries --------
-class ViewRelation(ABC):
-    """Whether an edge's two ends own the buffer with the same per-core view under
-    given divisions. The strategy holds one per edge and encodes it as the
-    view gate. When both ends are `Table` it is today's pair table over the
-    candidates, internal to the strategy; otherwise a `DerivedView`."""
-    @abstractmethod
-    def holds(self, src: WorkSplit, dst: WorkSplit) -> bool: ...
-
-@dataclass(frozen=True)
-class DerivedView(ViewRelation):
-    """2c: the view relation as derived-view equality, computed from each end's
-    per-axis splits through the read index maps the strategy takes from the two
-    nodes' ops. Used when an end is not a `Table`."""
-    def holds(self, src: WorkSplit, dst: WorkSplit) -> bool: ...
-
-class RelayoutRelation(ABC):
-    """Which candidate copies can bridge a view mismatch on a edge, under
-    given divisions. The strategy holds one per edge and encodes it as
-    the served literals; today's priced (source, consumer) division pairs per
-    copy are its internal data."""
-    @abstractmethod
-    def bridges(
-        self, src: WorkSplit, dst: WorkSplit) -> tuple[RelayoutLayout, ...]: ...
-
-@dataclass(frozen=True)
-class NestRelation:
-    """Whether two consecutive ops run the same non-empty loop nest, so they can
-    share a tiling group. No data in Phase 1, where the encoding keeps today's
-    `loop_id`; 2b encodes it on per-level tile vars."""
-
-    def joins(self, before: WorkSplit, after: WorkSplit) -> bool:
-        lb = before.tiling.level_counts if before.tiling else ()
-        la = after.tiling.level_counts if after.tiling else ()
-        return lb == la != ()
 
 # ---- CP state ---------------------------------------------------------------
 @dataclass(frozen=True)
@@ -539,11 +503,6 @@ class Strategy:
     tiling: AxisSetting
     relayout: Literal["data", "pruned", "lazy"]
     # per-solve state, reset by prepare() and filled by the encode_* methods
-    views: dict[DependencyEdge, ViewRelation] = field(default_factory=dict)
-                                             # a pair table when both ends are
-                                             # Table, DerivedView otherwise
-    relayouts: dict[DependencyEdge, RelayoutRelation] = field(default_factory=dict)
-    nests: dict[ExecutionEdge, NestRelation] = field(default_factory=dict)
     layouts: tuple[RelayoutLayout, ...] = () # candidate copies, in copy order
     vars: dict[ResourceNode | RelayoutLayout, NodeVars] = field(default_factory=dict)
     served: dict[DependencyEdge, dict[RelayoutLayout, Var]] = field(
@@ -602,6 +561,17 @@ class Strategy:
         """The node's tile-count term vars."""
     def encode_clone(self, node: ResourceNode, model: Model) -> None:
         """Graph input: its relation to its consumers (a no-op in Phase 1; 2c)."""
+    # ---- queries over its relations (no model): for tests and graph solvers ----
+    def views_agree(
+        self, edge: DependencyEdge, src: WorkSplit, dst: WorkSplit) -> bool:
+        """Do the two ends own the buffer with the same per-core view?"""
+    def bridges(
+        self, edge: DependencyEdge, src: WorkSplit, dst: WorkSplit,
+    ) -> tuple[RelayoutLayout, ...]:
+        """The candidate copies that can serve this read under (src, dst)."""
+    def joins(
+        self, edge: ExecutionEdge, before: WorkSplit, after: WorkSplit) -> bool:
+        """Do the two ops run the same non-empty loop nest?"""
     def joinable(self, edge: ExecutionEdge) -> bool:
         """contiguous, and both ends' work splits can be tiled."""
 
@@ -625,8 +595,8 @@ class EnumerationFactory:
         split (COMMITTED posts nothing), enumerates a "table" axis over the
         candidates it generates from node.space, and posts a "lazy" axis as
         constraints over node.space. Residency and offset are encoded, not
-        enumerated. Per edge: a pair table when both ends are table-based, else
-        a DerivedView."""
+        enumerated. Per edge, its relations are a pair table when both ends are
+        table-based, else derived-view equality (2c)."""
 
 # =============================================================================
 # Phase 3a: what solve() runs on
@@ -728,8 +698,9 @@ class Decomposed:
 
 class GraphSolver(Protocol):
     """3a: a solver that works on the graph directly instead of a posted model
-    (greedy, first-fit, best-fit, SA). It reads nodes and the strategy's
-    relation queries and fills the nodes' decisions, as `solve()` does."""
+    (greedy, first-fit, best-fit, SA). It reads nodes, asks the strategy's
+    queries (`views_agree`, `bridges`, `joins`) and fills the nodes' decisions,
+    as `solve()` does."""
     def accepts(self, strategy: Strategy) -> bool: ...  # can it handle these axes?
     def solve(
         self, graph: SpyreOptimizationGraph, strategy: Strategy,
@@ -930,11 +901,12 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   still opens the card), registered in a `tests/configs/` shard in the same PR (`make
   check-all-configs`): `add_node` order; `add_child` puts one edge object on both ends
   only, and a second edge between one pair is refused; nodes and edges carry no
-  candidate data; relation queries (`holds`, `bridges`, `joins`) agree with their
-  tables, and an empty table never holds; `add_successor` links both ends, derives
+  candidate data; `add_successor` links both ends, derives
   `contiguous`, and refuses a second neighbour; `Strategy.joinable` is false across a
   tick gap and at ends whose division axis cannot be tiled; the chain ends have `prev` /
-  `next` `None`; `joins` agrees with `loop_id` equality ∧ `tiled[after]`.
+  `next` `None`. The strategy's queries (`views_agree`, `bridges`, `joins`) are tested
+  with the default strategy in Stage 6: they agree with its tables, an empty table never
+  agrees, and `joins` matches `loop_id` equality ∧ `tiled[after]`.
 
 ### Stage 2. Builder
 
@@ -1354,13 +1326,13 @@ constraints over small per-buffer domains, never per-pair tables.
   change too: `RelayoutCharge` is keyed on the division symbol, and a `Lazy` node has
   no division index. Prerequisite for the rest; agreement: identical lowered values
   at every menu point.
-- **2b. `Lazy` tiling; `NestRelation` on per-level tile vars.** Tiling becomes its
+- **2b. `Lazy` tiling; nests on per-level tile vars.** Tiling becomes its
   own axis (the factory requires it for `Lazy` tiling). `NodeVars` gains `level(k)`:
   per node `L0`, `L1` (`max_dims=2`) tied to the per-dim counts; `same_nest` is the
   two-way reified `L0 == L0' ∧ L1 == L1' ∧ tiled` (a one-way `_gate_divisions`
   would let `joined` go false on an equal pair and loosen cuts). Tile-by-tile
-  alignment (`tile_misread`) becomes a tile `ViewRelation`, closing the Stage 8 gap.
-- **2c. `ViewRelation` constraints: views built from the ops.** A per-core view is
+  alignment (`tile_misread`) becomes a tile view relation, closing the Stage 8 gap.
+- **2c. View relations as constraints: views built from the ops.** A per-core view is
   determined by the op's index map plus divisibility of the buffer's shape, so it is
   posted, not enumerated:
   - **Divisibility.** Each split var's domain is the divisors of its stick-adjusted
@@ -1407,7 +1379,8 @@ constraints over small per-buffer domains, never per-pair tables.
     lists what they miss.
 
   The strategy takes each read's index map from the two nodes' ops (`node.op`, from
-  Stage 2); its `DerivedView` encodes views from them wherever an end is not a `Table`.
+  Stage 2) and encodes views from them, derived-view equality, wherever an end is not
+  a `Table`.
   Loop carries (two read relations on one storage) stay the strategy's special case.
 
   **Input clones** (`encode_clone`). Today `_clone_divisions_and_matches`
@@ -1472,7 +1445,7 @@ constraints over small per-buffer domains, never per-pair tables.
     tables, so the factory rejects it where those are not `Table`s. Agreement where
     capping did not bind; differences reported where it did.
 - **2e. In-place as constraints.** Per-core footprint equality
-  (`out_partition · out_tiles`, a product equality) plus the `ViewRelation`. The
+  (`out_partition · out_tiles`, a product equality) plus the view relation. The
   pre-solve gates (pointwise input, equal device layout, one-tick handoff) stay
   builder facts.
 - **2f. `Lazy` core division.** `Lazy(OpSplitSpace)`: per-axis domains from
@@ -1558,7 +1531,7 @@ constraints over small per-buffer domains, never per-pair tables.
       check holds; switching it to the real `cost_expr` is a later step of its own
       that lists the tests whose expectations change.
   - **Graph solvers.** A second kind behind `set_solver`: solvers that read nodes,
-    enumerations and relation queries directly and fill the nodes' decisions (greedy,
+    the strategy's queries directly and fill the nodes' decisions (greedy,
     first-fit, best-fit, SA placement, `SaCoOptimizingSolver`, `Decomposed`'s heuristic
     inner solver). `graph.solve` runs them in place of `_finalize` and the ladder; the
     greedy fallback after a `SolveError` is the greedy graph solver.
