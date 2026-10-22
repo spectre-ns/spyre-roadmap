@@ -48,7 +48,7 @@ Goal: model the solve as a graph.
   fills every open decision on the nodes (and the copy each read goes through on its
   edge) and returns the op-output nodes in execution order: the execution plan.
 - **The model side** — everything about *how* decisions are searched lives in the
-  `Strategy`, not on nodes and edges: each axis's *enumeration* (`Fixed`, `Table`,
+  `EncodingStrategy`, not on nodes and edges: each axis's *enumeration* (`Fixed`, `Table`,
   `Lazy`, `Pruned`, with a `Table`'s candidates as its own data), the relations over
   each edge's ends (views, relayouts, nests) and all CP state, none of them model
   types. The strategy applies the incoming data to the CP model: a `Table` axis applies
@@ -129,12 +129,12 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    upstream) and `residency_reason` (`None`: no restriction). `Fixed` is an enumeration
    of the work split, not a buffer type: it posts constants (or nothing) where an open
    axis posts vars.
-4. **Build structure, then finalize once, through a strategy.** `add_node` /
-   `add_child` / `add_successor` wire the graph and touch no model; nodes and edges are
-   pure incoming data and decisions. `solve(model, cost_expr, strategy)` calls
-   `SpyreOptimizationGraph._finalize(model, strategy)`, which runs the `Strategy`'s
-   `apply_*` steps over the graph in a fixed order. All encoding, and every CP var and
-   literal, lives in the strategy.
+4. **Build structure, then finalize once, through a strategy.** `add_node` / `add_child`
+   / `add_successor` wire the graph and touch no model; nodes and edges are pure
+   incoming data and decisions. `solve(model, cost_expr, strategy)` calls
+   `SpyreOptimizationGraph._finalize(model, strategy)`, which runs the
+   `EncodingStrategy`'s `apply_*` steps over the graph in a fixed order. All encoding,
+   and every CP var and literal, lives in the strategy.
 5. **Enumeration is polymorphic, per decision axis, inside the strategy.** Nodes do
    not carry enumerations and the model defines no enumeration types: how each axis is
    enumerated is part of a strategy implementation. The enumerated axes are the work
@@ -154,14 +154,13 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
 
    The `EnumerationFactory` is created from configuration alone (which enumeration each
    axis uses) and validated then, for example `Lazy` tiling requires tiling to be its
-   own axis. `factory.strategy()` returns a `Strategy` with that configuration and no
-   graph. `solve` injects the graph into each of its steps, which choose each node's
-   enumerations from its fields and the configuration, each edge's relations from its
-   ends' enumerations, and generate the candidates of table-based axes. The Phase 1
-   default
-   reproduces today: `Table` over the node's candidate menu, `Fixed(value)` for a set
-   decision (so `Fixed(COMMITTED)` for a placement-only node), and today's pair tables
-   for views and relayouts, all held inside the strategy.
+   own axis. `factory.strategy()` returns an `EncodingStrategy` with that configuration
+   and no graph. `solve` injects the graph into each of its steps, which choose each
+   node's enumerations from its fields and the configuration, each edge's relations from
+   its ends' enumerations, and generate the candidates of table-based axes. The Phase 1
+   default reproduces today: `Table` over the node's candidate menu, `Fixed(value)` for
+   a set decision (so `Fixed(COMMITTED)` for a placement-only node), and today's pair
+   tables for views and relayouts, all held inside the strategy.
 
    Every enumeration except `Fixed(COMMITTED)` exposes the same per-axis vars:
    `split(key)` and a tile count per `TileKey` (a `Table` makes them by element, as
@@ -396,14 +395,14 @@ class SpyreOptimizationGraph:
         self,
         model: Model,
         cost_expr: Optional[sympy.Expr] = None,  # None or unlowerable: fallback ladder
-        strategy: Optional[Strategy] = None,     # None: EnumerationFactory()
+        strategy: Optional[EncodingStrategy] = None,  # None: EnumerationFactory()
     ) -> list[ResourceNode]:                     # .strategy(), today's model
         """_finalize, the objective ladder, extraction. Fills every open decision
         on the nodes and `chosen` on edges, and returns the op outputs in
         execution order: the execution plan. Raises SolveError as _run does,
         writing nothing."""
 
-    def _finalize(self, model: Model, strategy: Strategy) -> None:
+    def _finalize(self, model: Model, strategy: EncodingStrategy) -> None:
         """Walk the graph in today's emission order, calling the strategy once
         per node, edge or copy (Finalization order)."""
 
@@ -487,7 +486,7 @@ class NodeVars:
 
 # ---- the strategy: decides per axis and per edge how to apply the data ------
 @dataclass(eq=False)
-class Strategy:
+class EncodingStrategy:
     """Encodes a graph into a CP model, one node, edge or copy at a time.
     Created by the factory from configuration alone (how each axis is
     enumerated), it holds no graph. `_finalize` walks the graph in today's
@@ -569,7 +568,7 @@ AxisSetting = Literal["table", "lazy", "pruned"]
 class EnumerationFactory:
     """Built from configuration only: how each axis is enumerated, and so
     which strategy implementation encodes it. It is validated once at creation
-    and never sees a graph; `strategy()` returns a `Strategy` with these
+    and never sees a graph; `strategy()` returns an `EncodingStrategy` with these
     settings. The defaults reproduce today's model."""
     division: AxisSetting = "table"          # Phase 2 settings, from config.py (the
     tiling: AxisSetting = "table"            # names are Phase 2's); the defaults
@@ -578,8 +577,8 @@ class EnumerationFactory:
     def __post_init__(self) -> None:
         """Rejects a combination of settings rule 5 does not allow."""
 
-    def strategy(self) -> Strategy:
-        """A Strategy with these settings. Per graph it then pins a set work
+    def strategy(self) -> EncodingStrategy:
+        """An EncodingStrategy with these settings. Per graph it then pins a set work
         split (COMMITTED posts nothing), enumerates a "table" axis over the
         candidates it generates from node.space, and posts a "lazy" axis as
         constraints over node.space. Residency and offset are encoded, not
@@ -668,7 +667,8 @@ class Annealing:
     strategy."""
     seed: int
     budget_seconds: float
-    neighbourhoods: Sequence[Callable[[Strategy], Iterator[dict[Var, int]]]] = ()
+    neighbourhoods: Sequence[
+        Callable[[EncodingStrategy], Iterator[dict[Var, int]]]] = ()
 
 @dataclass(eq=False)
 class BruteForce:
@@ -689,16 +689,16 @@ class GraphSolver(Protocol):
     (greedy, first-fit, best-fit, SA). It reads the nodes, enforces the rules
     a strategy would encode itself (it is built for one configuration, which
     `accepts` checks), and fills the nodes' decisions, as `solve()` does."""
-    def accepts(self, strategy: Strategy) -> bool: ...  # can it handle these axes?
+    def accepts(self, strategy: EncodingStrategy) -> bool: ...  # its config?
     def solve(
-        self, graph: SpyreOptimizationGraph, strategy: Strategy,
+        self, graph: SpyreOptimizationGraph, strategy: EncodingStrategy,
         cost_expr: Optional[sympy.Expr],
     ) -> list[ResourceNode]: ...             # raises SolveError like solve()
 ```
 
-The graph holds only incoming data and decisions. The `Strategy` holds how each axis is
-enumerated (internally), every edge's relations, the candidate copies and all CP state
-(a `NodeVars` per node and per candidate copy, the served literals per edge); the
+The graph holds only incoming data and decisions. The `EncodingStrategy` holds how each
+axis is enumerated (internally), every edge's relations, the candidate copies and all CP
+state (a `NodeVars` per node and per candidate copy, the served literals per edge); the
 `EnumerationFactory`, built from configuration alone, creates it with no graph, and
 `solve` injects the graph into each step, which builds that state from it. For
 table-based axes the strategy generates the candidates and tables itself (until Stage 9
@@ -725,8 +725,8 @@ Notes:
   that stays exact.
 - **Copy order** is every candidate layout sorted by (producer name, `group`), after all
   nodes: today's `sorted(groups.items())` (`allocator.py:4444`), with copies appended
-  after every other buffer. `Strategy.copy_order()` yields it; every copy-dependent
-  step uses it.
+  after every other buffer. `EncodingStrategy.layouts` holds them in that order; every
+  copy-dependent step uses it.
 - `eq=False` on nodes and edges: they reference each other, so they compare by
   identity and get a short custom `__repr__` (name, or `src->dst:kind`).
 - At most one edge joins a pair of nodes; `add_child` refuses a second. An in-place
@@ -873,9 +873,9 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   `SpyreOptimizationGraph`, `build_buffer_graph` → `build_graph`) and reshape it into
   the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
 - Implement the data types of *The model*: aliases, `WorkSplit`, the edges,
-  `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph, plus `Strategy` and
-  `EnumerationFactory` without solver methods. The fixed and table enumerations Phase 1
-  uses are internal to the default strategy.
+  `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph, plus `EncodingStrategy`
+  and `EnumerationFactory` without solver methods. The fixed and table enumerations
+  Phase 1 uses are internal to the default strategy.
 - From the draft: `RelayoutRead` and `Pairs` go into the table strategy's internals;
   `spill_cost(node)` (from `read_count`, `first_use_is_read`, `boundary` and `size`)
   and `sym_is_lx` stay on the node; the per-candidate properties (`per_core_sizes`,
@@ -972,7 +972,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 ### Stage 4. Tiling groups on execution edges
 
 - One per-edge function owns an execution edge's coarse-tiling encoding (it becomes
-  `Strategy.encode_nest` in Stage 6): `same_nest`
+  `EncodingStrategy.encode_nest` in Stage 6): `same_nest`
   and `joined` (today's `samenest_*` / `joined_*`) and the group step
   (`group[after] = group[before] + 1 - joined`). A non-joinable edge starts a new
   segment with group 0. `same_nest` keeps today's `loop_id` encoding, `tile_group_*`
@@ -980,8 +980,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   a menu (copies included, last), in today's order.
 - `_tiling_group_ids` becomes a walk along the execution chain from `graph.first`,
   starting a new segment at the first op and wherever an edge is not `joinable`; the
-  segments are local to the coarse-tiling encoding (`Strategy.tiling_segments` from
-  Stage 6), not a graph method. Its `uses[0]` logic and `RelayoutCopyBuffer` check
+  segments are local to the coarse-tiling encoding (`EncodingStrategy.tiling_segments`
+  from Stage 6), not a graph method. Its `uses[0]` logic and `RelayoutCopyBuffer` check
   go away.
 - `_cut_literals`: for each tiled node, consumers on its edges in the same segment
   get an `apart` literal gated on the edge's view relation; a consumer outside the
@@ -989,18 +989,18 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   nodes.
 - Proto diff empty (coarse-tiling corpus with `auto_coarse_tiling` on).
 
-### Stage 5. `Strategy.encode_node`: the strategy makes node vars
+### Stage 5. `EncodingStrategy.encode_node`: the strategy makes node vars
 
-- Gives the Stage 1 `Strategy` its first methods: `prepare(graph)` (reset and build
-  the enumerations) and the default strategy's `encode_node(node, model)` /
+- Gives the Stage 1 `EncodingStrategy` its first methods: `prepare(graph)` (reset and
+  build the enumerations) and the default strategy's `encode_node(node, model)` /
   `encode_layout(layout, model)`, which `_finalize` calls per node, then per copy in
-  copy order. Each makes and keeps a `NodeVars` in today's emission order
-  (*Finalization order*, step 1):
-  `in_buffer`, `offset`, merge literals, `division`, `eff_size`, `core_cost`, `cores`,
-  split and tile-count vars. It dispatches on the node's division enumeration,
-  replacing the variable-making half of both wrappers: `Table` posts today's index var,
-  element ties and single-candidate constants; `Fixed(COMMITTED)` posts no split vars,
-  which is today's placement-only model (`cores`, `core_cost` `None`, no gates).
+  copy order. Each makes and keeps a `NodeVars` in today's emission order (*Finalization
+  order*, step 1): `in_buffer`, `offset`, merge literals, `division`, `eff_size`,
+  `core_cost`, `cores`, split and tile-count vars. It dispatches on the node's division
+  enumeration, replacing the variable-making half of both wrappers: `Table` posts
+  today's index var, element ties and single-candidate constants; `Fixed(COMMITTED)`
+  posts no split vars, which is today's placement-only model (`cores`, `core_cost`
+  `None`, no gates).
 - `NodeVars` carries `cpsat_expr_printer`'s contract until Phase 2a: `buffer`, a
   read-only view exposing exactly `core_divisions` (the `Table` candidates),
   `sym_core_divs` and `sym_division` (`cpsat_expr_printer.py:249`, `:840`,
