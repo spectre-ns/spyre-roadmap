@@ -134,13 +134,12 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
    `SpyreOptimizationGraph._finalize(model, strategy)`, which runs the `Strategy`'s
    `apply_*` steps over the graph in a fixed order. All encoding, and every CP var and
    literal, lives in the strategy.
-5. **Enumeration is polymorphic, per decision axis.** Nodes do not carry enumerations;
-   the `Strategy` does. For each node and each enumerated axis (the work split: core
-   division and coarse tiling, one axis until 2b; from 2d, relayout choice per
-   edge) it holds an `Enumeration`, data plus `holds(value)` (a query, no model), built
-   from the node's fields (and, for a `Table`, the candidates it generates), and it
-   realizes that
-   enumeration in the model:
+5. **Enumeration is polymorphic, per decision axis, inside the strategy.** Nodes do
+   not carry enumerations and the model defines no enumeration types: how each axis is
+   enumerated is part of a strategy implementation. The enumerated axes are the work
+   split (core division and coarse tiling, one axis until 2b) and, from 2d, relayout
+   choice per edge. A strategy enumerates an axis in one of these ways, decided from
+   the node's fields and the configuration:
    - `Fixed(value)` — known before the solve; posts constants. `Fixed(COMMITTED)` is a
      placement-only buffer: committed upstream by work division, posts nothing.
    - `Table(candidates)` — explicit candidates: an index var plus element ties
@@ -216,7 +215,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import (
-    Callable, ClassVar, Generic, Iterator, Literal, Mapping, Optional, Protocol,
+    Callable, ClassVar, Iterator, Literal, Mapping, Optional, Protocol,
     Sequence, TypeAlias, TypeVar,
 )
 
@@ -229,7 +228,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.work_division import OpSplitSpace
 
-T = TypeVar("T")
 
 # ---- aliases ---------------------------------------------------------------
 SplitKey = sympy.Symbol                      # CoreDivision.splits keys
@@ -422,7 +420,9 @@ class ResidentLayout:
     offset: int                              # alignment units
 
 # =============================================================================
-# The model side: enumerations and their table data, relations, CP state.
+# The model side: relations, CP state and the strategy. How each axis is
+# enumerated (fixed, a table of candidates, lazy, pruned) lives inside the
+# strategy implementations, not here.
 # =============================================================================
 @dataclass(eq=False)
 class RelayoutLayout:
@@ -444,59 +444,6 @@ class RelayoutLayout:
     @property
     def sym_is_lx(self) -> sympy.Symbol:
         return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
-
-# ---- enumerations: one decision axis of one node; data plus a query --------
-class Enumeration(ABC, Generic[T]):
-    """How one decision axis of one node may vary: data plus a `holds(value)`
-    query, with no model. The strategy holds one per node and axis and
-    realizes it in the CP model; `reads` names the other axes it depends on
-    (rule 5)."""
-    reads: ClassVar[frozenset[str]] = frozenset()  # other axes it depends on
-
-    @abstractmethod
-    def holds(self, value: T) -> bool: ...
-
-@dataclass(frozen=True)
-class Fixed(Enumeration[T]):
-    """The value is known before the solve; the strategy posts constants.
-    `Fixed(WorkSplit.COMMITTED)` posts nothing (a placement-only node)."""
-    value: T                                 # Fixed(WorkSplit.COMMITTED) posts nothing
-    def holds(self, value: T) -> bool:
-        return value == self.value
-
-@dataclass(frozen=True)
-class Table(Enumeration[WorkSplit]):
-    """An explicit list of candidate divisions (today's menu): the strategy posts
-    an index var and element ties. The strategy generates the candidates from
-    the node's `space` and keeps them, with any tables over them, as its own
-    implementation detail. Division and tiling share one `Table` until 2b."""
-    def holds(self, value: WorkSplit) -> bool: ...  # one of the candidates
-
-@dataclass(frozen=True)
-class Lazy(Enumeration[WorkSplit]):
-    """Phase 2: no candidates. The strategy posts per-axis split vars over the
-    op's split space and states legality as constraints."""
-    space: OpSplitSpace                      # the node's space
-    def holds(self, value: WorkSplit) -> bool: ...  # the space admits it
-
-@dataclass(frozen=True)
-class Pruned(Enumeration[WorkSplit]):
-    """Phase 2: generate from the space, keep a shortlist, and realize it as a
-    `Table` (today's relayout capping is one). How it ranks and stores the
-    shortlist is the strategy's."""
-    def holds(self, value: WorkSplit) -> bool: ...  # in the shortlist
-
-def tileable(e: Enumeration[WorkSplit]) -> bool:
-    """Some value the division axis allows is tiled (Fixed: its tiling; Table: a
-    candidate's; Lazy / Pruned: the space's)."""
-
-@dataclass(frozen=True)
-class Enumerations:
-    """One node's enumerations, held by the strategy: the work split (core
-    division and tiling, one axis while it is a `Table`, separate from 2b), and
-    from 2d a relayout axis per edge. Residency and offset are not
-    enumerated: they are always-constrained decisions the steps encode."""
-    division: Enumeration[WorkSplit]         # carries tiling while it is a Table
 
 # ---- relations: what an edge's ends must agree on; data plus queries --------
 class ViewRelation(ABC):
@@ -577,21 +524,21 @@ class NodeVars:
 @dataclass(eq=False)
 class Strategy:
     """Encodes a graph into a CP model, one node, edge or copy at a time.
-    Created by the factory from configuration alone (which enumeration each
-    axis uses), it holds no graph. `_finalize` walks the graph in today's
+    Created by the factory from configuration alone (how each axis is
+    enumerated), it holds no graph. `_finalize` walks the graph in today's
     emission order and calls one method per element; only three hooks see the
     whole graph (`prepare`, `encode_no_overlap`, `tiling_segments`). Each
-    method reads the per-solve state below (the two ends' enumerations and
-    vars) and adds to it; nodes and edges stay pure data. For a table-based
-    axis the strategy generates its candidates itself from the graph's
-    incoming data (menus from `node.space`, match tables from the two ops'
-    priced copies from the ops), the work the allocator does today; those
-    tables are its implementation detail."""
+    method reads the per-solve state below (the two ends' vars) and adds to
+    it; nodes and edges stay pure data. How each axis is enumerated (a pinned
+    value, a table of candidates, lazy per-axis constraints, a pruned
+    shortlist) is internal to the strategy implementation, as are the
+    candidates a table-based axis generates from the graph's incoming data
+    (menus from `node.space`, match tables from the two ops' read index maps,
+    priced copies from the ops), the work the allocator does today."""
     division: AxisSetting                    # the configuration, from the factory
     tiling: AxisSetting
     relayout: Literal["data", "pruned", "lazy"]
     # per-solve state, reset by prepare() and filled by the encode_* methods
-    enumerations: dict[ResourceNode, Enumerations] = field(default_factory=dict)
     views: dict[DependencyEdge, ViewRelation] = field(default_factory=dict)
                                              # a pair table when both ends are
                                              # Table, DerivedView otherwise
@@ -604,8 +551,8 @@ class Strategy:
 
     # ---- whole-graph hooks (the only methods that take the graph) ----
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
-        """Reset the per-solve state, build each node's enumerations, and for
-        table-based axes generate the candidates (menus, match tables, candidate
+        """Reset the per-solve state, decide how each node's axes are enumerated,
+        and for table-based axes generate the candidates (menus, match tables, candidate
         copies in copy order). Graph-wide because the pricing loop spans it."""
     def encode_no_overlap(
         self, graph: SpyreOptimizationGraph, model: Model) -> None:
@@ -662,7 +609,7 @@ AxisSetting = Literal["table", "lazy", "pruned"]
 
 @dataclass(frozen=True)
 class EnumerationFactory:
-    """Built from configuration only: which enumeration each axis uses and so
+    """Built from configuration only: how each axis is enumerated, and so
     which strategy implementation encodes it. It is validated once at creation
     and never sees a graph; `strategy()` returns a `Strategy` with these
     settings. The defaults reproduce today's model."""
@@ -674,13 +621,12 @@ class EnumerationFactory:
         """Rejects a combination of settings rule 5 does not allow."""
 
     def strategy(self) -> Strategy:
-        """A Strategy with these settings. Its steps then choose, for each graph
-        they are given: per node, a set decision -> Fixed(value) (so COMMITTED
-        -> Fixed(COMMITTED)); a "table" axis -> a Table over candidates it
-        generates from node.space; a "lazy" axis -> Lazy(node.space). Residency
-        and offset are encoded, not enumerated. Per edge, a pair table when both
-        ends are Table,
-        else a DerivedView."""
+        """A Strategy with these settings. Per graph it then pins a set work
+        split (COMMITTED posts nothing), enumerates a "table" axis over the
+        candidates it generates from node.space, and posts a "lazy" axis as
+        constraints over node.space. Residency and offset are encoded, not
+        enumerated. Per edge: a pair table when both ends are table-based, else
+        a DerivedView."""
 
 # =============================================================================
 # Phase 3a: what solve() runs on
@@ -782,7 +728,7 @@ class Decomposed:
 
 class GraphSolver(Protocol):
     """3a: a solver that works on the graph directly instead of a posted model
-    (greedy, first-fit, best-fit, SA). It reads nodes, enumerations and
+    (greedy, first-fit, best-fit, SA). It reads nodes and the strategy's
     relation queries and fills the nodes' decisions, as `solve()` does."""
     def accepts(self, strategy: Strategy) -> bool: ...  # can it handle these axes?
     def solve(
@@ -791,9 +737,9 @@ class GraphSolver(Protocol):
     ) -> list[ResourceNode]: ...             # raises SolveError like solve()
 ```
 
-The graph holds only incoming data and decisions. The `Strategy` holds every node's
-`Enumerations`, every edge's relations, the candidate copies and all CP state (a
-`NodeVars` per node and per candidate copy, the served literals per edge); the
+The graph holds only incoming data and decisions. The `Strategy` holds how each axis is
+enumerated (internally), every edge's relations, the candidate copies and all CP state
+(a `NodeVars` per node and per candidate copy, the served literals per edge); the
 `EnumerationFactory`, built from configuration alone, creates it with no graph, and
 `solve` injects the graph into each step, which builds that state from it. For
 table-based axes the strategy generates the candidates and tables itself (until Stage 9
@@ -969,8 +915,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   the graph above. Drop `SliceEdge`/`InPlaceEdge`/`CopyEdge`/`Timeline`.
 - Implement the data types and queries of *The model*: aliases, `WorkSplit`, the
   relations, the edges, `RelayoutLayout`, `ResourceNode`, `spill_cost` and the graph,
-  plus the `Enumeration` kinds Phase 1 uses (`Fixed`, `Table`),
-  `Enumerations`, and `Strategy` and `EnumerationFactory` without solver methods.
+  plus `Strategy` and `EnumerationFactory` without solver methods. The fixed and
+  table enumerations Phase 1 uses are internal to the default strategy.
 - From the draft: `RelayoutRead` and `Pairs` go into the table strategy's internals;
   `spill_cost(node)` (from `read_count`, `first_use_is_read`, `boundary` and `size`)
   and `sym_is_lx` stay on the node; the per-candidate properties (`per_core_sizes`,
