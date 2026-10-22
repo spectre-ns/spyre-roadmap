@@ -220,6 +220,75 @@ sequenceDiagram
     A->>A: write back address, spill_reason, chosen_division, chosen_relayouts
 ```
 
+### Worked example: a SwiGLU MLP
+
+The zoo's `mlp_swiglu_128x512x1536`, `(x @ u * silu(x @ g)) @ d`, as the graph holds it
+after a solve. The decisions are real: its probe capture replayed through today's CP-SAT
+solver (`plan_layout_and_core_divisions`, 1.2 s). Offsets are in 128-byte alignment units.
+
+```mermaid
+classDiagram
+    direction LR
+    class x["x = arg0_1 : ResourceNode"]
+    x : produced_at = None, input
+    x : work_split = 16 x 2, 32 cores
+    x : resident = False
+    class buf0["buf0 = x @ u : ResourceNode"]
+    buf0 : produced_at = 0
+    buf0 : work_split = 4 x 8, 32 cores
+    buf0 : resident = True
+    buf0 : offset = 0
+    class buf1["buf1 = x @ g : ResourceNode"]
+    buf1 : produced_at = 1
+    buf1 : work_split = 4 x 8, 32 cores
+    buf1 : resident = True
+    buf1 : offset = 96
+    class buf2["buf2 = silu buf1 : ResourceNode"]
+    buf2 : produced_at = 2
+    buf2 : work_split = 4 x 8, 32 cores
+    buf2 : resident = True
+    buf2 : offset = 192
+    class buf3["buf3 = buf0 * buf2 : ResourceNode"]
+    buf3 : produced_at = 3
+    buf3 : work_split = 4 x 8, 32 cores
+    buf3 : resident = True
+    buf3 : offset = 768
+    class buf4["buf4 = buf3 @ d : ResourceNode"]
+    buf4 : produced_at = 4
+    buf4 : work_split = 4 x 8, 32 cores
+    buf4 : resident = False
+    buf4 : spill_reason = no LX reader
+    class T1["T1 : Transform"]
+    T1 : kind = RELAYOUT
+    T1 : producer = buf3
+    T1 : division = d1 4, replicated
+    T1 : resident = True
+    T1 : offset = 0
+    T1 : start, end = 4, 5
+
+    x --> buf0 : e1
+    x --> buf1 : e2
+    buf1 --> buf2 : e3 in_place
+    buf0 --> buf3 : e4 in_place
+    buf2 --> buf3 : e5 in_place
+    buf3 --> buf4 : e6 transform = T1
+    buf3 ..> T1 : producer
+    T1 ..> buf4 : e6 reads through
+```
+
+- **Nodes** are the six buffers: the graph input `x` (`produced_at = None`, spilled) and
+  five op outputs, each with its decisions. The weights are not in this solve.
+- **Dependency edges** are one per pair. `e3`–`e5` are in-place candidates (`silu` over
+  `x @ g`, the product over either operand); the solver took none of the merges, so each
+  buffer has its own offset.
+- **A transform** sits on `e6`: `buf3` is sliced 4 × 8 across the cores, but the second
+  matmul reads it split only along d1, into 4 parts replicated on all 32 cores. `e6`
+  points at `T1`, a relayout copy of `buf3` resident at offset 0 (free again once `buf0`
+  died) and live for tick 4 only. Another consumer wanting the same view of `buf3` would
+  point at the same `T1`.
+- **Execution edges** (not drawn) chain the op outputs by `produced_at`, `buf0` → … →
+  `buf4`; coarse tiling is off here, so no nests are joined.
+
 ## Design rules
 
 1. **Relations, not tables.** Every relationship is an object over the two ends'
