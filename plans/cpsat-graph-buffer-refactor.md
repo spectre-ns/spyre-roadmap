@@ -1783,6 +1783,44 @@ constraints over small per-buffer domains, never per-pair tables.
     the suites compiles to the same plans as before the merge, under the Stage 0
     harness's determinism (1 worker, no wall-clock limit).
 
+## Future work (not planned)
+
+Both are conversions of the data flowing along a dependency edge, decided by the solve
+and encoded by a strategy, next to the relayouts the edge already carries. Neither
+changes the graph types: the ops' index maps (`node.op`) already say how each side reads
+and writes.
+
+- **Dim-order conversions (transposes) for memory locality.** A consumer whose loop
+  order walks a buffer across its contiguous dimension reads with poor locality
+  (strided, partial sticks). Three places to rotate:
+  - a transpose copy on the edge into the consumer's preferred dim order, placed like a
+    relayout copy (an LX buffer from the transpose to the last reader using it); only
+    that consumer benefits;
+  - a rotated write on the producer, often free if its kernel can emit that order; a
+    node decision that changes the layout every consumer sees;
+  - a rotated read on the consumer (reordered loops), which moves no data but feeds
+    back into its work split.
+
+  Encoding: a decision over the few permutations that make an inner loop contiguous,
+  priced in `cost_expr` (strided-read penalty against transpose cost, from the cost
+  model as relayouts are). The view relation must be computed under the chosen order,
+  since stride order changes which device dims a split lands on, so this needs the
+  per-axis encodings of 2c / 2d; under direct enumeration every permutation multiplies
+  the menu.
+- **Restickification in the solve.** Today layout propagation (`propagate_layouts`,
+  `optimize_restickify`) inserts a restickify as its own op and buffer before LX
+  planning, and the allocator only bars its input from a core-sliced LX residency
+  (`_restickify_barrier`, `allocator.py:1313`). A restickify is the dim-order
+  conversion that moves the stick dimension, so it could become an edge conversion: the
+  builder folds the restickify node into a converted layout of the producer, and the
+  solve trades a restickify, a relayout and an HBM round trip in one model. It needs:
+  - layout propagation to defer the stick choice (each buffer's `FixedTiledLayout`) to
+    the solve, and codegen to accept layouts decided after LX planning;
+  - the cross-core hazard kept: on a restickify edge the producer cannot be core-sliced
+    in LX unless a relayout comes first;
+  - its time accounted for: a restickify is compute with its own tick today, so folding
+    it into an edge removes a tick unless realization puts it back.
+
 ## Probes
 
 All measurement code behind this plan is in **`probes/cpsat-graph/`**, with a README
