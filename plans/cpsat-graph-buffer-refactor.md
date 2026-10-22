@@ -44,9 +44,8 @@ Goal: model the solve as a graph.
   one tiling group, and where a group breaks.
 - **`SpyreOptimizationGraph`** — a collection of nodes (which own the edges), plus the
   global context (alignment, LX capacity). `graph.solve(model, cost_expr, strategy)`
-  returns an `ExecutionPlan`: every node's decisions with nothing left open, the op
-  outputs in execution order, and the copy each read goes through. The graph itself is
-  left as it was.
+  fills every open decision on the nodes (and the copy each read goes through on its
+  edge) and returns the op-output nodes in execution order: the execution plan.
 - **The model side** — everything about *how* decisions are searched lives in the
   `Strategy`, not on nodes and edges: each axis's *enumeration* (`Fixed`, `Table`,
   `Lazy`, `Pruned`, `Open`, with a `Table`'s candidates as its own data), the relations over each edge's ends (`ViewRelation`,
@@ -109,15 +108,15 @@ Work happens in the torch-spyre worktree `.claude/worktrees/cpsat-graph-model` (
      `strategy.apply_op_constraints(node, model)` applies the restrictions for the
      node's kind of op (its `residency_reason`: an op not allowed in LX, a mutation
      target, an empty tensor, min footprint over LX capacity, and so on). The default
-     strategy pins `resident=False` in the model and records the reason; the field
-     stays `None`, and the plan reports the node `Spilled` with that reason. Another strategy may post a restriction as a
-     constraint instead (for example "a split reduction axis ⇒ not resident"), which is
+     strategy pins `resident=False` in the model and records the reason; `solve`
+     then sets `resident=False` and `spill_reason`. Another strategy may post a
+     restriction as a constraint instead (for example "a split reduction axis ⇒ not resident"), which is
      why this lives in the strategy and not at construction. In Phase 1 the reasons
      are the allocator's, as given (rule 2); in Phase 3 they come from the op.
 
-   Decision fields use `None` only for "open", and `solve` never writes them: its
-   answer is the `ExecutionPlan`, whose fields are never `Optional`. The structural `Optional`s are
-   `produced_at` (`None`: a graph input), `space` (`None`: committed upstream) and
+   Decision fields use `None` only for "open"; after a successful `solve` none is
+   `None` (`offset` only when resident, `spill_reason` only when not). The structural
+   `Optional`s are `produced_at` (`None`: a graph input), `space` (`None`: committed upstream) and
    `residency_reason` (`None`: no restriction).
    `Fixed` is an enumeration on a decision axis, not a buffer type: it posts constants
    (or nothing) where an open axis posts vars.
@@ -271,6 +270,8 @@ class DependencyEdge:
     dst: ResourceNode
     kind: DependencyKind
     reads: tuple[ResidencyEdge, ...] = ()    # each read's index map into src (2c)
+    chosen: Optional[RelayoutLayout] = None  # set by solve(): the copy this READ
+                                             # goes through; None = directly
 
 @dataclass(eq=False)
 class ExecutionEdge:
@@ -283,12 +284,13 @@ class ExecutionEdge:
 
 @dataclass(eq=False)
 class ResourceNode:
-    """One buffer an op needs: an op output or a graph input. It holds only
-    incoming data about the buffer and its op (size, lifetime, readers, the
-    cost model's symbols, the op's split space) plus the decisions a caller
-    fixed before the solve. It holds no candidate menu and no CP state; the
-    strategy reads it and applies it to the model. `solve()` never writes to
-    it."""
+    """One buffer an op needs: an op output or a graph input. It holds incoming
+    data about the buffer and its op (size, lifetime, readers, the cost model's
+    symbols, the op's split space) and its decisions. A caller may set a
+    decision before the solve to pin it; `solve()` fills every one left open,
+    so after a successful solve none is `None` (`offset` only when resident,
+    `spill_reason` only when not). It holds no candidate menu and no CP state;
+    the strategy reads it and applies it to the model."""
     # what the resource is: filled by add_node from an allocator buffer (Phase 1)
     # or the torch IR (Phase 3); fixed once built
     name: str
@@ -308,16 +310,24 @@ class ResourceNode:
                                              # generates from); None: committed upstream
     residency_reason: Optional[str] = None   # Phase 1: excluded(buffer); Phase 3: from
                                              # the op; applied by apply_op_constraints
-    # decisions fixed before the solve (None = open). solve() never writes
-    # them; its answer is the ExecutionPlan.
+    # decisions: set before the solve to pin, None = open; solve() fills the rest
     assignment: Optional[Assignment] = None  # COMMITTED when division is fixed upstream
     resident: Optional[bool] = None
-    offset: Optional[int] = None             # alignment units; only with resident=True
+    offset: Optional[int] = None             # alignment units; only when resident
+    spill_reason: Optional[str] = None       # set by solve() when not resident: the
+                                             # residency_reason or _SOLVER_CHOSE_SPILL
+    relayouts: list[ResidentLayout] = field(default_factory=list)
+                                             # set by solve(): copies of this output
+                                             # to insert
     # structure
     prev: Optional[ExecutionEdge] = None     # set by add_successor; None for a graph
     next: Optional[ExecutionEdge] = None     # input and at the chain ends
     inputs: list[DependencyEdge] = field(default_factory=list)
     outputs: list[DependencyEdge] = field(default_factory=list)
+
+    @property
+    def tiling(self) -> Optional[TileSpec]:  # once assignment is set; None for
+        return self.assignment.tiling if self.assignment else None  # COMMITTED
 
     @property
     def sym_is_lx(self) -> sympy.Symbol:
@@ -357,7 +367,7 @@ class SpyreOptimizationGraph:
     """The solve's input: the nodes (which own the edges) in `add_node` order, the
     head of the execution chain, and the global context (alignment, LX
     capacity, solve settings, and from 3c the division mode). `solve` is the
-    only entry point after building and returns an `ExecutionPlan`."""
+    only entry point after building."""
     alignment: int                           # bytes per unit
     capacity: int                            # LX capacity in alignment units
     settings: SolveSettings
@@ -381,9 +391,11 @@ class SpyreOptimizationGraph:
         model: Model,
         cost_expr: Optional[sympy.Expr] = None,  # None or unlowerable: fallback ladder
         strategy: Optional[Strategy] = None,     # None: EnumerationFactory().strategy(
-    ) -> ExecutionPlan:                          # self), which has no table source
-        """_finalize, the objective ladder, extraction. Leaves the graph as it
-        was. Raises SolveError as _run does."""
+    ) -> list[ResourceNode]:                     # self), which has no table source
+        """_finalize, the objective ladder, extraction. Fills every open decision
+        on the nodes and `chosen` on READ edges, and returns the op outputs in
+        execution order: the execution plan. Raises SolveError as _run does,
+        writing nothing."""
 
     def _finalize(self, model: Model, strategy: Strategy) -> None:
         """The strategy's apply_* steps in today's order (Finalization order)."""
@@ -393,52 +405,12 @@ def build_graph(
     settings: SolveSettings,
 ) -> SpyreOptimizationGraph: ...             # Stage 2
 
-# ---- what solve() returns: every decision made, nothing Optional ------------
 @dataclass(frozen=True)
-class Resident:
-    """A buffer that stays in LX, at `offset` (alignment units)."""
-    offset: int                              # alignment units
-
-@dataclass(frozen=True)
-class Spilled:
-    """A buffer that lives in HBM, and why: the node's `residency_reason` when an
-    op constraint barred it, otherwise `_SOLVER_CHOSE_SPILL`."""
-    reason: str                              # the node's residency_reason, or
-                                             # _SOLVER_CHOSE_SPILL
-
-@dataclass(frozen=True)
-class PlannedLayout:
-    """A relayout copy the plan inserts: which candidate layout, and its LX
-    offset. Only resident copies appear."""
+class ResidentLayout:
+    """A relayout copy `solve()` made resident: which candidate copy, and its LX
+    offset. Realizing the plan inserts its copy op."""
     layout: RelayoutLayout
     offset: int                              # alignment units
-
-@dataclass(frozen=True)
-class PlannedNode:
-    """One node's solved decisions, with nothing left open: its division, where it
-    lives, and the relayout copies of its output to insert."""
-    node: ResourceNode
-    assignment: Assignment                   # COMMITTED for a placement-only node
-    residency: Resident | Spilled
-    relayouts: tuple[PlannedLayout, ...]     # resident copies of this output
-
-    @property
-    def tiling(self) -> Optional[TileSpec]:  # None only for COMMITTED
-        return self.assignment.tiling
-
-@dataclass(frozen=True)
-class ExecutionPlan:
-    """What `solve()` returns: a `PlannedNode` per node (op outputs in execution
-    order as `steps`, graph inputs apart), and for each READ edge the copy it
-    reads through (`None`: it reads the buffer directly). Index it by node."""
-    steps: tuple[PlannedNode, ...]           # op outputs in execution order
-    inputs: tuple[PlannedNode, ...]          # graph inputs
-    reads: Mapping[DependencyEdge, Optional[RelayoutLayout]]
-                                             # per READ edge: the copy it reads
-                                             # through; None = directly
-    objective: float                         # the last ladder stage's value
-
-    def __getitem__(self, node: ResourceNode) -> PlannedNode: ...
 
 # =============================================================================
 # The model side: enumerations and their table data, relations, CP state.
@@ -448,8 +420,8 @@ class RelayoutLayout:
     """A candidate relayout copy: the producer's output re-laid-out into another
     per-core view, held as a second buffer in LX from the first read it serves
     to the last (today's copy lifetime, `build_relayout_copy`). It is table
-    data, supplied by a `TableSource`, not on the node; the plan lists the ones
-    made resident. Phase 1 takes it from the allocator's `RelayoutCopyBuffer`;
+    data, supplied by a `TableSource`; `solve()` puts the ones it makes resident
+    on the producer's `relayouts`. Phase 1 takes it from the allocator's `RelayoutCopyBuffer`;
     2d generates it."""
     producer: ResourceNode
     name: str                                # today's copy name (var names, is_lx_*)
@@ -831,12 +803,12 @@ class Decomposed:
 class GraphSolver(Protocol):
     """3a: a solver that works on the graph directly instead of a posted model
     (greedy, first-fit, best-fit, SA). It reads nodes, enumerations and
-    relation queries and returns an `ExecutionPlan`."""
+    relation queries and fills the nodes' decisions, as `solve()` does."""
     def accepts(self, strategy: Strategy) -> bool: ...  # can it handle these axes?
     def solve(
         self, graph: SpyreOptimizationGraph, strategy: Strategy,
         cost_expr: Optional[sympy.Expr],
-    ) -> ExecutionPlan: ...                  # raises SolveError like solve()
+    ) -> list[ResourceNode]: ...             # raises SolveError like solve()
 ```
 
 The graph holds only incoming data and decisions. The `Strategy` holds every node's
@@ -862,8 +834,8 @@ Notes:
 - **Relayouts are layouts, not nodes.** A candidate `RelayoutLayout` is the producer's
   output in a destination view, with its own residency and offset, live from the first
   read it serves to the last. Candidates are table data (the strategy's `layouts`);
-  the `ExecutionPlan` lists the resident ones, and realizing the plan inserts their
-  copy ops (the shuffle directly before its first consumer). Copies do not break
+  `solve` puts the resident ones on their producer's `relayouts` (`ResidentLayout`),
+  and realizing the plan inserts their copy ops (the shuffle directly before its first consumer). Copies do not break
   tiling runs today, and with no copy node on the chain that stays exact.
 - **Copy order** is every candidate layout sorted by (producer name, `group`), after all
   nodes: today's `sorted(groups.items())` (`allocator.py:4444`), with copies appended
@@ -889,7 +861,7 @@ Notes:
   `residency_reason`).
 - `solve(model, cost_expr, strategy)` is the only public entry point after building:
   it runs `_finalize(model, strategy)`, then the **objective ladder**, then
-  extraction into an `ExecutionPlan`. The ladder is one `cost_expr` solve
+  extraction, which fills every open decision. The ladder is one `cost_expr` solve
   (lowered as `_minimize_cost_expr` does today) or, when `cost_expr` is `None` or fails
   to lower, today's fallback: the copy pin, then the residency, cut, parallelism, shape
   and tile-count stages (`ilp_solver_ortools.py:1040-1130`). Each solve is a *ladder
@@ -1076,7 +1048,7 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   | `cd_parent_matches`, `cd_parent_relayouts` | `AllocatorTables.view_table` / `.relayout_reads` per READ edge; the strategy's `TableView` / `TableRelayout` |
   | `in_place_parents` | IN_PLACE edges |
   | `RelayoutCopyBuffer` (whole buffer) | a candidate `RelayoutLayout` from `AllocatorTables.layouts()`, with its name, group, size, read count, division, candidates and lifetime |
-  | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | the `ExecutionPlan`, written to the buffers by Stage 8 |
+  | `chosen_division`, `address`, `spill_reason`, `chosen_relayouts` | node decisions, `relayouts` and edge `chosen`, written back to the buffers by Stage 8 |
   | `residency_edges`, `division_space` | `edge.reads`, `node.space`; first used in 2c / 2f |
   | `tile_reads` | not carried; Phase 2b |
   | `op_position` | replaced by `produced_at` and execution edges |
@@ -1161,8 +1133,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - The wrappers' other readers move onto `NodeVars` and the layouts' vars:
   `_minimize_cost_expr`'s `sym_map` / `buffer_map` (including `_division_of_*` and
   `is_lx_<copy>`), the ladder's term collection and fallback copy pin (layout terms
-  last, in copy order), and `_extract`, which now builds the `ExecutionPlan` (justify
-  units include layouts; the copy per READ edge).
+  last, in copy order), and `_extract`, which now fills the nodes' decisions (justify
+  units include layouts; `chosen` per READ edge).
 - Delete `_LifetimeBufferWithCpVars`, `_CoreDivisionBufferWithCpVars`, `_wrap`,
   `_add_core_division`, `_add_inplace_relaxation`, `_constrain_relayout_copies`, every
   `isinstance(..., RelayoutCopyBuffer/CoreDivisionBuffer)` and every
@@ -1191,11 +1163,11 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   `_run` takes today, plus the strategy (the factory's, with `AllocatorTables` as its
   table source):
   `_finalize(model, strategy)`, the objective ladder (with the fallback copy
-  pin when `cost_expr` is `None` or fails to lower), extraction. It returns an
-  `ExecutionPlan` and leaves the graph unchanged: a `PlannedNode` per node with its
-  `assignment` (so the tiling), `Resident(offset)` or `Spilled(reason)` and its
-  resident copies (`PlannedLayout`); the op outputs in chain order (`steps`); and per
-  READ edge the copy it reads through (`None`: directly).
+  pin when `cost_expr` is `None` or fails to lower), extraction. It fills every open
+  decision: `assignment` (so the tiling), `resident`, `offset` when resident,
+  `spill_reason` when not, the resident copies on `relayouts`, and `chosen` on READ
+  edges (`None`: read directly). It returns the op-output nodes along the execution
+  chain; that list is the execution plan.
 - It builds the CP-SAT solver as `_run` does (time limit, workers from deterministic
   mode or the CPU count, `random_seed=0`, presolve off past
   `config.lx_solver_relayout_presolve_max_copies` free copies) and solves every
@@ -1205,8 +1177,8 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
   into the `CpSat` backend.
 - Failure keeps `_run`'s behaviour: a ladder stage that ends without OPTIMAL or
   FEASIBLE raises `SolveError` naming the stage; a time-limited FEASIBLE incumbent is
-  accepted; a lowering error re-raises when `_cpsat_warn_on_cost_expr` is off. No plan
-  is returned and nothing is written.
+  accepted; a lowering error re-raises when `_cpsat_warn_on_cost_expr` is off. Nothing
+  is written to the nodes or edges.
 - Pre-fixed decisions are `Fixed` enumerations: a concrete `Fixed` division posts a
   constant index (its edges keep their gates, with that side constant);
   `Fixed(COMMITTED)` posts nothing, as above; `Fixed` residency / offset pin their
@@ -1215,12 +1187,12 @@ new `main` (with #5246, lifetime ends become a decision the strategy posts, and
 - `_plan_layout_generic` calls `build_graph`, builds the strategy with
   `EnumerationFactory(tables=AllocatorTables(graph, buffers)).strategy(graph)`, makes
   the model, calls
-  `graph.solve(model, cost_expr, strategy)` and writes the plan to the allocator's
-  buffers: `address` in bytes, `spill_reason`, `chosen_division` only where the caller
+  `graph.solve(model, cost_expr, strategy)` and writes the decisions back to the
+  allocator's buffers: `address` in bytes, `spill_reason`, `chosen_division` only where the caller
   enumerated divisions, `chosen_relayouts` scaled.
-- Tests: pre-fixed decisions are honoured; the plan covers every node; `steps`
-  matches `produced_at` order; the graph is unchanged after `solve`; an infeasible pin
-  raises `SolveError`.
+- Tests: pre-fixed decisions are honoured; every open decision comes back filled; the
+  returned order matches `produced_at`; an infeasible pin raises `SolveError` and
+  leaves every open decision `None`.
 - Device-suite check: CP-SAT's joined runs *refine* `derive_tiling_groups` on the same
   choices, mismatches logged. Equality is not guaranteed today: CP-SAT approximates
   tile-by-tile reads through the view tables and never consults `tile_misread` (a
@@ -1623,7 +1595,7 @@ constraints over small per-buffer domains, never per-pair tables.
       check holds; switching it to the real `cost_expr` is a later step of its own
       that lists the tests whose expectations change.
   - **Graph solvers.** A second kind behind `set_solver`: solvers that read nodes,
-    enumerations and relation queries directly and return an `ExecutionPlan` (greedy,
+    enumerations and relation queries directly and fill the nodes' decisions (greedy,
     first-fit, best-fit, SA placement, `SaCoOptimizingSolver`, `Decomposed`'s heuristic
     inner solver). `graph.solve` runs them in place of `_finalize` and the ladder; the
     greedy fallback after a `SolveError` is the greedy graph solver.
@@ -1682,7 +1654,7 @@ constraints over small per-buffer domains, never per-pair tables.
   in-place parents, paired members) and write `address` back in bytes; the SA
   solvers' native packer reads that view. Greedy drops its isinstance at :183.
 - **3e. Exhaustive search and the SA co-optimizer** read relations through the
-  strategy and return an `ExecutionPlan`; SA's `_spill_cost` becomes
+  strategy and fill the nodes' decisions; SA's `_spill_cost` becomes
   `buffer_graph.spill_cost(node, size=<bytes>)` with its `max(0, …)` clamp, and its op
   adjacency moves onto execution edges.
 - **3f. Tests**: about 195 constructor calls across 15 files, mostly direct (131 in
