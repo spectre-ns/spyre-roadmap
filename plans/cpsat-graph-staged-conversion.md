@@ -11,7 +11,7 @@ structure works. It cannot land as it is:
 - It is too large to review: about 100 files, +13k / −25k lines against `main`. Phase 1
   is a single squashed commit (`9dab5027`).
 - It changes behaviour:
-  - default compiles plan 21-30% slower;
+  - default compiles plan 21–30% slower;
   - the greedy fallback is gone, and nothing goes in LX without ortools;
   - committed mode is priced like the open mode;
   - completed-reduction relayouts are lost.
@@ -22,62 +22,77 @@ structure works. It cannot land as it is:
 This plan lands the structure on `main` in small PRs. Every PR keeps the CP model
 byte-identical and the committed plans identical. It implements five things:
 
-1. **An injectable backend.** The pywraplp-shaped protocol from the PR, with CP-SAT as
-   its only implementation for now.
-2. **One allocator class over the table strategy.** The enumerated menus and pair
-   tables are the only encoding; there is no `Lazy`.
+1. **One integrated graph solver over an injectable OR-Tools backend.** The backend
+   protocol is pywraplp-shaped, so any OR-Tools-compliant solver can implement it.
+   CP-SAT is the first backend.
+2. **One allocator class.** The co-optimizing allocator's division code moves into
+   `CoreDivisionStrategy`; it is today's table encoding (menus and match tables), and
+   there is no `Lazy`.
 3. **A graph that generates the `CoreDivisionBuffer`s itself.**
 4. **`DependencyEdge`s and `ExecutionEdge`s.**
 5. **Placement-only and co-optimizing as strategies.** They replace the two allocator
    classes and their `division_is_fixed` and capability-flag branches.
 
 Decisions (2026-10-23):
-- CP-SAT is the only pywraplp backend.
+- The graph solver is the only integrated solver. CP-SAT is its first backend.
 - Greedy, first-fit, best-fit, placement SA, the SA co-optimizer and exhaustive search
-  stay outside the graph model. They are fed by the buffers the graph generates. Greedy
-  stays the fallback after a failed solve.
+  stay outside the graph model. They are fed by the buffer records the strategies
+  generate. Greedy stays the fallback after a failed solve.
 - Placement-only reproduces today's plans exactly. `CO_OPTIMIZING_LX_PLANNING=0` stays
   usable for bisecting a miscompile.
-
-How the items read:
-- **Item 2:** after Stage 6 there is one `ScratchpadAllocator`. Its co-optimizing
-  strategy produces the table data (menus, match tables, capped relayout copies).
-  `TableStrategy` encodes that data for CP-SAT.
-- **Item 3:** the graph builder, not the allocator, makes every buffer record, and a node
-  references its record.
+- Strategies come in increasing order of difficulty, and each one extends the last:
+  placement first, then core division, then co-optimization (relayouts and coarse
+  tiling).
+- The new encodings are written beside today's CP-SAT code, not by refactoring it in
+  place. Each one is checked against today's model on the same input, and today's code
+  is deleted once both entry points delegate.
 
 Compatibility with the non-enumerating end state:
-- Menus stay inside the records, and only `TableStrategy` reads them.
+- Menus stay inside the records, and only `CoreDivisionStrategy` reads them.
 - Node and edge decisions are `WorkSplit`s and relayout choices, never menu indices.
 - A later `Lazy` strategy can skip generating the records.
+
+## Terms
+
+| Term | Meaning | Replaces |
+|---|---|---|
+| graph | `SpyreOptimizationGraph`: `ResourceNode`s, `DependencyEdge`s and `ExecutionEdge`s. It holds incoming data and decisions, with no candidates and no solver state. | the allocator's buffer lists, as the solver's input |
+| graph solver | The one integrated solver. It runs a strategy over the graph on a backend, then the objective ladder, then extraction onto the nodes. | `CpSatLayoutSolver`'s model code (the class stays as the entry point) |
+| backend | An OR-Tools solver behind the pywraplp-shaped protocol. `CpSat` is the first. | direct `cp_model` calls |
+| strategy | Which decisions are open, how the others are filled before encoding, where the candidates come from, and how the open decisions are encoded. | the two allocator classes, `division_is_fixed`, and the old plan's `TableStrategy` and `EncodingStrategy` |
+| encoding | The part of a strategy that posts to the backend. | the CP-SAT wrappers' constraint code |
+| record | A `LifetimeBoundBuffer`, `CoreDivisionBuffer` or `RelayoutCopyBuffer`. A node references its record, and solvers outside the graph model read records. | — |
+
+The three strategies:
+
+| Strategy | Open decisions | Filled before encoding | Used for |
+|---|---|---|---|
+| `PlacementStrategy` | residency, offset, in-place merges | the work split (the division work division already chose); no tiling; no relayouts | `co_optimizing_lx_planning=0` |
+| `CoreDivisionStrategy` | the above, plus the work split (today's table: menu index and match tables) | no tiling; no relayouts | co-optimizing with `SPYRE_LX_PLANNER_RELAYOUT=0` and coarse tiling off |
+| `CoOptimizingStrategy` | the above, plus relayouts and coarse tiling | nothing | `co_optimizing_lx_planning=1` (the default) |
 
 ## Order
 
 | # | Stage | Item | Needs | Proven by |
 |---|---|---|---|---|
 | 0 | Harness and gates | — | — | — |
-| 1 | Backend seam | 1 | 0 | proto + solver parameters |
-| 2 | Graph and dependency edges; CP-SAT reads them | 4 | 0 | proto |
-| 3 | Execution edges; CP-SAT's tiling walks read them | 4 | 2 | proto (tiling corpus) |
-| 4a | `TableStrategy` makes node vars, posting through the protocol | 1, 4 | 1, 3 | proto |
-| 4b | The remaining hooks; the wrappers are deleted | | 4a | proto |
-| 4c | `graph.solve`; `CpSatLayoutSolver` becomes an adapter | | 4b | proto + plans |
-| 5a | Shared rules and cross-method state extracted | 5 | 0 | plans |
-| 5b | `PlacementOnlyStrategy`; the allocator delegates its five mode hooks | 5 | 5a | plans |
-| 5c | `CoOptimizingStrategy`; the co-opt methods move | 5 | 5b | plans |
-| 6 | One allocator; capability rules in the strategies | 2, 5 | 5c | plans |
-| 7 | The graph generates the buffers | 3 | 4c, 6 | proto + plans |
+| 1 | The graph: nodes, dependency and execution edges | 4 | 0 | structural tests |
+| 2 | Graph solver, OR-Tools backend, `PlacementStrategy` | 1, 5 | 1 | parity with `plan_layout` |
+| 3 | Allocator prep: shared rules and state | — | 0 | plans |
+| 4 | `CoreDivisionStrategy`, pulled from the allocator | 2, 5 | 2, 3 | parity with the joint solve, relayouts and tiling off |
+| 5a | `CoOptimizingStrategy`: relayouts | 5 | 4 | parity, relayouts on |
+| 5b | `CoOptimizingStrategy`: coarse tiling | 5 | 5a | parity, `AUTO_COARSE_TILING=1` |
+| 5c | Today's CP-SAT model code deleted | — | 5b | recorded protos |
+| 6 | One allocator | 2, 5 | 5b | plans |
+| 7 | The graph generates the buffers | 3 | 6 | protos + plans |
 | 8 | Cleanup | — | all | — |
 
-There are 13 PRs in two independent tracks, which meet at Stage 7:
-- **CP-SAT internals (1-4)**, proven by an identical proto.
-- **Allocator (5-6)**, proven by identical plans.
+That is 11 PRs.
 
-Two ordering choices:
-- **Stage 5 comes before 7** so that the co-optimizing build code moves once: into its
-  strategy, which the builder then calls.
-- **Protocol posting lands with `TableStrategy` (4a/4b)** so that every posting line
-  changes once; #5246's hooks have to be re-derived from `main` anyway.
+- Stage 3 can run any time after Stage 0, in parallel with Stages 1–2.
+- **Parity** means that today's model and the graph solver's model, built from the same
+  records in one process, have identical protos and identical decisions. The check is a
+  device-free test in CI, so the two cannot drift while both exist (Stages 2–5b).
 
 ## Stages
 
@@ -92,10 +107,11 @@ Line numbers refer to `main` at `16926127`. #5183 (`58afed9e`) inserts lines int
   proto, status, objective and decisions. Add a record of the solver parameters (time
   limit, workers, presolve, seed), taken **before** the harness forces one worker and
   the deterministic limit.
-- **Recorded suites.** Add `test_work_division`, which holds #5246's tests, and
-  `test_coarse_tiling` to `record_tests.sh`.
-- **Captures.** Re-capture smoke, zoo default and tiling, and Granite on current `main`
-  (`deenum/run_profile.sh`). Replay the tiling captures, not only `caps_smoke`.
+- **Corpus.** The unit-test solves, the synthetic co-optimization graphs, the capture
+  loader's graphs, and fresh captures from current `main` (`deenum/run_profile.sh`):
+  smoke, zoo default and tiling, and Granite. The parity tests in later stages replay
+  this corpus. Add `test_work_division` (#5246's tests) and `test_coarse_tiling` to
+  `record_tests.sh`.
 - **Same-plans check.** Promote `plan_record.py`, `same_plans.sh` and `compare_plans.py`
   from `probes/cpsat-graph/feasibility/` and extend them:
   - Record **after** `_push_allocation` as well, so that inserted clones, drain clones,
@@ -108,214 +124,242 @@ Line numbers refer to `main` at `16926127`. #5183 (`58afed9e`) inserts lines int
 - **Tooling.** Parameterize `freeze.sh` and `gate.sh`, which hard-code the experimental
   worktree.
 
-### Stage 1. Injectable backend seam (item 1)
+### Stage 1. The graph (item 4)
 
-- **New `backend.py`.** It holds the `Backend` protocol and `CpSat`, lifted from
-  `a47ef8f2` `backend.py` (up to :175).
-  - **Guard the ortools import** as `ilp_solver_ortools` does, and drop `pywraplp`,
-    `cp_model_pb2` and `text_format`.
-  - Resolve the default backend lazily, so the no-ortools paths do not change.
-  - Not lifted: `_SolvedRecording`, Mip, BruteForce, Annealing.
-- **What goes through the backend:**
-  - `CpModel()` (:744) and `CpSolver()` (:1312);
-  - the solver parameters: time limit :1313, presolve rule :1320-1335, workers :1336,
-    seed :1342;
-  - `Solve` (:1283), status names and constants, the `model.proto` and parameter reads
-    in `_solve_and_record`, and the `Value` / `BooleanValue` reads;
-  - #5183's `clone()`, second `CpSolver`, `parameters.copy_from` and `Solve`, through a
-    raw `CpSat.solver` / `CpSat.model`.
-- **Injection.** `CpSatLayoutSolver(..., backend=None)` takes a factory that defaults to
-  a module-level `CpSat`.
-- **Unchanged:**
-  - `cpsat_expr_printer` keeps cp_model's expression algebra (`new_int_var_from_domain`,
-    the multiplication and division equalities, its `isinstance` checks). While CP-SAT
-    is the only backend, those types are the protocol's `Var` / `LinearExpr`.
-  - The `ilp_solver_ortools.cp_model` attribute stays: 10 test sites set it to `None`.
-  - Tests that patch `CpSolver.Solve` or assert the parameters keep working
-    (`test_scratchpad_use.py:1423`, `test_solver_relayout_decision.py:187/222`).
-  - The harness stays patch-based.
-- **Check:** proto diff empty, and the parameter records are equal.
+The whole structure lands at once, so the encoding tests in later stages run on a
+complete graph. No solver changes in this stage. It is a redesign of the branch's
+`buffer_graph.py`, not a trim: the branch has no `node.buffer`, and its copies are not
+records.
 
-### Stage 2. Graph and dependency edges; CP-SAT reads them (item 4)
-
-**New `buffer_graph.py`.** This is a redesign of the branch's version, not a trim: the
-branch has no `node.buffer`, and its copies are not records.
-- **`WorkSplit`** carries every `CoreDivision` field. That includes `reduction_syms` and
-  `tile_splits`, which the branch's `of` drops. The record still gets the menu index.
+**New `buffer_graph.py`:**
+- **`WorkSplit`** carries every `CoreDivision` field, including `reduction_syms` and
+  `tile_splits`, which the branch's `of` drops. `COMMITTED` marks a split chosen by work
+  division.
 - **`ResourceNode`** has:
   - incoming data: name, size in units, start and end with overrides, `read_count`,
     `first_use_is_read`, `boundary`, `produced_at`, `residency_reason`, `untiled_bar`;
   - decisions: `work_split`, `resident`, `offset`, `spill_reason`;
   - links: `prev` / `next` and `inputs` / `outputs`;
-  - `buffer`: its record, in units, read only by the encoding.
-- **`DependencyEdge`** has `src`, `dst`, `reads` (a count, since a parent can be listed
-  twice), `in_place` (`reads == 0` allowed), and the decisions `merged` and `relayout`.
-- **`ExecutionEdge`** is used from Stage 3.
-- **`SpyreOptimizationGraph`:**
-  - `copies` holds the relayout copies in copy order, kept off the chain;
-  - `buffers()` returns the records.
-- **`build_graph(buffers, alignment, capacity)`.**
+  - `buffer`: its record, read only by the strategies.
+- **`DependencyEdge`** has `src`, `dst`, `reads`, `in_place`, and the decisions `merged`
+  and `relayout`.
+  - `reads` is a count, because a parent can be listed twice.
+  - An in-place edge may have `reads == 0`.
+- **`ExecutionEdge`** has `before`, `after` and `contiguous`.
+  - The chain is the op outputs in tick order. Op-output ticks are unique
+    (`utils.py:73-110`).
+  - Graph inputs and relayout copies are not on the chain.
+  - `contiguous` means consecutive ticks. Whether two ops can share a nest is decided by
+    the coarse-tiling encoding (Stage 5b), not by the graph.
+- **`SpyreOptimizationGraph`** has:
+  - `nodes`;
+  - `copies`: the relayout copies, in copy order;
+  - `first` and `execution_chain()`;
+  - `buffers()`: the records, in the allocator's order.
+- **`build_graph(records, alignment, capacity)`.** The edges come from the records: a
+  read from each listed `parents` entry (only `CoreDivisionBuffer`s carry `parents`),
+  and an in-place edge from `in_place_parents`.
 
-**CP-SAT reads the dependency edges.** `_plan_layout_generic` builds the graph from the
-wrapped copies.
-- These read `node.outputs` instead of `children_of`:
-  - `_add_tiling` (:921);
-  - `_cut_traffic_terms` (:1232, and `len(kids)` at :1248);
-  - `_add_lifetime_ends` (:1142);
-  - `_add_core_division` (:1733).
-- The `apart_` / `via_full_` literals (:930, :942) become per read edge.
-- `_relayout_copies` (:1492) reads `graph.copies`.
-- The in-place loop reads `edge.in_place`.
-- `_get_children` and `_relayout_copies` are deleted.
+**Tests:** a new `test_buffer_graph.py`, registered in `tests/configs`. It checks:
+- the edges against `_get_children`;
+- `in_place` against `in_place_parents`;
+- the chain against the op order today's tiling walks use;
+- read counts;
+- that `add_child` / `add_successor` refuse duplicates.
 
-**Exactness rules:**
-- A read edge exists only when the child has a menu: the base wrapper's `parents` is
-  `[]` (:350).
-- Every consumer iterates once per listed read.
-- `via_full[child]` stays last-write-wins.
+### Stage 2. Graph solver, OR-Tools backend and `PlacementStrategy` (items 1 and 5)
 
-**Tests and check:**
-- New `test_buffer_graph.py`, with its `tests/configs` YAML. It checks the edges
-  against `_get_children` before that function is deleted.
-- Proto diff empty.
+**New `backend.py`.** It holds the pywraplp-shaped `Backend` protocol and `CpSat`, lifted
+from `a47ef8f2` `backend.py` (up to :175).
+- Guard the ortools import as `ilp_solver_ortools` does, and drop the MPSolver-only
+  imports.
+- Resolve the default backend lazily, so the no-ortools paths do not change.
+- The protocol is what another OR-Tools solver implements (the `pywraplp` MPSolver
+  backends: SCIP, HiGHS, CBC). None is built here; see *Out of scope* for what one needs.
 
-### Stage 3. Execution edges; the tiling walks read them (item 4)
+**New `graph_solver.py`.** `GraphSolver(backend_factory).solve(graph, strategy,
+cost_expr)` runs these steps:
+1. The strategy fills the decisions it does not open.
+2. Its encoding posts the open ones, in today's emission order.
+3. The objective ladder runs. The stages are today's (:1369-1450), with no tiebreak
+   solves, and each strategy contributes the terms of the stages it opens.
+4. Extraction writes the decisions onto the nodes and edges and returns the op outputs
+   in execution order.
 
-- **The chain** is the op outputs in tick order. Op-output ticks are unique
-  (`utils.py:73-110`), and graph inputs and copies are not on it.
-- **`contiguous`** means a tick difference of 1 *and* a tileable predecessor. That
-  reproduces `_add_tiling_groups` (:1071-1108), including the gaps left by ops with no
-  node.
-- **Walk the chain:**
-  - the group derivation (:1051);
-  - `_add_nest_ends` (:990);
-  - `_add_nest_starts` (:1023).
+It also covers:
+- the solver parameters (time limit, workers, seed, presolve rule), set as `_run` sets
+  them today (:1312-1342);
+- #5183's uniqueness probe, over the strategy's decision variables;
+- `SolveError` as the only failure.
 
-  The `tile_group_` domain stays `len(position)` (:1102).
-- **Keep node order**, because unit-test lists are not in tick order:
-  - `loop_id` / `tiled` (:898-910);
-  - the cut loop (:915);
-  - the per-node `_add_partial_reduction_cut_guard` (:961);
-  - `_tile_count_terms`.
-- **Check:**
-  - proto diff empty on the tiling captures and on `test_work_division` /
-    `test_coarse_tiling`;
-  - then the device suites.
+**`PlacementStrategy`:**
+- **Fill:** each node's `work_split` is `COMMITTED`, with no tiling and no relayouts.
+- **Encoding**, per node:
+  - the residency literal, the offset, and a merge literal per in-place input;
+  - the merges: offset equality, both ends resident, and at-most-one in and out;
+  - capacity;
+  - the 2-D no-overlap, with the incoming-merge shortening;
+  - the exclusions from `record_exclusions()`, pinned with their reasons;
+  - a node with an `untiled_bar` pinned out, since nothing here can tile it
+    (:1724-1731); its spill reason is the bar (:760-761);
+  - the residency stage (spill cost).
 
-### Stage 4. `TableStrategy` and `graph.solve`
-
-**4a. Node vars.** New `table_strategy.py` holds `TableStrategy` with `prepare` and
-`encode_node`.
-- It posts through the protocol's PascalCase methods, which pass through to CP-SAT.
-- Each node gets a `NodeVars` in the wrappers' creation order. That includes #5246's
-  `loop_id`, `tiled`, `cut`, `nest_start` / `nest_end`, `via_full`, `start`, `end` and
-  `slot_span`.
-- A node without a menu is `Fixed(COMMITTED)`.
-- `NodeVars.division` and a lazily cached `division_is` keep the printer's duck typing,
-  in the same creation order.
-- The wrappers delegate to `NodeVars`.
-
-**4b. The rest of the encoding.**
-- **Hook order** follows `_run` (:1301-1310): tiling, lifetime ends, in-place plus the
-  2-D no-overlap, core division with read gates and op constraints, relayout copies,
-  tile-count terms.
-- **Printer:** its `sym_map` / `buffer_map` come from `NodeVars`, and the model stays
-  live if lowering fails partway (:810-837).
-- **Uniqueness probe:** per-node `decision_variables` feed #5183's probe. Its warning
-  stays on the `ilp_solver_ortools` logger (`test_scratchpad_solver.py:2867`).
-- **Deleted:** the wrappers, `_wrap` and the `isinstance` dispatch.
-- **Tests updated:**
-  - `test_cooptimization_types.py:358-367` (`_LifetimeBufferWithCpVars`);
-  - `test_scratchpad_solver.py:2009` (`_gate_divisions`).
-- **From the branch:** hooks lift from `9dab5027` `encoding_strategy.py` only where #5246
-  did not touch the model.
-
-**4c. `graph.solve(backend, cost_expr, strategy)`.**
-- It runs `_finalize`, then today's ladder unchanged (:1369-1450, no tiebreak solves),
-  then `_extract` onto the nodes and edges.
-- `CpSatLayoutSolver` stays the **only** CP-SAT entry point: `plan_layout*` →
-  `build_graph` (or a prebuilt graph, from Stage 7) → `graph.solve` → write-back
-  (:753-770). The write-back is the only place that touches records.
-- Kept as they are:
-  - `record_exclusions()` (:742);
-  - `last_solve_stats`, including `{}` for an empty solve and `NOT_LINEARIZABLE`;
-  - the ImportError check;
-  - `SolveError` as the only failure.
+**`CpSatLayoutSolver.plan_layout`** delegates to `GraphSolver` with `PlacementStrategy`
+when no record carries a menu. The class stays the only CP-SAT entry point, so the
+harness, `last_solve_stats`, `record_exclusions()`, the ImportError check and the dump
+are unchanged.
 
 **Check:**
-- After each sub-stage: proto diff empty and the same plans.
-- After 4c also: the 18 `test_inductor_ops_lx_*` shards, and zoo planning time before
-  vs after.
+- The parity test (`test_graph_solver_parity.py`, device-free, in CI). On every corpus
+  input without menus, `plan_layout`'s model and the graph solver's model must be
+  identical and give identical decisions.
+- Same plans for `co_optimizing_lx_planning=0` with `layout_solver=cpsat`.
 
-### Stage 5. Placement-only and co-optimizing strategies (item 5)
+### Stage 3. Allocator prep (no behaviour change)
 
-**5a. Extraction only.**
+`CoreDivisionStrategy` pulls code out of `CoOptimizingAllocator`, but the two allocator
+classes share state that a plain move would break. This stage gives that state an
+explicit home first.
 - **Shared rules.** The residency and in-place helpers go to a rules module that both
   modes use: `_get_op_name`, `_op_inputs_good_for_lx_inplace`, `_inplace_edge_ok`,
   `_residency_reasons`, `_untiled_residency_bar`, `_input_residency_reason`.
 - **Mode value.** The `division_is_fixed` branches read a mode value there: 1089, 1102,
   1158, 1230 / 1237, 1283, and the drain validator at 439.
-- **`_loop_carry_update_edge`** becomes a module function. `_assert_drain_plan_committed`
-  calls it (:725), and moving it with the class would create an import cycle.
+- **`_loop_carry_update_edge`** (4135) becomes a module function.
+  `_assert_drain_plan_committed` calls it (:725), and moving it with the class would
+  create an import cycle.
 - **Cross-method state** gets one explicit home that the base class reads:
-  - `_validated_drain_plans`: set at 2968, read at 1944, 3349 and 3790; a verbatim move
-    would leave `_push_allocation` reading `{}` and drop the drain clones;
-  - `_relayout_pair_costs`;
+  - `_validated_drain_plans`: set at 2968, read at 1944, 3349 and 3790. Moved
+    verbatim, `_push_allocation` would read `{}` and silently drop the drain clones.
+  - `_relayout_pair_costs` (2948);
   - `_prescribed_ops` / `_readers_by_name`;
   - `_relayout_view_groups`;
   - `layout_planning`, `size` and `prune`.
+- **Check:** same plans, including the post-push graph.
 
-**5b. `PlacementOnlyStrategy`.**
-- It takes the five mode hooks: `_prepare_buffers` 868, `_solve` 897,
-  `_finalize_lx_relayout_allocation` 901, `_post_solve` 933, `_get_spill_reasons` 942.
-- `ScratchpadAllocator` delegates them to `self.strategy`.
+### Stage 4. `CoreDivisionStrategy`, pulled from the allocator (items 2 and 5)
 
-**5c. `CoOptimizingStrategy`.**
-- **What moves into `co_optimizing.py`:**
-  - the overrides: 2957, 3047, 3282, 3333, 3353;
-  - menus; match tables, carries and clones; relayout candidates and copies; pricing;
-  - the build → price → pin → rebuild loop and `_build_cd_bound_buffers`.
-- **The cost dump** keeps today's name (`type(self).__name__`, :3219).
-- **`CoOptimizingAllocator`** shrinks to `ScratchpadAllocator` plus this strategy.
-- **Tests:** about 70 references in 13 files move with the code. Moved code binds the new
-  module's names, so test patches move too.
+It extends `PlacementStrategy` and opens the work split. The old plan's `TableStrategy`
+is this strategy's encoding, not a strategy of its own: the menus and match tables are
+how core divisions are chosen today.
 
-**Check:**
-- Same plans, including the post-push graph and the fallback.
-- Protos identical.
-- Unit and device suites.
+**Candidates, pulled from `CoOptimizingAllocator`:**
+- menus: `_division_map` (3376), `_enumerate_core_divisions` (3511),
+  `_tiling_candidates` (3588) and `_division_space` (4303);
+- match tables: `_cd_parent_matches` (4475) and `_parent_residency_edges` (4445);
+- loop carries: 4135 and 4185;
+- clones: 4324 and 4344;
+- `_residency_by_buf` (3729);
+- the build → price → pin → rebuild loop (2981-3012) and `_build_cd_bound_buffers`
+  (3758);
+- the pricing behind the cost expression: 3015, 3032, 3237, and the cost bundle in
+  `_solve` (3047).
 
-### Stage 6. One allocator; capability rules in the strategies (items 2 and 5)
+The SA co-optimizer and exhaustive search read the same records, so they keep working
+unchanged.
 
+**Encoding:**
+- the menu index and its element ties: footprint, cores, core cost, and split and
+  tile-count vars;
+- the cached `division_is` literals that `cpsat_expr_printer` duck-types;
+- the read gates (match tables) and the in-place view gates;
+- the parallelism and shape ladder stages;
+- the cost expression, through the printer's `sym_map` / `buffer_map`. The model stays
+  live if lowering fails partway (:810-837).
+
+**Fill:** no relayouts and no tiling.
+
+**Check:** parity with `plan_layout_and_core_divisions` under `SPYRE_LX_PLANNER_RELAYOUT=0`
+with coarse tiling off. That configuration then delegates.
+
+### Stage 5. `CoOptimizingStrategy`: relayouts and coarse tiling (item 5)
+
+It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
+
+**5a. Relayouts.**
+- Candidates: `_cd_parent_relayouts` (4606), `_cap_relayout_groups` (4497),
+  `_relayout_consumer_costs` (4572), `_views_for_divs` (4875) and
+  `_relayout_copy_buffers` (4226).
+- The copies become `graph.copies`.
+- Encoding:
+  - the served literals and the "match or served" gates;
+  - copy use (today's `_constrain_relayout_copies`);
+  - the relayout charges in the cost, and the fallback copy pin.
+- After the solve: `_finalize_lx_relayout_allocation` (3282).
+- Check: parity with relayouts on and tiling off.
+
+**5b. Coarse tiling.** Re-derive it from `main`'s #5246 code; the branch has none.
+- `loop_id` / `tiled`.
+- Groups, nest ends and nest starts along the execution edges: `_add_tiling_groups`
+  (:1051), `_add_nest_ends` (:990), `_add_nest_starts` (:1023).
+  - Grouping uses consecutive ticks with a tileable predecessor, which reproduces
+    :1071-1108.
+  - The `tile_group_` domain stays `len(position)` (:1102).
+- The cut literals, with `apart_` / `via_full_` per dependency edge (:930, :942).
+- The per-node partial-reduction guard (:961).
+- The `untiled_bar` rule: a node with a bar that can be tiled is resident only when tiled
+  (:1728-1731).
+- Lifetime ends and slots (`_add_lifetime_ends` :1142, `_Slots`).
+- The tile-count and cut-traffic terms, and the cut stage.
+- After the solve: `apply_chosen_tilings`.
+- Only the group and nest walks follow the chain. `loop_id` / `tiled`, the cut loop and
+  the tile-count terms keep node order, because unit-test record lists are not in tick
+  order.
+- Check: parity with `AUTO_COARSE_TILING=1`, on the tiling captures and on
+  `test_work_division` / `test_coarse_tiling`.
+
+**5c. Today's model code is deleted.** `plan_layout_and_core_divisions` delegates fully.
+- Deleted: the wrappers, `_wrap`, the model posting in `_run`, `_get_children` and
+  `_relayout_copies`.
+- Tests updated: `test_cooptimization_types.py:358-367` (`_LifetimeBufferWithCpVars`)
+  and `test_scratchpad_solver.py:2009` (`_gate_divisions`).
+- The parity test becomes a recorded-baseline test.
+- Check: the recorded protos and plans equal, and the 18 `test_inductor_ops_lx_*` shards
+  pass.
+
+### Stage 6. One allocator (items 2 and 5)
+
+- **The remaining mode hooks move into the strategies.**
+  - `PlacementStrategy` takes `ScratchpadAllocator`'s: `_prepare_buffers` 868, `_solve`
+    897, `_finalize_lx_relayout_allocation` 901, `_post_solve` 933 and
+    `_get_spill_reasons` 942.
+  - `CoOptimizingStrategy` takes whatever is left of `CoOptimizingAllocator`'s overrides
+    (2957, 3047, 3282, 3333, 3353).
+  - The cost dump keeps today's name (`type(self).__name__`, :3219).
 - **`CoOptimizingAllocator` is deleted.** `select_allocator` returns
   `ScratchpadAllocator(solver_cls, strategy, post_optimization_passes)`.
-- **Its mode and solver rules become `strategy.accepts(solver_cls)`** (4978-5012). They
+  - The CP-SAT path runs the graph solver.
+  - The solvers outside the graph model take the strategy's records.
+- **The mode and solver rules become `strategy.accepts(solver_cls)`** (4978-5012). They
   cover:
   - the SA co-optimizer, which gets no post-passes;
   - exhaustive wrapping;
-  - the `ValueError` for co-optimization without a division-capable solver, which is also
+  - the `ValueError` for co-optimizing without a division-capable solver, which is also
     what happens without ortools.
-- **Checked in `select_allocator` only, not in the constructor.** Tests build
-  `CoOptimizingAllocator(GreedyLayoutSolver, …)` (`test_scratchpad_solver.py:241`,
+
+  They are checked in `select_allocator` only, not in the constructor, because tests
+  build `CoOptimizingAllocator(GreedyLayoutSolver, …)` (`test_scratchpad_solver.py:241`,
   `test_work_division_hint.py:815`).
 - **Each capability flag** is read only inside the strategy that uses it.
 - **The greedy fallback** keeps `post_optimization_passes` (5058-5062).
-- **Tests:** the constructors in the 13 test files move.
+- **Tests:** about 70 references in 13 files move with the code. Moved code binds the new
+  module's names, so test patches move too.
 - **Check:** same plans.
 
 ### Stage 7. The graph generates the buffers (item 3)
 
 **`GraphBuilder(strategy, solver_caps).build(scheduler graph)`:**
 - The generic part comes from `_generate_buffers` (1680).
-- The strategy's build hook makes each record:
+- The strategy makes each record:
   - placement: `_build_bound_buffers` (1425), plus `_append_lx_relayout_destinations`
     (1762) for pairing solvers, which re-ticks to 2u+1;
-  - co-optimizing: the 5c code, with its loop run to convergence.
+  - the co-optimizing strategies: their Stage 4–5 candidate code, with the price loop
+    run to convergence.
 - The builder wires nodes, edges, the chain and `node.buffer` **after** both.
 
 **Who reads what:**
 - The allocator keeps the graph. `CpSatLayoutSolver` accepts it prebuilt and does not
-  rebuild it, so the harness, `last_solve_stats`, `excluded()` and the dump are unchanged.
+  rebuild it.
 - The other solvers and `_push_allocation` read `graph.buffers()`.
 - The records stay authoritative after the solve:
   - the SA co-optimizer appends to menus;
@@ -335,38 +379,49 @@ wrapped copies.
 
 ## Out of scope
 
+- **A second OR-Tools backend.** The protocol admits one, but building it needs two
+  things.
+  - **Linearization.** The model uses CP-SAT-only constraints: element / table, optional
+    intervals with the 2-D no-overlap, and products. The branch's `Mip` linearized them
+    with big-M, one-hot and pairwise disjunctions. It was exact on small models, but
+    found no solution on attention graphs in 60 s.
+  - **The cost printer.** `cpsat_expr_printer` builds the cost with cp_model's own
+    expression types, so it has to post through the protocol first.
 - `Lazy`, derived and `Pruned` encodings.
 - Pins and `set_solver`.
-- The Mip, BruteForce and Annealing backends.
-- The other solvers on the graph.
+- Moving the solvers outside the graph model onto it.
 - Deleting `CoreDivisionBuffer`.
 - A general `Transform` for restickification and transposes.
 - The old plan's Stage 7: it changes tied plans.
 
 ## Gates for every PR
 
-- **Proto.** `cpsat_equivalence.py diff` over the unit-test solves plus the default and
-  tiling captures, comparing frozen trees of the parent and the change. It must show
-  0 differences, and the parameter records must be equal.
+- **Parity (Stages 2–5b).** The side-by-side test passes: identical protos and decisions
+  on the whole corpus.
+- **Proto (all stages).** `cpsat_equivalence.py diff` over the unit-test solves plus the
+  default and tiling captures, comparing frozen trees of the parent and the change. It
+  must show 0 differences, and the parameter records must be equal.
 - **Plans.** The extended same-plans check from Stage 0 must be identical, including the
   post-push graph, the tiling config and the fallback.
 - **Unit suites, run serially:** `test_scratchpad_solver`, `test_solver_relayout_decision`,
   `test_cooptimization_types`, `test_cost_expr_dump`, `test_restickify_cost_model`,
   `test_sa_cooptimizer`, `test_coarse_tiling`, `test_work_division*`,
   `test_scratchpad_patterns`, `test_perm_layout_solver`, `test_scratchpad_use`,
-  `test_solver_auto_coarse_tiling`, `test_buffer_graph`.
-- **Device suites after Stages 3, 4c, 5c, 6 and 7:** `test_scratchpad_use`,
+  `test_solver_auto_coarse_tiling`, `test_buffer_graph`, `test_graph_solver_parity`.
+- **Device suites after Stages 2, 4, 5a, 5b, 6 and 7:** `test_scratchpad_use`,
   `test_work_division`, `test_solver_relayout_e2e`, `test_solver_auto_coarse_tiling`,
   `test_lx_planning_suite`.
 - **Housekeeping.** `pre-commit run --files`, and re-record the baselines after every
   rebase onto `main`.
 
 Pitfalls from the branch:
-- Build the graph from the allocator's full buffer list, never from a solver's filtered
+- Build the graph from the allocator's full record list, never from a solver's filtered
   view. The placement annealer's `self.buffers` rebinding dropped barred buffers this way.
 - Never put a CP-SAT expression in a Python `if`.
 - Add no new exception types to the solve path.
 - Select no backend from an environment variable.
+- While both CP-SAT builders exist, any change to today's model needs the same change in
+  the graph solver. The parity test fails until both match.
 
 ## References
 
