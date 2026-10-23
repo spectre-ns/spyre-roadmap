@@ -20,7 +20,7 @@ structure works. It cannot land as it is:
   check, `58afed9e`), so its tiling and lifetime encodings cannot be lifted.
 
 This plan lands the structure on `main` in small PRs. Every PR keeps the CP model
-byte-identical and the committed plans identical. It implements five things:
+byte-identical and the committed plans identical. It implements six things:
 
 1. **One integrated graph solver over an injectable OR-Tools backend.** The backend
    protocol is pywraplp-shaped, so any OR-Tools-compliant solver can implement it.
@@ -32,12 +32,17 @@ byte-identical and the committed plans identical. It implements five things:
 4. **`DependencyEdge`s and `ExecutionEdge`s.**
 5. **Placement-only and co-optimizing as strategies.** They replace the two allocator
    classes and their `division_is_fixed` and capability-flag branches.
+6. **An abstract encoding factory.** Each concrete factory produces the encodings for
+   one backend family: `CpSatEncodings` and `AnnealingEncodings`. Ideally any strategy
+   works with any backend. In the interim, a simulated-annealing co-optimization
+   strategy runs on a simulated-annealing backend.
 
 Decisions (2026-10-23):
 - The graph solver is the only integrated solver. CP-SAT is its first backend.
-- Greedy, first-fit, best-fit, placement SA, the SA co-optimizer and exhaustive search
-  stay outside the graph model. They are fed by the buffer records the strategies
-  generate. Greedy stays the fallback after a failed solve.
+- The SA co-optimizer joins the graph model as the annealing family (Stage 6).
+- Greedy, first-fit, best-fit, placement SA and exhaustive search stay outside the graph
+  model. They are fed by the buffer records the strategies generate. Greedy stays the
+  fallback after a failed solve.
 - Placement-only reproduces today's plans exactly. `CO_OPTIMIZING_LX_PLANNING=0` stays
   usable for bisecting a miscompile.
 - Strategies come in increasing order of difficulty, and each one extends the last:
@@ -57,10 +62,11 @@ Compatibility with the non-enumerating end state:
 | Term | Meaning | Replaces |
 |---|---|---|
 | graph | `SpyreOptimizationGraph`: `ResourceNode`s, `DependencyEdge`s and `ExecutionEdge`s. It holds incoming data and decisions, with no candidates and no solver state. | the allocator's buffer lists, as the solver's input |
-| graph solver | The one integrated solver. It runs a strategy over the graph on a backend, then the objective ladder, then extraction onto the nodes. | `CpSatLayoutSolver`'s model code (the class stays as the entry point) |
-| backend | An OR-Tools solver behind the pywraplp-shaped protocol. `CpSat` is the first. | direct `cp_model` calls |
-| strategy | Which decisions are open, how the others are filled before encoding, where the candidates come from, and how the open decisions are encoded. | the two allocator classes, `division_is_fixed`, and the old plan's `TableStrategy` and `EncodingStrategy` |
-| encoding | The part of a strategy that posts to the backend. | the CP-SAT wrappers' constraint code |
+| graph solver | The one integrated solver. It runs a strategy over the graph, using the encodings and backend of one encoding factory, then the objective ladder, then extraction onto the nodes. | `CpSatLayoutSolver`'s model code (the class stays as the entry point) |
+| backend | What an encoding factory's encodings run on: an OR-Tools solver behind the pywraplp-shaped protocol (`CpSat` first), or the annealing engine (Stage 6). | direct `cp_model` calls |
+| strategy | Backend-agnostic: which decisions are open, how the others are filled before encoding, and where the candidates come from. | the two allocator classes, `division_is_fixed`, and the old plan's `TableStrategy` and `EncodingStrategy` |
+| encoding factory | An abstract factory. Each concrete factory produces, for every element a strategy opens (node, dependency edge, execution edge, copy), the encoding for one backend family: `CpSatEncodings` or `AnnealingEncodings`. | — |
+| encoding | What a factory produces for one element: constraints posted to a pywraplp-shaped backend, or annealing state and moves. | the CP-SAT wrappers' constraint code; the SA co-optimizer's state |
 | record | A `LifetimeBoundBuffer`, `CoreDivisionBuffer` or `RelayoutCopyBuffer`. A node references its record, and solvers outside the graph model read records. | — |
 
 The three strategies:
@@ -83,11 +89,12 @@ The three strategies:
 | 5a | `CoOptimizingStrategy`: relayouts | 5 | 4 | parity, relayouts on |
 | 5b | `CoOptimizingStrategy`: coarse tiling | 5 | 5a | parity, `AUTO_COARSE_TILING=1` |
 | 5c | Today's CP-SAT model code deleted | — | 5b | recorded protos |
-| 6 | One allocator | 2, 5 | 5b | plans |
-| 7 | The graph generates the buffers | 3 | 6 | protos + plans |
-| 8 | Cleanup | — | all | — |
+| 6 | `AnnealingEncodings`: the SA co-optimizer joins the graph model | 6 | 5b | the same plans as today's SA co-optimizer, bit for bit |
+| 7 | One allocator: picks a strategy and an encoding factory | 2, 5, 6 | 6 | plans |
+| 8 | The graph generates the buffers | 3 | 7 | protos + plans |
+| 9 | Cleanup | — | all | — |
 
-That is 11 PRs.
+That is 12 PRs.
 
 - Stage 3 can run any time after Stage 0, in parallel with Stages 1–2.
 - **Parity** means that today's model and the graph solver's model, built from the same
@@ -167,7 +174,16 @@ records.
 - read counts;
 - that `add_child` / `add_successor` refuse duplicates.
 
-### Stage 2. Graph solver, OR-Tools backend and `PlacementStrategy` (items 1 and 5)
+### Stage 2. Graph solver, encoding factory, OR-Tools backend and `PlacementStrategy` (items 1, 5 and 6)
+
+**New `encodings.py`.** It holds the abstract `EncodingFactory` and its first concrete
+factory, `CpSatEncodings`.
+- For each element kind a strategy can open (node, dependency edge, execution edge,
+  copy), the factory produces that element's encoding for its backend family.
+- Strategies are written against the factory from the start, so the annealing family
+  (Stage 6) plugs in without touching them.
+- `CpSatEncodings` posts to the backend below. From Stage 2 through 5b, every new CP-SAT
+  encoding lives in it.
 
 **New `backend.py`.** It holds the pywraplp-shaped `Backend` protocol and `CpSat`, lifted
 from `a47ef8f2` `backend.py` (up to :175).
@@ -177,10 +193,10 @@ from `a47ef8f2` `backend.py` (up to :175).
 - The protocol is what another OR-Tools solver implements (the `pywraplp` MPSolver
   backends: SCIP, HiGHS, CBC). None is built here; see *Out of scope* for what one needs.
 
-**New `graph_solver.py`.** `GraphSolver(backend_factory).solve(graph, strategy,
-cost_expr)` runs these steps:
+**New `graph_solver.py`.** `GraphSolver(encodings).solve(graph, strategy, cost_expr)`
+runs these steps:
 1. The strategy fills the decisions it does not open.
-2. Its encoding posts the open ones, in today's emission order.
+2. The factory's encodings post the open ones, in today's emission order.
 3. The objective ladder runs. The stages are today's (:1369-1450), with no tiebreak
    solves, and each strategy contributes the terms of the stages it opens.
 4. Extraction writes the decisions onto the nodes and edges and returns the op outputs
@@ -194,7 +210,7 @@ It also covers:
 
 **`PlacementStrategy`:**
 - **Fill:** each node's `work_split` is `COMMITTED`, with no tiling and no relayouts.
-- **Encoding**, per node:
+- **Encoding** (from `CpSatEncodings`):
   - the residency literal, the offset, and a merge literal per in-place input;
   - the merges: offset equality, both ends resident, and at-most-one in and out;
   - capacity;
@@ -317,7 +333,46 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
 - Check: the recorded protos and plans equal, and the 18 `test_inductor_ops_lx_*` shards
   pass.
 
-### Stage 6. One allocator (items 2 and 5)
+### Stage 6. `AnnealingEncodings`: the SA co-optimizer joins the graph model (item 6)
+
+`SaCoOptimizingSolver` (`sa_cooptimizer.py`) already splits along the graph's lines.
+So it ports as a second encoding family, not as a solver over the CP-SAT model. The
+branch tried the latter: its generic annealer over the posted model was about 18x worse,
+because single-variable moves cannot carry a division change through the offsets and
+merges of its neighbours.
+
+**`AnnealingEncodings`, per element:**
+- **Node:** its division source, with the node's spill cost and per-core size.
+  - `_MenuDivisions` (:334) draws from the menu.
+  - `_GeneratedDivisions` (:378) generates from the split space.
+- **Dependency edge:** its edge relation (`_edge_relation` :1071).
+  - `_TableRelation` (:547) comes from the match tables.
+  - `_ViewRelation` (:614) comes from the residency edges.
+- **Execution edge:** op positions and tiling runs (`_build_operation_positions` :962,
+  `_runs` :1036), taken from `produced_at` and the chain.
+
+**`Annealing` backend:**
+- the annealing loop: reorder, atomic flip and region recolor moves, judged by a
+  Metropolis test and keeping the best state seen;
+- the score from `cost_expr` (`_build_score_fn` :807);
+- offsets through the C++ `NativePermutationLayoutSolver` packer (:1255).
+
+**The interim strategy, `SaCoOptimizingStrategy`.** It opens the co-optimizing
+decisions, but generates divisions from the split space (`generates_divisions`,
+`chooses_tilings`) instead of the menus. So it pairs only with `AnnealingEncodings`.
+`strategy.accepts(encodings)` refuses any other pairing until it is built.
+
+**Check:**
+- Today's SA co-optimizer is seeded and bit-for-bit reproducible, so the port must give
+  exactly the same plans.
+- This is checked on the corpus and on the same-plans runs with
+  `layout_solver=simulated_annealing` and co-optimization on.
+
+**Not here:** any strategy with any factory. The obvious next pair is `PlacementStrategy`
+on annealing, which is today's placement SA (`simulated_annealing.py` and the same
+packer).
+
+### Stage 7. One allocator (items 2 and 5)
 
 - **The remaining mode hooks move into the strategies.**
   - `PlacementStrategy` takes `ScratchpadAllocator`'s: `_prepare_buffers` 868, `_solve`
@@ -326,13 +381,15 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
   - `CoOptimizingStrategy` takes whatever is left of `CoOptimizingAllocator`'s overrides
     (2957, 3047, 3282, 3333, 3353).
   - The cost dump keeps today's name (`type(self).__name__`, :3219).
-- **`CoOptimizingAllocator` is deleted.** `select_allocator` returns
-  `ScratchpadAllocator(solver_cls, strategy, post_optimization_passes)`.
-  - The CP-SAT path runs the graph solver.
+- **`CoOptimizingAllocator` is deleted.** `select_allocator` picks a strategy and an
+  encoding factory, and returns `ScratchpadAllocator(solver_cls, strategy, encodings,
+  post_optimization_passes)`.
+  - `cpsat` runs the graph solver with `CpSatEncodings`.
+  - `simulated_annealing` with co-optimization runs the graph solver with
+    `SaCoOptimizingStrategy` and `AnnealingEncodings`.
   - The solvers outside the graph model take the strategy's records.
-- **The mode and solver rules become `strategy.accepts(solver_cls)`** (4978-5012). They
-  cover:
-  - the SA co-optimizer, which gets no post-passes;
+- **The mode and solver rules become `strategy.accepts(...)`** (4978-5012). They cover:
+  - the SA co-optimizer, which today gets no post-passes and keeps none;
   - exhaustive wrapping;
   - the `ValueError` for co-optimizing without a division-capable solver, which is also
     what happens without ortools.
@@ -346,7 +403,7 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
   module's names, so test patches move too.
 - **Check:** same plans.
 
-### Stage 7. The graph generates the buffers (item 3)
+### Stage 8. The graph generates the buffers (item 3)
 
 **`GraphBuilder(strategy, solver_caps).build(scheduler graph)`:**
 - The generic part comes from `_generate_buffers` (1680).
@@ -362,17 +419,18 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
   rebuild it.
 - The other solvers and `_push_allocation` read `graph.buffers()`.
 - The records stay authoritative after the solve:
-  - the SA co-optimizer appends to menus;
+  - the annealing family appends the divisions it generates to the menus, as the SA
+    co-optimizer does today (`sa_cooptimizer.py:1981-1983`);
   - `_clear_lx_relayout_groups` clears addresses;
   - `apply_chosen_tilings` shifts op indices.
-- Exhaustive search, the SA co-optimizer (both build private temporaries) and
-  `LxContextSwitchingPass` (it reads only the scheduler graph) work unchanged.
+- Exhaustive search (it builds private temporaries) and `LxContextSwitchingPass` (it
+  reads only the scheduler graph) work unchanged.
 
 **Check:**
 - For one PR, a debug flag compares the records with the old path field by field.
 - Then protos identical and the same plans.
 
-### Stage 8. Cleanup
+### Stage 9. Cleanup
 
 - Docstrings, and a grep for every deleted name.
 - Point `cpsat-graph-buffer-refactor.md` at this path.
@@ -389,7 +447,9 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
     expression types, so it has to post through the protocol first.
 - `Lazy`, derived and `Pruned` encodings.
 - Pins and `set_solver`.
-- Moving the solvers outside the graph model onto it.
+- Moving the remaining outside solvers (greedy, first-fit, best-fit, placement SA,
+  exhaustive search) onto the graph.
+- Any strategy with any factory, beyond the pairs built here.
 - Deleting `CoreDivisionBuffer`.
 - A general `Transform` for restickification and transposes.
 - The old plan's Stage 7: it changes tied plans.
@@ -398,6 +458,8 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
 
 - **Parity (Stages 2–5b).** The side-by-side test passes: identical protos and decisions
   on the whole corpus.
+- **Annealing parity (Stage 6).** The plans are the same as today's seeded SA
+  co-optimizer's, bit for bit.
 - **Proto (all stages).** `cpsat_equivalence.py diff` over the unit-test solves plus the
   default and tiling captures, comparing frozen trees of the parent and the change. It
   must show 0 differences, and the parameter records must be equal.
@@ -408,7 +470,7 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
   `test_sa_cooptimizer`, `test_coarse_tiling`, `test_work_division*`,
   `test_scratchpad_patterns`, `test_perm_layout_solver`, `test_scratchpad_use`,
   `test_solver_auto_coarse_tiling`, `test_buffer_graph`, `test_graph_solver_parity`.
-- **Device suites after Stages 2, 4, 5a, 5b, 6 and 7:** `test_scratchpad_use`,
+- **Device suites after Stages 2, 4, 5a, 5b, 6, 7 and 8:** `test_scratchpad_use`,
   `test_work_division`, `test_solver_relayout_e2e`, `test_solver_auto_coarse_tiling`,
   `test_lx_planning_suite`.
 - **Housekeeping.** `pre-commit run --files`, and re-record the baselines after every
