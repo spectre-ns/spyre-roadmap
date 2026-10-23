@@ -33,13 +33,16 @@ byte-identical and the committed plans identical. It implements six things:
 5. **Placement-only and co-optimizing as strategies.** They replace the two allocator
    classes and their `division_is_fixed` and capability-flag branches.
 6. **An abstract encoding factory.** Each concrete factory produces the encodings for
-   one backend family: `CpSatEncodings` and `AnnealingEncodings`. Ideally any strategy
-   works with any backend. In the interim, a simulated-annealing co-optimization
-   strategy runs on a simulated-annealing backend.
+   one backend family, starting with `CpSatEncodings`. Ideally any strategy works with
+   any backend. SA and CP-SAT stay separate until a probe shows that SA can solve the
+   unified model. Until then, a strategy converts the optimization graph into what
+   today's SA interface accepts.
 
 Decisions (2026-10-23):
 - The graph solver is the only integrated solver. CP-SAT is its first backend.
-- The SA co-optimizer joins the graph model as the annealing family (Stage 6).
+- The SA co-optimizer stays separate from CP-SAT. It is reached through a conversion
+  strategy (Stage 6), not ported. An `AnnealingEncodings` family follows only if the
+  probe holds (*Probe: SA on the unified model*).
 - Greedy, first-fit, best-fit, placement SA and exhaustive search stay outside the graph
   model. They are fed by the buffer records the strategies generate. Greedy stays the
   fallback after a failed solve.
@@ -63,10 +66,11 @@ Compatibility with the non-enumerating end state:
 |---|---|---|
 | graph | `SpyreOptimizationGraph`: `ResourceNode`s, `DependencyEdge`s and `ExecutionEdge`s. It holds incoming data and decisions, with no candidates and no solver state. | the allocator's buffer lists, as the solver's input |
 | graph solver | The one integrated solver. It runs a strategy over the graph, using the encodings and backend of one encoding factory, then the objective ladder, then extraction onto the nodes. | `CpSatLayoutSolver`'s model code (the class stays as the entry point) |
-| backend | What an encoding factory's encodings run on: an OR-Tools solver behind the pywraplp-shaped protocol (`CpSat` first), or the annealing engine (Stage 6). | direct `cp_model` calls |
+| backend | What an encoding factory's encodings run on: an OR-Tools solver behind the pywraplp-shaped protocol, `CpSat` first. An annealing engine joins only if the probe holds. | direct `cp_model` calls |
 | strategy | Backend-agnostic: which decisions are open, how the others are filled before encoding, and where the candidates come from. | the two allocator classes, `division_is_fixed`, and the old plan's `TableStrategy` and `EncodingStrategy` |
-| encoding factory | An abstract factory. Each concrete factory produces, for every element a strategy opens (node, dependency edge, execution edge, copy), the encoding for one backend family: `CpSatEncodings` or `AnnealingEncodings`. | — |
-| encoding | What a factory produces for one element: constraints posted to a pywraplp-shaped backend, or annealing state and moves. | the CP-SAT wrappers' constraint code; the SA co-optimizer's state |
+| encoding factory | An abstract factory. Each concrete factory produces, for every element a strategy opens (node, dependency edge, execution edge, copy), the encoding for one backend family. `CpSatEncodings` is the first; `AnnealingEncodings` waits on the probe. | — |
+| encoding | What a factory produces for one element: constraints posted to a pywraplp-shaped backend. | the CP-SAT wrappers' constraint code |
+| conversion strategy | A strategy that converts the graph into the input of a solver kept outside the unified model, runs that solver unchanged, and copies its decisions onto the nodes. `SaConversionStrategy` (Stage 6) is the first. | `CoOptimizingAllocator(SaCoOptimizingSolver)` |
 | record | A `LifetimeBoundBuffer`, `CoreDivisionBuffer` or `RelayoutCopyBuffer`. A node references its record, and solvers outside the graph model read records. | — |
 
 The three strategies:
@@ -89,8 +93,8 @@ The three strategies:
 | 5a | `CoOptimizingStrategy`: relayouts | 5 | 4 | parity, relayouts on |
 | 5b | `CoOptimizingStrategy`: coarse tiling | 5 | 5a | parity, `AUTO_COARSE_TILING=1` |
 | 5c | Today's CP-SAT model code deleted | — | 5b | recorded protos |
-| 6 | `AnnealingEncodings`: the SA co-optimizer joins the graph model | 6 | 5b | the same plans as today's SA co-optimizer, bit for bit |
-| 7 | One allocator: picks a strategy and an encoding factory | 2, 5, 6 | 6 | plans |
+| 6 | `SaConversionStrategy`: SA reached through the graph, kept separate | 6 | 4 | the same SA inputs, so the same plans bit for bit |
+| 7 | One allocator: picks a strategy and an encoding factory, or a conversion | 2, 5, 6 | 5b, 6 | plans |
 | 8 | The graph generates the buffers | 3 | 7 | protos + plans |
 | 9 | Cleanup | — | all | — |
 
@@ -180,8 +184,8 @@ records.
 factory, `CpSatEncodings`.
 - For each element kind a strategy can open (node, dependency edge, execution edge,
   copy), the factory produces that element's encoding for its backend family.
-- Strategies are written against the factory from the start, so the annealing family
-  (Stage 6) plugs in without touching them.
+- Strategies are written against the factory from the start. A second family (annealing,
+  if the probe holds) then plugs in without touching them.
 - `CpSatEncodings` posts to the backend below. From Stage 2 through 5b, every new CP-SAT
   encoding lives in it.
 
@@ -333,44 +337,42 @@ It extends `CoreDivisionStrategy` and reuses its division vars and view gates.
 - Check: the recorded protos and plans equal, and the 18 `test_inductor_ops_lx_*` shards
   pass.
 
-### Stage 6. `AnnealingEncodings`: the SA co-optimizer joins the graph model (item 6)
+### Stage 6. `SaConversionStrategy`: SA reached through the graph, kept separate (item 6)
 
-`SaCoOptimizingSolver` (`sa_cooptimizer.py`) already splits along the graph's lines.
-So it ports as a second encoding family, not as a solver over the CP-SAT model. The
-branch tried the latter: its generic annealer over the posted model was about 18x worse,
-because single-variable moves cannot carry a division change through the offsets and
-merges of its neighbours.
+SA and CP-SAT stay separate until a probe shows that SA can solve the unified model
+(*Probe: SA on the unified model*). Until then, the SA co-optimizer is not ported. A
+conversion strategy hands it the graph in the form it accepts today.
 
-**`AnnealingEncodings`, per element:**
-- **Node:** its division source, with the node's spill cost and per-core size.
-  - `_MenuDivisions` (:334) draws from the menu.
-  - `_GeneratedDivisions` (:378) generates from the split space.
-- **Dependency edge:** its edge relation (`_edge_relation` :1071).
-  - `_TableRelation` (:547) comes from the match tables.
-  - `_ViewRelation` (:614) comes from the residency edges.
-- **Execution edge:** op positions and tiling runs (`_build_operation_positions` :962,
-  `_runs` :1036), taken from `produced_at` and the chain.
-
-**`Annealing` backend:**
-- the annealing loop: reorder, atomic flip and region recolor moves, judged by a
-  Metropolis test and keeping the best state seen;
-- the score from `cost_expr` (`_build_score_fn` :807);
-- offsets through the C++ `NativePermutationLayoutSolver` packer (:1255).
-
-**The interim strategy, `SaCoOptimizingStrategy`.** It opens the co-optimizing
-decisions, but generates divisions from the split space (`generates_divisions`,
-`chooses_tilings`) instead of the menus. So it pairs only with `AnnealingEncodings`.
-`strategy.accepts(encodings)` refuses any other pairing until it is built.
+**`SaConversionStrategy`:**
+- **Input.** It converts the graph into today's SA interface: the records, in the
+  allocator's order (`graph.buffers()`). They already carry everything
+  `SaCoOptimizingSolver` reads: menus, split spaces (`division_space`), residency edges,
+  tile reads and match tables.
+- **Solve.** It calls `plan_layout_and_core_divisions(cost_expr)` as
+  `CoOptimizingAllocator` calls it today, so the SA co-optimizer keeps all of its
+  behaviour. That includes generating divisions from the split space
+  (`generates_divisions`, `chooses_tilings`) and appending them to the menus
+  (`sa_cooptimizer.py:1981-1983`).
+- **Output.** The decisions the SA co-optimizer writes on the records (chosen division,
+  address, spill reason) are copied onto the nodes, so the rest of the flow reads the
+  graph.
+- **Pairing.** `strategy.accepts(...)` refuses it with anything but the SA co-optimizer.
 
 **Check:**
-- Today's SA co-optimizer is seeded and bit-for-bit reproducible, so the port must give
-  exactly the same plans.
+- The SA co-optimizer receives identical inputs and is seeded and bit-for-bit
+  reproducible, so its plans must be identical.
 - This is checked on the corpus and on the same-plans runs with
   `layout_solver=simulated_annealing` and co-optimization on.
 
-**Not here:** any strategy with any factory. The obvious next pair is `PlacementStrategy`
-on annealing, which is today's placement SA (`simulated_annealing.py` and the same
-packer).
+**If the probe holds,** an `AnnealingEncodings` family replaces this conversion. The SA
+co-optimizer already splits along the graph's lines, so the port is per element:
+- node: a division source, `_MenuDivisions` (:334) or `_GeneratedDivisions` (:378);
+- dependency edge: an edge relation (`_edge_relation` :1071), `_TableRelation` (:547)
+  or `_ViewRelation` (:614);
+- execution edge: op positions and tiling runs (`_build_operation_positions` :962,
+  `_runs` :1036);
+- backend: the annealing loop, the score from `cost_expr` (`_build_score_fn` :807), and
+  offsets through the C++ `NativePermutationLayoutSolver` packer (:1255).
 
 ### Stage 7. One allocator (items 2 and 5)
 
@@ -385,8 +387,7 @@ packer).
   encoding factory, and returns `ScratchpadAllocator(solver_cls, strategy, encodings,
   post_optimization_passes)`.
   - `cpsat` runs the graph solver with `CpSatEncodings`.
-  - `simulated_annealing` with co-optimization runs the graph solver with
-    `SaCoOptimizingStrategy` and `AnnealingEncodings`.
+  - `simulated_annealing` with co-optimization runs `SaConversionStrategy` (Stage 6).
   - The solvers outside the graph model take the strategy's records.
 - **The mode and solver rules become `strategy.accepts(...)`** (4978-5012). They cover:
   - the SA co-optimizer, which today gets no post-passes and keeps none;
@@ -419,8 +420,8 @@ packer).
   rebuild it.
 - The other solvers and `_push_allocation` read `graph.buffers()`.
 - The records stay authoritative after the solve:
-  - the annealing family appends the divisions it generates to the menus, as the SA
-    co-optimizer does today (`sa_cooptimizer.py:1981-1983`);
+  - the SA co-optimizer appends the divisions it generates to the menus
+    (`sa_cooptimizer.py:1981-1983`);
   - `_clear_lx_relayout_groups` clears addresses;
   - `apply_chosen_tilings` shifts op indices.
 - Exhaustive search (it builds private temporaries) and `LxContextSwitchingPass` (it
@@ -434,6 +435,36 @@ packer).
 
 - Docstrings, and a grep for every deleted name.
 - Point `cpsat-graph-buffer-refactor.md` at this path.
+
+## Probe: SA on the unified model
+
+This probe decides whether SA becomes a native backend family (`AnnealingEncodings`
+beside `CpSatEncodings`) or stays behind the Stage 6 conversion. It lives in
+`probes/cpsat-graph/` and changes nothing in torch-spyre.
+
+**Question.** Can an annealing backend solve the graph solver's model on every ladder
+stage, including the division choice, as well as today's SA co-optimizer does?
+
+**Evidence so far, residency stage only.** The branch's rewritten annealer (`b25590d2`)
+uses violation weights that grow at stalls, Kempe-chain recolors through the tables, and
+in-place groups packed as one box. It was measured device-free at 10 s per stage:
+- 6 of 7 zoo graphs that must spill reached CP-SAT's optimum (×1.03 geomean, down from
+  ×18);
+- all 25 zoo graphs that need not spill reached it;
+- on 66 JSON captures it was ×1.008 off CP-SAT, against ×1.027 for today's SA
+  co-optimizer;
+- over three seeds, 58 of 72 runs on the cases that must spill were optimal.
+
+**What the probe adds:**
+- the division stages (parallelism, shape, tile count) and the cost expression;
+- the zoo at default and tiling configs, plus the JSON captures;
+- comparison against CP-SAT's optimum and today's SA co-optimizer, over several seeds at
+  a fixed budget.
+
+**Bar.** No worse than today's SA co-optimizer on every stage, at comparable time.
+- If it holds, `AnnealingEncodings` replaces the conversion, and any strategy can run on
+  SA.
+- If not, the conversion stays.
 
 ## Out of scope
 
@@ -450,6 +481,7 @@ packer).
 - Moving the remaining outside solvers (greedy, first-fit, best-fit, placement SA,
   exhaustive search) onto the graph.
 - Any strategy with any factory, beyond the pairs built here.
+- An `AnnealingEncodings` family, until the probe holds.
 - Deleting `CoreDivisionBuffer`.
 - A general `Transform` for restickification and transposes.
 - The old plan's Stage 7: it changes tied plans.
@@ -458,8 +490,8 @@ packer).
 
 - **Parity (Stages 2–5b).** The side-by-side test passes: identical protos and decisions
   on the whole corpus.
-- **Annealing parity (Stage 6).** The plans are the same as today's seeded SA
-  co-optimizer's, bit for bit.
+- **SA conversion (Stage 6).** The SA co-optimizer's inputs are identical, so its seeded
+  plans are the same bit for bit.
 - **Proto (all stages).** `cpsat_equivalence.py diff` over the unit-test solves plus the
   default and tiling captures, comparing frozen trees of the parent and the change. It
   must show 0 differences, and the parameter records must be equal.
