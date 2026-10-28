@@ -727,8 +727,11 @@ without changing them.
   encoder's provenance already tags each constraint with its rule and each pin with its
   source. Passed to `mus` or `optimal_mus` with pins as the soft constraints and rules
   as the hard ones, they name the smallest set of user hints that conflict, instead of
-  the warning listing every hint. `mcs` gives the fewest hints to drop, and `marco`
-  enumerates the alternatives.
+  the warning listing every hint. `quickxplain` takes the pins in preference order and
+  returns the preferred conflict, the one built from the earliest pins it can use. With
+  user hints listed first and internal pins after, its explanation names user hints
+  wherever a conflict made of them exists. `mcs` gives the fewest hints to drop, and
+  `marco` enumerates the alternatives.
 - **SA over the CPMpy model.** An annealer that walks assignments of the CPMpy model's
   variables, so SA and the CP families share one encoding instead of SA keeping its own
   `AnnealModel`. The open question is speed: each move evaluates CPMpy expressions
@@ -746,9 +749,18 @@ without changing them.
   then be computed under the chosen order.
 - **Stick layout optimization.** Stage 11 lets the solve pick each op's stick dim among
   the legal ones. Beyond that, the solve could choose the rest of the
-  `SpyreTensorLayout`: dim order, padding, and how sticks span the device dims. The
-  cost model would then price stick utilization (partial sticks, padding) alongside
-  traffic.
+  `SpyreTensorLayout`: dim order and how sticks span the device dims. The cost model
+  would then price stick utilization (partial sticks) alongside traffic.
+- **Padding.** Today padding is fixed before the solve:
+  - `enforce_indirect_access_layout` grows a gather output to whole index sticks so its
+    entry dim can split;
+  - a padded reduction stays on one core (`PADDED_REDUCTION_UNSPLIT`).
+
+  The solve could instead choose to pad a dim, to a stick multiple or a core-count
+  multiple, when the extra footprint and traffic buy a split the unpadded size forbids.
+  The logical size stays the same, as with the gather padding today. A padded
+  dim's extent becomes a decision on the out port's layout, priced by the cost model.
+  Any read of the pad needs the masking padded reductions already get.
 
 ## Verification
 
