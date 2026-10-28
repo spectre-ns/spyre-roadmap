@@ -298,8 +298,7 @@ classDiagram
 
 `Transpose` is in the diagram only to show where it would go: a step that permutes the
 device dims of a resident tile, priced like a relayout. It is not built in this plan
-(see "Out of the first implementation" below), and its `ORDER` among the other steps is
-left for its own design.
+(see "Future work"), and its `ORDER` among the other steps is left for its own design.
 
 #### Families
 
@@ -307,7 +306,7 @@ One factory per solver family creates that family's encoder and owns its private
 backend, and each encoder builds its family's own model. OR-Tools builds a CP model.
 SA builds an `AnnealModel`, a port of today's `SaCoOptimizingSolver` state, because an
 annealer moves through divisions and a placement order rather than through CP
-variables. `CpmpyFactory` and its encoder are an expansion, not part of this plan.
+variables. `CpmpyFactory` and its encoder are future work, not part of this plan.
 
 ```mermaid
 classDiagram
@@ -322,7 +321,7 @@ classDiagram
         +placement: no_overlap | pack
     }
     class CpmpyFactory {
-        <<expansion>>
+        <<future work>>
     }
     class SAFactory {
         +seed: int
@@ -344,7 +343,7 @@ classDiagram
         +symbol(name, variable)
     }
     class CpmpyEncoder {
-        <<expansion>>
+        <<future work>>
     }
     class SAEncoder {
         +ENCODES: Restriction
@@ -502,14 +501,14 @@ Data edges carry no restrictions.
 | In place | A variable on the edge, allowed only when the consumer reads at the producer's index, adjacent lifetimes, both resident, same layout and footprint, and at most one per op. The pair shares one offset. |
 | Objective | A sympy expression from the cost model. The encoder consumes it and encodes it into its own variables by symbol name, and an unknown name fails. More cores only break ties. |
 | Placement | A backend detail. CP-SAT places natively (offsets under a 2-D no-overlap) or by packing (a cumulative under a roof, then a first-fit packer; on overflow the roof comes down and the model is solved again). Annealing and MIP solvers pack. |
-| Families | One object encodes and solves, and its backend is private. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools and SA are built here, each encoding into its own model; CPMpy is an expansion axis. |
+| Families | One object encodes and solves, and its backend is private. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools and SA are built here, each encoding into its own model; CPMpy is future work. |
 | Pins | Constraints that narrow the solve, never decisions, never dropped. They come from hints, graph-input arrival, the restickify pre-pass, hazards, and greedy pins the encoder may add to cut search. Internal pins must never be infeasible. |
 | Failure | A model proven infeasible is returned infeasible, with nothing decoded or committed and a warning naming the user hints. A solve out of time with no plan is retried with the fallback family (SA by default), which encodes the same graph into its own model. A failed check raises `RuleViolation`, because it means a bug. |
 | Decisions | They live in the solution. `read_back` decodes them onto the graph only from a plan, and commit lowers from the graph. |
 | Determinism | Opt-in. `SolveSettings(deterministic=True)` budgets by deterministic time with a fixed seed and interleaved search. Otherwise speed wins. |
 | Loops | Not modelled. User-written loops are opaque hazards, pinned and never re-tiled. Drains stay with whatever inserts them. |
 | After commit | `LxContextSwitchingPass` stays a separate pass. |
-| Out of the first implementation | Lazy work division, conflict explanation (MUS/MCS), `AxisRotation`, the `Transpose` step, multi-level tiles, and the CPMpy family. |
+| Out of the first implementation | Lazy work division, multi-level tiles, and everything under "Future work": the CPMpy family, explanations, SA over CPMpy, axis rotations (with the `Transpose` step) and stick layout optimization. |
 
 ## Stages
 
@@ -714,6 +713,42 @@ and either justified or fixed.
   `_multi_arg_pointwise_layouts` and `_check_stick_all_same`.
 - **Phase 3 exit:** the optimizer is the default, and the replaced solvers and the
   duplicated rules are gone.
+
+## Future work
+
+None of this is staged above. Each item builds on the graph, the flags and the families
+without changing them.
+
+- **CPMpy family.** `CpmpyFactory` and `CpmpyEncoder` encode the same graph and flags
+  into a CPMpy model, so any solver CPMpy drives (OR-Tools, Exact, Gurobi and others)
+  can solve it. `coverage()` names any flag the family cannot encode yet. If it matches
+  the OR-Tools family on the corpus, it may replace it.
+- **Explanations with `cpmpy.tools.explain`.** For a model proven infeasible, the
+  encoder's provenance already tags each constraint with its rule and each pin with its
+  source. Passed to `mus` or `optimal_mus` with pins as the soft constraints and rules
+  as the hard ones, they name the smallest set of user hints that conflict, instead of
+  the warning listing every hint. `mcs` gives the fewest hints to drop, and `marco`
+  enumerates the alternatives.
+- **SA over the CPMpy model.** An annealer that walks assignments of the CPMpy model's
+  variables, so SA and the CP families share one encoding instead of SA keeping its own
+  `AnnealModel`. The open question is speed: each move evaluates CPMpy expressions
+  rather than today's fixed-point score function.
+- **Axis rotations (`AxisRotation`).** Dim-order conversions for memory locality, where
+  a consumer walks a buffer across its contiguous dim:
+  - a transpose step on the edge (the `Transpose` transform), which helps only that
+    consumer;
+  - a rotated write on the producer, which changes the layout every consumer sees;
+  - a rotated read on the consumer (reordered loops), which moves no data but feeds
+    back into its work split.
+
+  Each is a choice among the few permutations that make an inner loop contiguous,
+  priced by the cost model against the strided-read penalty. The edge relations must
+  then be computed under the chosen order.
+- **Stick layout optimization.** Stage 11 lets the solve pick each op's stick dim among
+  the legal ones. Beyond that, the solve could choose the rest of the
+  `SpyreTensorLayout`: dim order, padding, and how sticks span the device dims. The
+  cost model would then price stick utilization (partial sticks, padding) alongside
+  traffic.
 
 ## Verification
 
