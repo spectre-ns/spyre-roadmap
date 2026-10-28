@@ -1,453 +1,556 @@
-# LX allocator: one optimizer over op nodes, restriction flags and solver families
+# LX allocator: implementation plan
 
-## Context
+## Goal
 
-`plans/cpsat-graph-buffer-refactor.md` models the CP-SAT solve as a graph of buffer
-nodes, dependency edges and execution edges, and outlines a Phase 3 in which every
-solver moves onto that one problem definition. torch-spyre/torch-spyre#5676 (branch
-`scratchpad-refactor-experimental`, a draft marked "DO NOT MERGE") built that plan end
-to end. Its prototype includes:
+Replace the scratchpad planner's several solvers and duplicated rule sets with one
+optimizer. The optimizer runs in five steps:
 
-- `buffer_graph.py`: `ResourceNode`, `DependencyEdge`, `ExecutionEdge`, `Transform`,
-  and `SpyreOptimizationGraph.solve(model, cost_expr, strategy)`;
-- `encoding_strategy.py` and `lazy_strategy.py`: `EncodingStrategy`, with the
-  `Enumerated`, `PairTable` and `Lazy` strategies;
-- `graph_builder.py`: `GraphBuilder`;
-- `backend.py`: the recorded-model backends `CpSat`, `Mip`, `BruteForce` and
-  `Annealing`, selected by `SPYRE_LX_BACKEND`;
-- `pricing.py`: `cost_expr`.
+1. build a graph of the program;
+2. encode every restriction into one model;
+3. solve the model with one solver family;
+4. check the decoded plan without a solver;
+5. commit the plan.
 
-The open `plans/cpsat-graph-staged-conversion.md` (this repo's #4, decisions of
-2026-10-23) explains why torch-spyre/torch-spyre#5676 cannot land as it is:
+That one solve decides work division, sticks, restickify, relayout, copy-out, in place,
+coarse tiling and LX placement.
 
-- it is too large to review;
-- default compiles plan 21–30% slower;
-- the greedy fallback is gone;
-- completed-reduction relayouts are lost;
-- it never ported torch-spyre/torch-spyre#5246.
+Today the same stick rule can exist in up to three places (`propagate_layouts`,
+`optimize_restickify` and `op_spec_validation`), each dispatched differently. Several
+solver classes each own part of the problem, with fallbacks between them. When this
+plan is done:
 
-It instead lands the structure on `main` in 12 PRs that keep the CP model
-byte-identical.
-
-This plan is the target that path leads to. It settles the earlier plan's Phase 3. Its
-design (the LX allocator design, 34 questions closed on 2026-10-28) keeps the graph but
-changes what sits on it and what solves it:
-
-- nodes are ops, subclassed by op kind;
-- what is special about an op type is a set of `Restriction` flags frozen on its node
-  type;
-- the encoding strategy is replaced by a solver family whose encoder applies the rules
-  and whose private backend solves and places;
-- legality is judged after the solve by `check_decisions`, with no solver involved.
-
-The goal is one optimizer that decides work division, sticks, restickify, relayout,
-copy-out, in place, coarse tiling and LX placement in one solve. The optimizer then
-checks the plan without a solver and commits it. It replaces the placement-only
-solvers, the duplicated stick rules (`propagate_layouts`, `optimize_restickify`,
-`op_spec_validation`) and the `SolveError` → greedy re-plan path.
-
-The design is written out as a runnable sketch in **`probes/lx-allocator/`**
-(`lx_design.py`, about 1,500 lines, OR-Tools 9.15, sympy 1.14). It plans three real
-cases end to end:
-
-- a SwiGLU MLP whose transposed `nn.Linear` weights arrive with the restickifies the
-  pre-pass inserted (torch-spyre/torch-spyre#4208);
-- SDPA decode with a padded KV stick that cannot be split where it is reduced
-  (torch-spyre/torch-spyre#3248);
-- 4096-token prefill with `AUTO_COARSE_TILING=1`, placed by packing.
-
-Each case solves to OPTIMAL and passes `check_decisions`. The design page (UML,
-sequence, encodings, a 50-row map from current `main` symbols to the design, and the
-decision log) is a private claude.ai artifact:
-<https://claude.ai/artifact/UNVmhkwDhbnHpfazJ1VmKj>.
-
-Work lands on torch-spyre `main` in small PRs, under the gates of the staged
-conversion. The branch is a source to lift from where `main` has not moved past it,
-never a base. File references to `main` are at torch-spyre `6487062` (2026-10-27), and
-references to the branch are at `4999f73`.
-
-## What changes relative to the graph refactor
-
-| `cpsat-graph-buffer-refactor` / torch-spyre/torch-spyre#5676 | this plan |
-|---|---|
-| `ResourceNode`: one buffer an op needs, with its menu | `OpNode`, subclassed by op kind (`PointwiseNode`, `MatmulNode`, `ReductionNode`), plus `InputNode` for graph inputs and weights. A node is an op and the memory it writes (size, residency, offset), with one `Layout(stick)` for its output. It holds no menu, and there is no `Buffer` class. |
-| `DependencyEdge` (with `in_place`) | `DataEdge`: an operand index, `in_place`, and the transform steps on the edge in canonical order (`CopyOut`, `Restickify`, `Relayout`). Each step holds its own memory. Data edges carry no restrictions. |
-| `RelayoutEdge`, `CloneRead` on edges (`graph_builder.py`) | `Relayout` is a step on the edge, keyed by the producer's reduction split. Clone reads become constraints between the clone's view and the consumer's. |
-| `EncodingStrategy` with per-axis `Fixed` / `Table` / `Lazy` / `Pruned` | The family's encoder. Op-specific rules are `Restriction` flags on node types, and rules every op obeys are built into the encoder. Pins fold into constants, and the enumerated table is pruned by what holds unconditionally. The design has no separate strategy or lookup object. |
-| `graph.solve(model, cost_expr, strategy)` | `SpyreOptimizer.optimize(graph)`. The graph has no `solve` and holds no solver types. |
-| `Backend` protocol, chosen by `SPYRE_LX_BACKEND` | `ModelAbstractFactory`, chosen from config (so it is in the FX cache key), returns one object per family that encodes and solves. The backend is private to its family. `Annealing` becomes the fallback over the same model, `Mip` packs, and `BruteForce` stays as a test oracle. |
-| `pricing.cost_expr` | `CostModel.objective(graph)`: a sympy expression over named symbols. The encoder consumes it and encodes it by symbol name, and an unknown name fails. |
-| `_PlacementUnit`, `justify`, `AddNoOverlap2D`, `_C.pack_boxes` | The encoder records `PlacementBox`es. The backend places them, either natively (2-D no-overlap) or by packing: a cumulative constraint under a roof, then a first-fit packer, lowering the roof and re-solving on overflow. |
-| `SolveError` | A model proven infeasible is returned with a warning that names the user hints, and nothing is decoded or committed. Out of time with no plan → anneal the same model. A failed check raises `RuleViolation`. |
-| Phase 2: lazy encodings | Sticks, restickify, in place and copy-out are variables already. Lazy work division is a later item, worth doing once coarse tiling, work division and relayout combine. |
-| Future work: restickification in the solve | Stage 10 here. |
-
-## Relation to the staged conversion (#4)
-
-The staged conversion's Stages 0–1 (harness and gates, then the graph) fit this design.
-Stage 1 here reshapes the graph's types. From Stage 2 on, the two plans make different
-calls:
-
-| staged conversion (2026-10-23) | this design (2026-10-28) |
-|---|---|
-| `PlacementStrategy`, `CoreDivisionStrategy` and `CoOptimizingStrategy` over an abstract `EncodingFactory` | No strategies. The family's encoder applies the always-on rules and each node type's flags. Joint division and placement is the only mode, and placement-only is the same model with every division pinned. |
-| SA stays separate behind `SaConversionStrategy` until a probe shows it can solve the unified model | SA anneals the same model as the fallback when a solve runs out of time with no plan. That rests on the staged conversion's *Probe: SA on the unified model* holding. If it does not hold, the fallback stays the conversion. |
-| Greedy, first-fit, best-fit, placement SA and exhaustive search stay outside, and greedy is the fallback | The placement-only solvers go, and the first-fit packer lives on inside the backends that pack. A model proven infeasible is returned with a warning naming the user hints, and nothing is re-planned. |
-| `CpSatLayoutSolver` stays the only CP-SAT entry point | `SpyreOptimizer` over a family chosen from config (also never from an environment variable). |
-| No new exception types in the solve path | `RuleViolation` when `check_decisions` fails on a decoded plan. That check runs after the solve and indicates a bug, not a user error. |
-| Every PR keeps the CP model byte-identical | The same through Phase 1, and in Phase 2 wherever the rules agree. Each remaining difference is listed by rule. |
-
-If this design is adopted, the staged conversion's Stages 0–1 and 3 stay as written. Its
-Stages 2 and 4–7 are replaced by Phases 2–3 here, and its Stage 6 conversion stays only
-until the SA probe holds.
-
-The Stage 0 equivalence harness, its corpus, the same-plans check and the verification
-suites carry over unchanged (see *Verification*).
+- each rule exists once;
+- one solver family encodes and solves the problem;
+- a single solver-free check judges every plan, however it was produced.
 
 ## Design
 
-The interfaces, as the sketch defines them. Bodies are in `probes/lx-allocator/lx_design.py`,
-and each class has a runnable example in `lx_examples.py`.
+The design has two layers.
 
-```python
-# ---- graph layer: no solver types --------------------------------------------
-class Restriction(Flag):            # what is special about an op type
-    NONE = 0
-    WHOLE_STICKS = auto()           # a stuck axis splits in whole sticks (main: factor_domain)
-    PADDED_REDUCTION_UNSPLIT = auto()  # a padded reduction stays on one core while stuck
-                                    #   (main: coordinate_mask_blocked_vars)
-    MATMUL_STICKS = auto()          # x stuck on K, y on N, the output on N (main: _matmul_layouts)
-    POINTWISE_STICKS = auto()       # inputs that index the output's stick axis stick on it
+- **The graph layer holds no solver types.** It is plain data, so a family can encode
+  it, it can be annealed, and it can be tested without a solver.
+  - The optimizer owns a graph of op nodes, data edges carrying transform steps,
+    execution edges and pins.
+  - A cost model writes the objective as a sympy expression.
+  - What is special about an op type is a set of `Restriction` flags that its node type
+    ORs together and freezes.
+- **The family layer** is one object per solver family that encodes and solves.
+  - Its encoder applies the rules at every level (op, edge, op-op and graph), records
+    the boxes to place, and consumes the cost model.
+  - Its private backend solves the model and places the boxes.
 
-class OpNode:                       # name, axes, reads, writes, shape, size; decisions:
-    restrictions: ClassVar[Restriction] = Restriction.WHOLE_STICKS   # work_split, layout,
-    runs: ClassVar[bool] = True                                      # resident, offset
-class PointwiseNode(OpNode): restrictions = OpNode.restrictions | Restriction.POINTWISE_STICKS
-class MatmulNode(OpNode):           # x, y, k, n: the attributes MATMUL_STICKS reads
-    restrictions = OpNode.restrictions | Restriction.MATMUL_STICKS | Restriction.PADDED_REDUCTION_UNSPLIT
-class ReductionNode(OpNode): restrictions = OpNode.restrictions | Restriction.PADDED_REDUCTION_UNSPLIT
-class InputNode(OpNode): runs = False; restrictions = Restriction.NONE
+### Class diagram
 
-class DataEdge: src, dst, operand, transforms, in_place
-class ExecutionEdge: before, after, cut          # cut derived where tiles don't match
-class Transform: resident, offset, footprint, pinned   # CopyOut (HBM), Restickify, Relayout
-class Pin: target, what, value, source           # graph input | pre-pass | hazard | greedy | hint
-class SpyreOptimizationGraph: nodes, data_edges, execution_edges, pins, alignment, capacity
-class CostModel:
-    def objective(self, graph) -> sympy.Expr: ...  # spill_cost, cut traffic, restickify, K-split
+```mermaid
+classDiagram
+    direction TB
 
-def check_decisions(graph, overrides=None) -> list[str]: ...   # every rule, no solver
-def coverage(graph, encoder, overrides=None) -> list[str]: ...  # flags a family cannot encode
+    class SpyreOptimizer {
+        +family: ModelAbstractFactory
+        +cost_model: CostModel
+        +settings: SolveSettings
+        +plan_allocation(ir) SpyreOptimizationGraph
+        +optimize(graph, restrictions) SpyreOptimizationGraph
+        +build_graph(ir) SpyreOptimizationGraph
+        +commit(graph)
+    }
+    class CostModel {
+        +objective(graph) sympy.Expr
+        +spill_cost(node) int
+        +cut_traffic(node) list~sympy.Expr~
+    }
+    class SpyreOptimizationGraph {
+        +nodes: list~OpNode~
+        +data_edges: list~DataEdge~
+        +execution_edges: list~ExecutionEdge~
+        +pins: list~Pin~
+        +alignment: int
+        +capacity: int
+        +add_node(node) OpNode
+        +add_read(src, dst, operand) DataEdge
+        +pin(target, what, value, source) Pin
+        +pins_on(target, what) list~Pin~
+        +step(node) int
+        +lifetime(node) tuple
+    }
+    class OpNode {
+        <<abstract>>
+        +name: str
+        +axes: tuple~Axis~
+        +reads: tuple~dict~
+        +writes: dict
+        +shape: tuple
+        +size: int
+        +elems_per_stick: int
+        +inputs: list~DataEdge~
+        +outputs: list~DataEdge~
+        +prev: ExecutionEdge
+        +next: ExecutionEdge
+        +work_split: WorkSplit
+        +layout: Layout
+        +resident: bool
+        +offset: int
+        +restrictions: Restriction$
+        +runs: bool$
+        +padded_reductions() list
+        +whole_stick_factors(axis, elems_per_stick) tuple
+        +broadcast_dims(operand) list
+        +same_index_read(operand) bool
+        +footprint(splits, tiling, alignment) int
+    }
+    class PointwiseNode {
+        restrictions = WHOLE_STICKS | POINTWISE_STICKS
+    }
+    class MatmulNode {
+        +x: int
+        +y: int
+        +k: str
+        +n: str
+        restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT
+    }
+    class ReductionNode {
+        restrictions = WHOLE_STICKS | PADDED_REDUCTION_UNSPLIT
+    }
+    class InputNode {
+        runs = False
+        restrictions = NONE
+    }
+    class DataEdge {
+        +src: OpNode
+        +dst: OpNode
+        +operand: int
+        +in_place: bool
+        +transforms: list~Transform~
+        +read_layout() Layout
+    }
+    class ExecutionEdge {
+        +before: OpNode
+        +after: OpNode
+        +cut: bool
+    }
+    class Pin {
+        +target: OpNode | DataEdge
+        +what: str
+        +value
+        +source: str
+        +internal: bool
+    }
+    class Transform {
+        <<abstract>>
+        +resident: bool
+        +offset: int
+        +footprint: int
+        +pinned: bool
+        +ORDER: int$
+        +forced: bool$
+        +in_lx: bool$
+        +apply(layout) Layout
+    }
+    class CopyOut {
+        ORDER = 0, forced, in HBM
+    }
+    class Restickify {
+        +to_stick: int
+        ORDER = 1, forced
+    }
+    class Relayout {
+        +to_view
+        +reduction_split: int
+        ORDER = 2, chosen
+    }
+    class Restriction {
+        <<Flag>>
+        NONE
+        WHOLE_STICKS
+        PADDED_REDUCTION_UNSPLIT
+        MATMUL_STICKS
+        POINTWISE_STICKS
+    }
+    class Encoder {
+        <<abstract>>
+        +encode(graph, restrictions) Model
+        +read_back(solution, graph)
+    }
+    class OrToolsEncoder {
+        +ENCODES: Restriction
+        +coarse_tiling: bool
+        +cost_model: CostModel
+        +post(subject, rule, expr, when)
+        +symbol(name, variable)
+    }
+    class CpmpyEncoder {
+        <<expansion>>
+    }
+    class SAEncoder {
+        <<expansion>>
+    }
+    class Model {
+        +provenance: list
+        +pruned: list
+        +symbols: dict
+        +boxes: list~PlacementBox~
+        +capacity: int
+    }
+    class ModelAbstractFactory {
+        <<abstract>>
+        +encoder(cost_model) Encoder
+        +solve(model, settings) Solution
+        +fallback(model, settings) Solution
+    }
+    class OrToolsFactory {
+        +placement: no_overlap | pack
+    }
+    class CpmpyFactory {
+        <<expansion>>
+    }
+    class SAFactory {
+        <<expansion>>
+    }
+    class Backend {
+        <<abstract>>
+        +solve(model, settings) Solution
+    }
 
-# ---- family layer -------------------------------------------------------------
-class Encoder(ABC):
-    def encode(self, graph, restrictions=None) -> Model: ...
-    def read_back(self, solution, graph) -> None: ...
-class ModelAbstractFactory(ABC):
-    def encoder(self, cost_model=None) -> Encoder: ...
-    def solve(self, model, settings: SolveSettings) -> Solution: ...
-    def fallback(self, model, settings) -> Solution: ...   # anneal the same model
-FACTORIES = {"ortools": OrToolsFactory, "cpmpy": CpmpyFactory, "sa": SAFactory}
-
-class SpyreOptimizer:
-    def optimize(self, graph):
-        model = encoder.encode(graph); solution = family.solve(model, settings)
-        # INFEASIBLE -> warnings.warn(user hints), return; no plan -> family.fallback
-        encoder.read_back(solution, graph); check_decisions(graph); self.commit(graph)
+    SpyreOptimizer *-- SpyreOptimizationGraph
+    SpyreOptimizer ..> ModelAbstractFactory : family from config
+    SpyreOptimizer ..> CostModel : hands to the encoder
+    SpyreOptimizer ..> Encoder : encode and read_back
+    SpyreOptimizer ..> Restriction : check_decisions
+    SpyreOptimizationGraph o-- OpNode : nodes
+    SpyreOptimizationGraph o-- Pin : pins
+    OpNode <|-- PointwiseNode
+    OpNode <|-- MatmulNode
+    OpNode <|-- ReductionNode
+    OpNode <|-- InputNode
+    OpNode o-- DataEdge : inputs and outputs
+    OpNode o-- ExecutionEdge : prev and next
+    OpNode ..> Restriction : frozen per type
+    DataEdge o-- Transform : steps
+    Transform <|-- CopyOut
+    Transform <|-- Restickify
+    Transform <|-- Relayout
+    Pin ..> DataEdge : or a node
+    CostModel ..> SpyreOptimizationGraph : reads data
+    Encoder ..> CostModel : consumes objective
+    Encoder <|-- OrToolsEncoder
+    Encoder <|-- CpmpyEncoder
+    Encoder <|-- SAEncoder
+    Encoder ..> Restriction : ENCODES
+    Encoder ..> Model : returns
+    Encoder ..> SpyreOptimizationGraph : read_back decodes a plan
+    ModelAbstractFactory ..> Encoder : creates
+    ModelAbstractFactory *-- Backend : private
+    ModelAbstractFactory <|-- OrToolsFactory
+    ModelAbstractFactory <|-- CpmpyFactory
+    ModelAbstractFactory <|-- SAFactory
+    Backend ..> Model : solves and places
 ```
 
-Rules every op obeys are not flags. `Always` names them; the encoder always applies
-them and `check_decisions` always checks them:
+### `optimize`
+
+```mermaid
+sequenceDiagram
+    participant O as SpyreOptimizer
+    participant G as SpyreOptimizationGraph
+    participant F as ModelAbstractFactory
+    participant E as Encoder
+    participant C as CostModel
+    participant B as Backend (private)
+    participant IR as GraphLowering
+
+    O->>G: build_graph(ir): nodes by op kind, edges, pins
+    O->>F: encoder(cost_model), family from config
+    F-->>O: encoder
+    O->>E: encode(graph, restrictions)
+    E->>E: op level: table, residency rules, sticks, node-type flags
+    E->>E: edge and op-op level: restickify, relayout, copy-out, cuts, in place
+    E->>E: graph level: record the boxes to place
+    E->>C: objective(graph)
+    C-->>E: sympy expression over named symbols
+    E->>E: encode the objective by symbol name
+    E-->>O: model
+    O->>F: solve(model, settings)
+    F->>B: solve and place (natively or by packing)
+    B-->>F: solution: status, objective, offsets
+    F-->>O: solution
+    alt proven infeasible
+        O->>O: warn naming the user hints, return the graph unchanged
+    else out of time with no plan
+        O->>F: fallback(model, settings): anneal the same model
+        F-->>O: solution
+    end
+    O->>E: read_back(solution, graph)
+    E->>G: decode splits, layouts, residency, offsets, steps, in place
+    O->>O: check_decisions(graph): every rule, no solver
+    O->>IR: commit: insert steps in order, divisions, offsets
+```
+
+### Restrictions
+
+A `Restriction` flag names what is special about an op type's decisions:
+
+```python
+class Restriction(Flag):
+    NONE = 0
+    WHOLE_STICKS = auto()              # a stuck axis splits in whole sticks
+    PADDED_REDUCTION_UNSPLIT = auto()  # a padded reduction stays on one core while stuck
+    MATMUL_STICKS = auto()             # x read stuck on K, y on N, the output on N
+    POINTWISE_STICKS = auto()          # inputs that index the output's stick axis stick on it;
+                                       # broadcast dims are exempt
+
+class OpNode:
+    restrictions: ClassVar[Restriction] = Restriction.WHOLE_STICKS
+
+class MatmulNode(OpNode):
+    x: int = 0; y: int = 1; k: str = "K"; n: str = "N"   # the attributes MATMUL_STICKS reads
+    restrictions = OpNode.restrictions | Restriction.MATMUL_STICKS | Restriction.PADDED_REDUCTION_UNSPLIT
+```
+
+- **Flags are frozen per node type.** Setting `restrictions` on an instance raises. A
+  test can override a type's flags through a mapping passed to `encode`,
+  `check_decisions` and `optimize`, for example
+  `{ReductionNode: ReductionNode.restrictions & ~Restriction.PADDED_REDUCTION_UNSPLIT}`.
+- **A flag only names a rule.** Two functions turn a flag into data from the node's
+  facts and the attributes its subtype adds:
+  - `splits_while_stuck(node, flag)` gives split domains that apply while something is
+    stuck;
+  - `stick_tables(node, flag)` gives tables of legal sticks.
+
+  Each family's encoder encodes that data, and `check_decisions` evaluates it.
+- **Coverage is checked.** `OrToolsEncoder.ENCODES` is itself a flag set, and
+  `coverage()` reports any flag on the graph's node types that a family cannot encode.
+- **A new flag needs three things:** its data, an encoding in each family, and a check.
+
+**Always-on rules** hold for every op, so they are not flags. The `Always` class names
+them; the encoder always applies them and `check_decisions` always checks them:
 
 - the split divides the axis;
 - the core budget holds;
 - at most one reduction axis is split;
 - tiles are on output axes, never the stick dim;
-- the cut-tile guard: a copied-out tile that stays resident has no reduction split;
-- main's residency rules;
-- restickify only where the read stick differs;
+- a copied-out tile that stays resident has no reduction split;
+- the residency rules hold;
+- a restickify appears only where the read stick differs;
 - pinned steps stay;
 - a copy-out lives in HBM;
-- in-place conditions;
-- tile alignment inside a nest;
+- in-place conditions hold;
+- tiles line up inside a nest;
 - resident boxes fit LX and never overlap.
 
-A flag only names a rule. `splits_while_stuck(node, flag)` and
-`stick_tables(node, flag)` turn it into data from the node's facts, which both the
-encoder and the check read. A test can override a type's flags
-(`{ReductionNode: ReductionNode.restrictions & ~Restriction.PADDED_REDUCTION_UNSPLIT}`).
-Setting `restrictions` on an instance raises.
+Data edges carry no restrictions.
 
-## Design rules
-
-These were settled in the design threads and in chat (2026-10-28).
+### Decisions
 
 | topic | decision |
 |---|---|
-| Graph inputs | Leaf `InputNode`s with downstream edges only. How they arrive is a pin. |
+| Graph inputs | Leaf `InputNode`s with downstream edges only. How an input arrives (its stick) is a pin. |
 | Layout | One `Layout` per node (its output), with no ports. What a consumer needs is a restriction, and a mismatch is a step on the edge. |
-| Memory | No `Buffer` class. Nodes and steps carry footprint, residency and offset, and placement works over both. |
-| Restrictions | A `Flag` class. Node types OR flags together and freeze them, and subtypes add the attributes the flags read. Always-on rules are built into the encoder and the check. Data edges have none. A new flag needs its data, an encoding in each family, and a check. |
-| Who applies rules | The family's encoder, at op, edge, op-op and graph level. There is no separate lookup or strategy. |
-| Residency rules | Always on, applied while building the table. A division is banned together with residency, not removed. |
-| Work division | Enumerated as on `main` ships first. Lazy work division comes later. |
-| Cuts | Derived where adjacent tiles don't match. Tile alignment is required on every edge inside a run (as `ilp_solver_ortools.py:985-992`). |
-| Copy-out | The buffer lives in HBM, filled tile by tile through its mutation layout, and is never placed in LX. Priced as `_cut_traffic_terms`. |
-| Restickify | A transform. It is forced where sticks differ, so it needs no elision. One inserted before the graph is built is a pinned step. |
-| Relayout | Keyed by the producer's reduction split, which restores the completed-reduction routes. Only from a resident source (a spilled one reloads in the consumer's configuration). Inside a tile it is priced per tile times the trip count. Never across a cut. |
-| In place | A variable on the edge: same-index read, adjacent lifetimes, same layout and footprint, at most one per op. The pair packs as one box. |
-| Objective | A sympy expression from the cost model, consumed by the encoder by symbol name. Cores only break ties. |
-| Placement | A backend detail. CP-SAT places natively or by packing; annealing and MIP solvers pack. |
-| Families | One object encodes and solves, with a private backend. OR-Tools comes first; CPMpy and SA are expansion axes, and CPMpy may later replace OR-Tools. |
-| Pins | Constraints, never decisions, never dropped. They come from hints, the pre-pass, hazards, or greedy pinning to cut search. Internal pins must never be infeasible. |
-| Failure | Proven infeasible → returned with a warning naming the user hints. Out of time with no plan → anneal the same model. |
+| Memory | No `Buffer` class. Nodes and transform steps carry their own footprint, residency and offset, and placement works over both. |
+| Who applies rules | The family's encoder, at op, edge, op-op and graph level. There is no separate lookup or strategy object. |
+| Residency rules | Always on, applied while the table is built. A division is banned together with residency rather than removed. |
+| Work division | Enumerated eagerly, as today, and pruned by the rules that hold unconditionally. Conditional rules are posted under their stick literal. |
+| Cuts | Derived wherever adjacent ops' tiles don't match. Two ops share a nest only if every data edge between them lines up tile by tile. A nest is the run of ops between two cuts, not an object. |
+| Copy-out | Forced when a cut lies between a data edge's ends. Its buffer lives in HBM, filled tile by tile, and is never placed in LX. There is one per producer, shared by every reader outside the nest, and its traffic is priced by the cost model. |
+| Restickify | A transform, forced where the read stick differs, so it needs no elision. A restickify inserted before the graph is built is a pinned step. |
+| Relayout | A chosen step, keyed by the producer's reduction split as well as the two layouts, so a completed-reduction route can read only the last core of each K group. Only from a resident source: a spilled producer reloads from HBM in the consumer's configuration. Inside a tile it is priced per tile times the trip count. Never across a cut. |
+| In place | A variable on the edge, allowed only when the consumer reads at the producer's index, adjacent lifetimes, both resident, same layout and footprint, and at most one per op. The pair shares one offset. |
+| Objective | A sympy expression from the cost model. The encoder consumes it and encodes it into its own variables by symbol name, and an unknown name fails. More cores only break ties. |
+| Placement | A backend detail. CP-SAT places natively (offsets under a 2-D no-overlap) or by packing (a cumulative under a roof, then a first-fit packer; on overflow the roof comes down and the model is solved again). Annealing and MIP solvers pack. |
+| Families | One object encodes and solves, and its backend is private. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools comes first, and CPMpy and SA are expansion axes. |
+| Pins | Constraints that narrow the solve, never decisions, never dropped. They come from hints, graph-input arrival, the restickify pre-pass, hazards, and greedy pins the encoder may add to cut search. Internal pins must never be infeasible. |
+| Failure | A model proven infeasible is returned infeasible, with nothing decoded or committed and a warning naming the user hints. A solve out of time with no plan anneals the same model. A failed check raises `RuleViolation`, because it means a bug. |
 | Decisions | They live in the solution. `read_back` decodes them onto the graph only from a plan, and commit lowers from the graph. |
-| Determinism | Opt-in: `SolveSettings(deterministic=True)` uses deterministic time, seed 0 and interleaved search. Otherwise speed wins. |
+| Determinism | Opt-in. `SolveSettings(deterministic=True)` budgets by deterministic time with a fixed seed and interleaved search. Otherwise speed wins. |
 | Loops | Not modelled. User-written loops are opaque hazards, pinned and never re-tiled. Drains stay with whatever inserts them. |
 | After commit | `LxContextSwitchingPass` stays a separate pass. |
-| Diagnostics | Conflict explanation (MUS/MCS) and `AxisRotation` are out of the first implementation. |
+| Out of the first implementation | Lazy work division, conflict explanation (MUS/MCS), `AxisRotation`, multi-level tiles, and the CPMpy and SA families. |
 
-## Phase 1: the design's types, no change to the solve
+## Stages
 
-Each stage is its own PR on `main` and leaves the full suite green. The owner commits
-each stage. Stage 0 is the staged conversion's Stage 0 (harness, corpus, same-plans
-check), unchanged.
+Each stage is its own PR on `main` and leaves the full suite green. Through Phase 1, and
+in Phase 2 wherever the rules agree with today's, the CP model stays byte-identical and
+the committed plans stay identical. Any other difference is listed by rule in its PR
+and either justified or fixed.
 
-### Stage 1. Node and edge types
+### Phase 1: the graph and the check, no change to the solve
 
-- This takes the place of the staged conversion's Stage 1, or reshapes its types if
-  that stage lands first.
-- `ResourceNode` becomes `OpNode` with `PointwiseNode`, `MatmulNode` (`x`, `y`, `k`,
-  `n`), `ReductionNode` and `InputNode`. A node holds its output's size, layout,
-  residency and offset.
-- `DependencyEdge` becomes `DataEdge` (operand index, `in_place`, step list).
-- `RelayoutEdge` and the copy edges become `Relayout`, `CopyOut` and `Restickify`
-  steps.
-- `Pin` gains `source`.
-- The existing strategies keep encoding through these types.
-- Verification: the Stage 0 proto diff is empty.
+**Stage 0. Harness and baseline.**
+- A device-free equivalence harness solves deterministically: one worker, seed 0, a
+  deterministic time budget and no wall-clock limit.
+- For each solve it records the model proto, status, objective and decisions. After
+  `_push_allocation` it also records the committed plan: inserted clones, relayout ops,
+  addresses, divisions and spill reasons.
+- The corpus is:
+  - the unit-test solves;
+  - the synthetic co-optimization graphs;
+  - captures from the zoo at default and `AUTO_COARSE_TILING=1`, with one forced solve
+    failure to cover the fallback;
+  - every `layout_solver` × `co_optimizing_lx_planning` combination.
+- No production code changes in this stage.
 
-### Stage 2. Builder
+**Stage 1. Graph types.**
+- Add `SpyreOptimizationGraph`, `OpNode` and its subtypes (`PointwiseNode`,
+  `MatmulNode` with `x`, `y`, `k`, `n`, `ReductionNode`, `InputNode`), `DataEdge`,
+  `ExecutionEdge`, `Pin`, `Transform`, `CopyOut`, `Restickify`, `Relayout`, `Layout`,
+  `WorkSplit` and `Axis`.
+- The graph layer imports no solver.
+- Unit tests cover each class: flags frozen per type, overrides, lifetimes, an edge's
+  read layout after its steps, and pins by source.
 
-The builder is the staged conversion's Stage 1 builder, or #5676's `GraphBuilder`
-lifted where `main` has not moved past it.
+**Stage 2. Builder.**
+- `build_graph` makes one node per op, choosing the subtype from the op kind with the
+  same predicates codegen uses.
+- It works out the axis-to-dim maps once from each read's index expression, and builds
+  data edges by operand index and execution edges from op order.
+- It adds pins for:
+  - graph-input arrival;
+  - restickifies the pre-pass inserted (pinned steps);
+  - work-division hints;
+  - hazards (user-written loops, drains);
+  - every op's stick as `propagate_layouts` fixed it.
+- The stick pins keep Phases 1–2 at parity: commit then never changes a layout, and
+  Stage 10 lifts them.
+- Build from the allocator's full record list, never from a solver's filtered view.
 
-- The builder builds one node per op, choosing its subtype from the op kind (the
-  predicates codegen uses, as `is_restickify_op` does). Each node gets axis-to-dim maps
-  from the index expressions (`TensorDep`).
-- The builder adds pins for graph-input arrival, the restickifies the pre-pass inserted
-  (source `pre-pass`), work-division hints, hazards (`PrescribedRegion`, `DrainPlan`),
-  and every node's stick as `propagate_layouts` fixed it.
-- Pinning sticks keeps Phases 1–2 at parity, since commit then never changes a layout.
-  Stage 10 lifts those pins.
-- Verification: the proto diff is empty.
+**Stage 3. Restrictions and the check.**
+- Add `Restriction`, `Always`, the residency rules, `splits_while_stuck`,
+  `stick_tables`, `check_decisions` and `coverage`.
+- They take over these rules from today's code:
+  - `work_division_constraints.py`: `coordinate_mask_blocked_vars` becomes
+    `PADDED_REDUCTION_UNSPLIT`, and each other op-specific constraint function becomes
+    a flag on the node types it applies to, with its data taken from the node's facts.
+    Examples are the qfp8wt K split domain, `plain_reduction_k_split_domains` and
+    `reduction_window_blocked_vars`;
+  - `_matmul_layouts` becomes `MATMUL_STICKS`;
+  - `_multi_arg_pointwise_layouts` and `_check_stick_all_same` become
+    `POINTWISE_STICKS`;
+  - `WorkDivisionContext.is_legal`, `ResidencyChecks` and
+    `check_in_place_parent_is_read` become always-on rules.
+- `check_decisions` runs on every plan today's solve commits. It reports but never
+  fails a compile.
+- **Phase 1 exit:** across the unit and device suites, `check_decisions` reports nothing,
+  or every report traces to a real bug that gets an issue.
 
-### Stage 3. Restrictions and the check
+### Phase 2: the OR-Tools family, behind config
 
-- Add `Restriction`, `Always`, `RESIDENCY_RULES`, `splits_while_stuck`,
-  `stick_tables`, `check_decisions` and `coverage`. Their sources on `main`:
-  - `work_division_constraints.py` (`coordinate_mask_blocked_vars`, `:350`);
-  - `_matmul_layouts` and `_multi_arg_pointwise_layouts` (`propagate_layouts.py:1298`,
-    `:1534`);
-  - `_check_stick_all_same` (`op_spec_validation.py:675`);
-  - `WorkDivisionContext.is_legal` (`work_division.py:818`);
-  - `ResidencyChecks` (`residency_rules.py`);
-  - `check_in_place_parent_is_read` (`plan_solver.py:903`).
-- Run `check_decisions` on every plan the current solve returns. It reports and never
-  fails the compile.
-- **Exit for Phase 1:** across the unit and device suites, `check_decisions` reports
-  nothing, or each report traces to a real bug that gets an issue.
-
-## Phase 2: the OR-Tools family, behind config
-
-### Stage 4. Cost model
-
-- `CostModel.objective(graph)` ports `main`'s objective:
-  - `spill_cost` (`ilp_solver_ortools.py:358`), with inputs and outputs discounted;
-  - `_cut_traffic_terms` (`:1267`) for copy-outs;
-  - the co-optimizing `cost_expr`, with its per-bundle terms and relayout charges as
-    `cost_expr_record` (`plan_solver.py:574`) dumps them;
+**Stage 4. Cost model.**
+- `CostModel.objective(graph)` ports today's objective:
+  - `spill_cost`, with graph inputs and outputs discounted;
+  - `_cut_traffic_terms` for copy-outs;
+  - the co-optimizing cost expression's per-bundle terms and relayout charges;
   - cores, only to break ties.
-- #5676's `pricing.py` is the reference for the shape of the port.
-- `Sym` names the symbols, and the existing printer (`cpsat_expr_printer.py`) encodes
-  the expression by name.
-- Verification: on the Stage 0 corpus, the objective equals today's, solve for solve.
+- `Sym` names every symbol, and `cpsat_expr_printer` encodes the expression by name.
+- Proven by: on the Stage 0 corpus, the objective equals today's, solve for solve.
 
-### Stage 5. `OrToolsEncoder`, op level
+**Stage 5. `OrToolsEncoder`, op level.**
+- The encoder builds today's work-division table (`enumerate_work_division_candidates`),
+  with coarse tilings in the same table when enabled.
+- Residency rules are applied while the table is built.
+- Sticks are variables, or constants where pinned.
+- Each node type's flags are posted: conditional splits under their stick literal, and
+  stick tables as table constraints.
+- Every constraint is tagged with its rule in the model's provenance, and the table
+  entries each rule pruned are recorded.
+- Proven by: an empty proto diff against today's model wherever the rules agree.
 
-- Builds what `CpSatLayoutSolver` builds today, and #5676's `EnumeratedStrategy` and
-  `PairTableStrategy` or #4's `CoreDivisionStrategy` if either lands first:
-  - the enumerated table (`enumerate_work_division_candidates`), with coarse tiling in
-    the same table and residency rules applied while building it;
-  - sticks as variables, or as constants where pinned;
-  - each node type's flags (conditional splits under their stick literal, stick tables
-    as table constraints).
-- Every constraint it posts is tagged with its rule in the model's provenance.
-- Verification: the proto diff against today's model is empty where the rules agree. Every remaining difference is listed by rule and either justified in the PR
-  or fixed.
+**Stage 6. `OrToolsEncoder`, edge and op-op level.**
+- **Restickify** is forced where the read stick differs, or pinned.
+- **Cross-frame hazard (an always-on rule).** A restickify may not read a core-sliced
+  resident source unless a relayout comes first. Today's `_restickify_barrier` enforces
+  this.
+- **Relayout** options are a table over source layout, producer reduction split and
+  destination layout, including completed-reduction routes
+  (`derive_completed_reduction_routes`). Relayouts are allowed inside a tile when both
+  ends share a nest, never across a cut.
+- **Cuts and copy-outs.** Cuts are derived through a running nest id that steps at each
+  cut, with tile alignment on every edge inside a run and copy-outs forced at cuts.
+  - A tiled op's live range starts at its nest's start, a solve decision as in today's
+    `_add_nest_starts`.
+  - The partial-reduction cut guard is an always-on rule.
+- **In place** is a variable on the edge.
+- **Clone reads** are constraints between the clone's view and the consumer's.
 
-### Stage 6. Edge and op-op level
+**Stage 7. Families and placement.**
+- Add `Model`, `ModelAbstractFactory` and `OrToolsFactory`, registered in `FACTORIES`
+  and chosen by a `config.layout_solver` value.
+- The private `CpSatBackend` places in one of two modes, set by a config option:
+  natively, under a 2-D no-overlap, or by packing (a cumulative under a roof, then
+  first-fit in several orders, lowering the roof on overflow).
+  - An in-place pair packs as one box.
+- `SolveSettings` carries the time limit, workers and opt-in determinism.
 
-- Restickify is forced where the read stick differs, or pinned.
-- **The restickify cross-frame hazard becomes an always-on rule.** A restickify must not
-  read a core-sliced resident source unless a relayout comes first (`main`:
-  `_restickify_barrier`, `allocator.py:1403`). The sketch does not encode this yet.
-- Relayout options are keyed by (source layout, producer reduction split, destination
-  layout), with completed-reduction routes (`derive_completed_reduction_routes`,
-  `lx_relayout.py:680`). The sketch declares `Relayout` but does not post it yet.
-- Copy-outs are derived from cuts.
-- Tile alignment is enforced inside a run.
-- In place is a variable on the edge.
-- Clone reads become constraints.
-
-### Stage 7. Families and placement
-
-- Add `ModelAbstractFactory` and `OrToolsFactory`, registered in `FACTORIES` and
-  selected by a new `config.layout_solver` value, so the choice enters the FX cache key.
-  This replaces `SPYRE_LX_BACKEND` as the selector.
-- The private `CpSatBackend` places natively (2-D no-overlap) or by packing. The packer
-  is `_C.pack_boxes`.
-- `SolveSettings` makes determinism opt-in.
-- `Mip` becomes a family that packs. That is not needed for the switch-over, and it
-  stays out of scope until its linearization solves attention graphs (see #4's *Out of
-  scope*).
-- `BruteForce` stays as the oracle for encoder unit tests.
-
-### Stage 8. `SpyreOptimizer`
-
+**Stage 8. `SpyreOptimizer`.**
 - `optimize` runs encode → solve, then `read_back` → `check_decisions` → commit.
-- A model proven infeasible returns with a warning naming the user hints.
-- A solve out of time with no plan runs `fallback`: the branch's `Annealing` over the
-  same recorded model, which packs, once the SA probe holds. Until then the fallback is
-  the staged conversion's `SaConversionStrategy`.
-- A failed check raises `RuleViolation`.
-- `graph.solve` goes.
-- **Exit for Phase 2**, with the new family selected:
+- **A model proven infeasible** returns with a warning naming the user hints, and
+  nothing is decoded or committed.
+- **A solve out of time with no plan** runs `fallback`, simulated annealing over the
+  same model, which packs. It replaces the greedy re-plan only once it matches today's
+  SA co-optimizer's plans across the corpus; until then the greedy re-plan stays as the
+  fallback.
+- **A failed check** raises `RuleViolation`.
+- **Phase 2 exit**, with the new family selected:
   - the unit and device suites pass;
-  - HBM traffic (the objective) is no worse than `CoOptimizingAllocator`'s on the
-    suites and the zoo captures;
-  - planning time on the zoo replay stays within run-to-run noise of `main`'s (torch-spyre/torch-spyre#5676
-    planned 21–30% slower by default).
+  - HBM traffic is no worse than `CoOptimizingAllocator`'s on the suites and the zoo,
+    including committed mode (every division pinned);
+  - planning time on the zoo stays within run-to-run noise of today's.
 
-## Phase 3: commit, sticks in the solve, switch-over
+### Phase 3: commit, sticks in the solve, switch-over
 
-### Stage 9. Commit
-
+**Stage 9. Commit.**
 - `SpyreOptimizer.commit` inserts each edge's steps in canonical order (pinned steps
-  exist already), then commits divisions and offsets through `GraphEditor`. This
-  replaces `_push_allocation` (`allocator.py:1019`).
+  already exist), then commits divisions and offsets through `GraphEditor`. This
+  replaces `_push_allocation`.
 - `LxContextSwitchingPass` runs after commit, unchanged.
 
-### Stage 10. Sticks in the solve
-
+**Stage 10. Sticks in the solve.**
 - Lift the Stage 2 stick pins, except graph inputs and pre-pass restickifies. The
-  solver then chooses each node's stick and places the restickifies it needs, as the
-  sketch does for `k` in SDPA decode.
-- This is the earlier plan's "restickification in the solve", and it needs:
-  - `propagate_layouts` to accept a stick decided by the solve;
-  - codegen to accept layouts decided after LX planning;
-  - the cross-frame hazard from Stage 6 kept;
-  - a restickify's compute time accounted for.
+  solver then chooses each op's stick and places the restickifies it needs.
+- This requires four things:
+  - `propagate_layouts` accepts a stick decided by the solve;
+  - codegen accepts layouts decided after LX planning;
+  - the Stage 6 cross-frame hazard holds;
+  - a restickify's compute time is accounted for.
 - The restickify pre-pass stays as the source of pinned steps.
-- `elide_proven_read_copies` (`read_copy_elision.py:607`) goes, because a restickify is
-  never present where the sticks agree.
+- `elide_proven_read_copies` goes, because a restickify is never present where the
+  sticks agree.
 
-### Stage 11. Shadow comparison and default flip
+**Stage 11. Default flip.**
+- Run the old and new paths side by side on CI models, comparing traffic, planning time
+  and correctness, then make the new optimizer the default.
 
-- Run the old and new paths side by side on CI models, comparing traffic, planning
-  time and correctness, then flip the default.
-
-### Stage 12. Deletions
-
-- `GreedyLayoutSolver`, `FirstFitLayoutSolver`, `BestFitLayoutSolver`,
-  `ExhaustiveSearchSolver`.
+**Stage 12. Deletions.**
+- `ScratchpadAllocator` and `CoOptimizingAllocator`, whose role `SpyreOptimizer` takes
+  over. Joint division and placement is the only mode, and placement-only is the same
+  model with every division pinned.
 - `MemoryPlanSolver`, `CoreDivisionLayoutSolver` and `CpSatLayoutSolver`.
-- The `SolveError` → greedy re-plan in `scratchpad_planning` (`allocator.py:5127`).
+- `GreedyLayoutSolver`, `FirstFitLayoutSolver`, `BestFitLayoutSolver` and
+  `ExhaustiveSearchSolver`. First-fit lives on inside the backends that pack.
+- `SimulatedAnnealingLayoutSolver` and `SaCoOptimizingSolver`, once the annealing
+  fallback has replaced them.
+- The `SolveError` re-plan in `scratchpad_planning`.
 - The stick rules now held once in the flags: `_matmul_layouts`,
   `_multi_arg_pointwise_layouts` and `_check_stick_all_same`.
-- **Exit for Phase 3:** the optimizer is the default, and the replaced solvers and
-  duplicated rules are deleted.
-
-## Later (not planned)
-
-- **Lazy work division.** The branch's `LazyStrategy` becomes a second encoding in the
-  OR-Tools family. It is worth doing once coarse tiling, work division and relayout
-  combine and the enumerated table grows too large.
-- **Conflict explanation (MUS, MCS, step-wise).** This would name which user hints make
-  a model infeasible, rather than listing all of them.
-- **`AxisRotation`** and the dim-order conversions from the earlier plan's future work.
-- **CPMpy and SA families.** They read the same flags (`coverage()` names any flag a
-  family cannot encode), and CPMpy may later replace OR-Tools.
-- **Multi-level tiles.** `main`'s `TileSpec`s are multi-level, outermost first, while
-  the sketch holds one level.
-- **Solve budget per use**, for example a quick compile against an AOT build.
+- **Phase 3 exit:** the optimizer is the default, and the replaced solvers and the
+  duplicated rules are gone.
 
 ## Verification
 
-- **Stages 1–2, and Stage 5 where the rules agree:** the Stage 0 equivalence harness
-  from `cpsat-graph-buffer-refactor` must show an empty proto diff. That means 1 worker,
-  `random_seed=0`, no wall-clock limit, the same corpus, and the 89 zoo captures replayed
-  without a device.
+- **Every stage:** the Stage 0 harness, comparing proto, decisions and committed plans
+  between the stage's parent and the change. Baselines are re-recorded after every
+  rebase.
 - **From Stage 3:** `check_decisions` runs on every plan in every suite.
-- **Unit and device suites:** the same lists as that plan's *Verification*, serial,
-  base against change, with baselines re-recorded on each stage's parent commit. Add the
-  sketch's examples (`run_examples.py`) as unit tests of the graph layer and the check.
-- **After Stages 5, 8 and 10:** replay the zoo captures with `timers.py` on base and
-  change, in one process and interleaved, and flag planning-time growth beyond noise.
-- `pre-commit run --files <changed>` (ruff, mypy).
-
-## Known gaps in the sketch
-
-The sketch is the design, not the implementation.
-
-- `build_graph`, `commit`, the annealing fallback, and the CPMpy and SA encoders raise
-  `NotImplementedError`.
-- `Relayout` is declared but not encoded.
-- Clone reads are not modelled.
-- The restickify cross-frame hazard is not encoded (Stage 6).
-- Lifetimes are fixed: each runs from the node's step to its last reader. On `main`,
-  torch-spyre/torch-spyre#5246 makes a tiled op's live range start at its nest's start (`_add_nest_starts`,
-  `ilp_solver_ortools.py:1078`), which is a solve decision. Stage 6 must carry that over.
-- Tiles have one level.
-- Placement-only parity (every division pinned) is untested. torch-spyre/torch-spyre#5676 priced the committed
-  mode like the open mode and changed plans that way, so the Phase 2 parity gate must
-  include the committed mode.
-- `to_cpsat` handles the cost terms the sketch uses; `main`'s printer handles more.
-
-## Probes
-
-**`probes/lx-allocator/`** holds the sketch and what it measures. It needs no
-torch-spyre checkout and no card, only `pip install ortools sympy`.
-
-| probe | file | answers |
-|---|---|---|
-| The design, runnable | `lx_design.py` | Plans the three cases (MLP decode, SDPA decode, MLP prefill with coarse tiling and packing) deterministically, and checks each with `check_decisions` |
-| Examples per class | `lx_examples.py`, `run_examples.py` | One small runnable example for each class on the design page: flag freezing and overrides, a narrower encoder caught by `coverage`, the infeasible-hint warning, both placement modes |
-| Placement under pressure | `stack.py` | A decoder stack (14 ops per layer) under shrinking LX capacity, planned with CP-SAT placing natively and by packing; objective, time, spills, peak and check |
-
-Typical runs:
-
-```bash
-cd probes/lx-allocator
-python3 lx_design.py                 # the three cases (output: run_output.txt)
-python3 run_examples.py Restriction  # one class's examples
-python3 stack.py 8 120 8 1,0.1,0.04,0.02   # layers, time limit s, workers, capacity scales
-```
-
-`stack.py` results on 8 CP-SAT workers (`stack_output.txt`):
-
-| layers | LX capacity | native 2-D no-overlap | packing | same objective | check |
-|---|---|---|---|---|---|
-| 8 | ×1 | 12.8 s | 1.2 s | yes | ok |
-| 8 | ×0.1 | 5.8 s | 1.0 s | yes | ok |
-| 8 | ×0.04 | 7.9 s | 1.3 s | yes | ok |
-| 8 | ×0.02 (16–17 ops spill) | 13.7 s | 2.4 s | yes | ok |
-| 16 | ×1 | 43.8 s | 3.6 s | yes | ok |
-| 16 | ×0.02 (33 ops spill) | 299.3 s | 16.4 s | yes | ok |
-
-Every run ended OPTIMAL. Packing reached the same optimum 5.7 to 18 times faster, and
-the gap widens as the graph grows and LX tightens. The times are for the whole
-`optimize`: encode, solve, place and check. This
-is why placement is a backend detail: a family can pick packing without changing the
-model. The graphs are synthetic (32 tokens, hidden 4096, intermediate 12800, KV length
-100), not captures.
+- **Unit suites, run serially:**
+  - `test_scratchpad_solver`, `test_solver_relayout_decision`,
+    `test_cooptimization_types`, `test_cost_expr_dump`;
+  - `test_restickify_cost_model`, `test_sa_cooptimizer`, `test_coarse_tiling`,
+    `test_work_division*`;
+  - `test_scratchpad_patterns`, `test_perm_layout_solver`, `test_scratchpad_use`,
+    `test_solver_auto_coarse_tiling`;
+  - the new graph-layer tests.
+- **Device suites after Stages 5, 6, 8, 9 and 10:** `test_scratchpad_use`,
+  `test_work_division`, `test_solver_relayout_e2e`, `test_solver_auto_coarse_tiling`
+  and `test_lx_planning_suite`. After Stages 8 and 10, also the `test_inductor_ops_lx_*`
+  shards.
+- **Planning time, after Stages 5, 8 and 10:** replay the zoo captures on base and
+  change, in one process and interleaved, and flag growth beyond noise.
+- **Housekeeping:** `pre-commit run --files <changed>` (ruff, mypy).
