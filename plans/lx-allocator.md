@@ -89,9 +89,12 @@ classDiagram
 
 #### Graph
 
-The graph layer holds no solver types. Each node carries its output layout as a
-`FixedTiledLayout`, the host size and stride plus the `SpyreTensorLayout` that
-codegen uses, so every rule reads the same device layout the compiler commits.
+The graph layer holds no solver types. A node connects to data edges through named
+ports: one `InPort` per operand it reads and one `OutPort` for what it writes. Each node
+type declares its port names in `PORTS`, so rules, pins and edges name an operand
+(`x`, `table`) rather than an index. The out port carries the node's output layout as a
+`FixedTiledLayout`, the host size and stride plus the `SpyreTensorLayout` that codegen
+uses, so every rule reads the same device layout the compiler commits.
 
 ```mermaid
 classDiagram
@@ -105,7 +108,7 @@ classDiagram
         +alignment: int
         +capacity: int
         +add_node(node) OpNode
-        +add_read(src, dst, operand) DataEdge
+        +connect(out, in_port) DataEdge
         +pin(target, what, value, source) Pin
         +pins_on(target, what) list~Pin~
         +step(node) int
@@ -115,43 +118,60 @@ classDiagram
         <<abstract>>
         +name: str
         +axes: tuple~Axis~
-        +reads: tuple~dict~
-        +writes: dict
         +size: int
-        +inputs: list~DataEdge~
-        +outputs: list~DataEdge~
+        +in_ports: dict~str, InPort~
+        +out: OutPort
         +prev: ExecutionEdge
         +next: ExecutionEdge
         +work_split: WorkSplit
-        +layout: FixedTiledLayout
         +resident: bool
         +offset: int
+        +PORTS: tuple~str~$
         +restrictions: Restriction$
         +runs: bool$
+        +port(name) InPort
         +padded_reductions() list
         +whole_stick_factors(axis) tuple
-        +broadcast_dims(operand) list
-        +same_index_read(operand) bool
+        +broadcast_dims(port) list
+        +same_index_read(port) bool
         +footprint(splits, tiling, alignment) int
     }
+    class Port {
+        <<abstract>>
+        +name: str
+        +node: OpNode
+        +axis_map: dict~Axis, int~
+    }
+    class InPort {
+        +operand: int
+        +index: sympy.Expr
+        +edge: DataEdge
+    }
+    class OutPort {
+        +layout: FixedTiledLayout
+        +edges: list~DataEdge~
+    }
     class PointwiseNode {
+        PORTS = in0 .. inN
         restrictions = WHOLE_STICKS | POINTWISE_STICKS
     }
     class MatmulNode {
+        PORTS = x, y
         +k: Axis
         +n: Axis
         restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT
     }
     class ReductionNode {
+        PORTS = in0
         restrictions = WHOLE_STICKS | PADDED_REDUCTION_UNSPLIT
     }
     class IndirectNode {
-        +table: int
-        +index: int
+        PORTS = table, index, values
         +scatter: bool
         restrictions = WHOLE_STICKS | INDIRECT_ACCESS
     }
     class InputNode {
+        PORTS = none
         runs = False
         restrictions = NONE
     }
@@ -161,9 +181,8 @@ classDiagram
         +device_layout: SpyreTensorLayout
     }
     class DataEdge {
-        +src: OpNode
-        +dst: OpNode
-        +operand: int
+        +src: OutPort
+        +dst: InPort
         +in_place: bool
         +transforms: list~Transform~
         +read_layout() FixedTiledLayout
@@ -174,7 +193,7 @@ classDiagram
         +cut: bool
     }
     class Pin {
-        +target: OpNode | DataEdge
+        +target: OpNode | Port | DataEdge
         +what: str
         +value
         +source: str
@@ -198,24 +217,35 @@ classDiagram
     OpNode <|-- ReductionNode
     OpNode <|-- IndirectNode
     OpNode <|-- InputNode
-    OpNode *-- FixedTiledLayout : output layout
-    OpNode o-- DataEdge : inputs and outputs
+    OpNode *-- InPort : in_ports
+    OpNode *-- OutPort : out
+    Port <|-- InPort
+    Port <|-- OutPort
+    OutPort *-- FixedTiledLayout : output layout
+    OutPort o-- DataEdge : edges
+    InPort o-- DataEdge : edge
     OpNode o-- ExecutionEdge : prev and next
     OpNode ..> Restriction : frozen per type
     DataEdge o-- Transform : steps
-    Pin ..> DataEdge : or a node
+    Pin ..> DataEdge : or a port or a node
 ```
 
+An in port records how its operand is read: the operand index it is bound to, the
+read's index expression and its axis-to-dim map. The out port records the write's map.
+The builder works these out once, so a rule asks `node.port("x")` instead of searching
+the reads.
+
 `MatmulNode.k` and `.n` are the contraction axis and the output-column axis that
-`MATMUL_STICKS` reads (x stuck on K, y and the output on N). The builder finds them once
+`MATMUL_STICKS` reads (port `x` stuck on K, port `y` and the out port on N). The builder finds them once
 from the reads' index symbols, as `_matmul_layouts` does today with
 `find_reduction_var` and `find_matmul_generated_var`, including the `M = 1` and `N = 1`
-cases where one symbol simplifies away. The operands need no attributes: x and y are
-always operands 0 and 1 (`identify_matmul_inputs` confirms the positional order).
+cases where one symbol simplifies away. Ports `x` and `y` bind to operands 0 and 1
+(`identify_matmul_inputs` confirms the positional order).
 
 `IndirectNode` is a gather (an indirect read) or a scatter (an indirect write,
-`scatter = True`). `table` is the operand holding the shared value table or scatter
-destination, and `index` the operand holding the indices. Every core reads the table
+`scatter = True`). Port `table` reads the shared value table or scatter destination,
+`index` reads the indices, and `values` reads a scatter's source (a gather leaves it
+unbound). Every core reads the table
 at one base address, so `INDIRECT_ACCESS` keeps its data dims unsplit; only the
 index-entry dims carry the op's parallelism.
 
@@ -404,7 +434,7 @@ class Restriction(Flag):
     NONE = 0
     WHOLE_STICKS = auto()              # a stuck axis splits in whole sticks
     PADDED_REDUCTION_UNSPLIT = auto()  # a padded reduction stays on one core while stuck
-    MATMUL_STICKS = auto()             # x read stuck on K, y on N, the output on N
+    MATMUL_STICKS = auto()             # port x stuck on K, port y on N, the output on N
     POINTWISE_STICKS = auto()          # inputs that index the output's stick axis stick on it;
                                        # broadcast dims are exempt
     INDIRECT_ACCESS = auto()           # a gather table's or scatter destination's data dims stay
@@ -415,6 +445,7 @@ class OpNode:
     restrictions: ClassVar[Restriction] = Restriction.WHOLE_STICKS
 
 class MatmulNode(OpNode):
+    PORTS = ("x", "y")
     k: Axis   # contraction axis, read by MATMUL_STICKS
     n: Axis   # output-column axis, read by MATMUL_STICKS
     restrictions = OpNode.restrictions | Restriction.MATMUL_STICKS | Restriction.PADDED_REDUCTION_UNSPLIT
@@ -458,7 +489,8 @@ Data edges carry no restrictions.
 | topic | decision |
 |---|---|
 | Graph inputs | Leaf `InputNode`s with downstream edges only. How an input arrives (its stick) is a pin. |
-| Layout | One `FixedTiledLayout` per node (its output), carrying its `SpyreTensorLayout`, with no ports. What a consumer needs is a restriction, and a mismatch is a step on the edge. |
+| Ports | Every operand a node reads is a named `InPort` and its output an `OutPort`, with names declared per node type. Data edges run from an out port to an in port, and rules and pins name ports, never operand indices. |
+| Layout | One `FixedTiledLayout` per node, on its out port, carrying its `SpyreTensorLayout`. An in port holds no layout of its own: what a consumer needs is a restriction over its port names, and a mismatch is a step on the edge. |
 | Memory | No `Buffer` class. Nodes and transform steps carry their own footprint, residency and offset, and placement works over both. |
 | Who applies rules | The family's encoder, at op, edge, op-op and graph level. There is no separate lookup or strategy object. |
 | Residency rules | Always on, applied while the table is built. A division is banned together with residency rather than removed. |
@@ -503,21 +535,21 @@ and either justified or fixed.
 - No production code changes in this stage.
 
 **Stage 1. Graph types.**
-- Add `SpyreOptimizationGraph`, `OpNode` and its subtypes (`PointwiseNode`,
-  `MatmulNode` with `k` and `n`, `ReductionNode`, `IndirectNode` with `table`,
-  `index` and `scatter`, `InputNode`), `DataEdge`,
-  `ExecutionEdge`, `Pin`, `Transform`, `CopyOut`, `Restickify`, `Relayout`,
-  `WorkSplit` and `Axis`. Layouts are torch-spyre's own `FixedTiledLayout` and
+- Add `SpyreOptimizationGraph`, `Port`, `InPort`, `OutPort`, `OpNode` and its subtypes
+  with their `PORTS` (`PointwiseNode`, `MatmulNode` with `k` and `n`, `ReductionNode`,
+  `IndirectNode` with `scatter`, `InputNode`), `DataEdge`, `ExecutionEdge`, `Pin`,
+  `Transform`, `CopyOut`, `Restickify`, `Relayout`, `WorkSplit` and `Axis`. Layouts are torch-spyre's own `FixedTiledLayout` and
   `SpyreTensorLayout`, not a new type.
 - The graph layer imports no solver.
-- Unit tests cover each class: flags frozen per type, overrides, lifetimes, an edge's
-  read layout after its steps, and pins by source.
+- Unit tests cover each class: flags frozen per type, overrides, ports by name, lifetimes,
+  an edge's read layout after its steps, and pins by source.
 
 **Stage 2. Builder.**
 - `build_graph` makes one node per op, choosing the subtype from the op kind with the
   same predicates codegen uses.
-- It works out the axis-to-dim maps once from each read's index expression, and builds
-  data edges by operand index and execution edges from op order.
+- It binds each operand to the node type's in port, works out each port's axis-to-dim
+  map once from the read's index expression, connects data edges from out port to in
+  port, and builds execution edges from op order.
 - It adds pins for:
   - graph-input arrival;
   - restickifies the pre-pass inserted (pinned steps);
@@ -540,7 +572,7 @@ and either justified or fixed.
     `reduction_window_blocked_vars`;
   - `indirect_access_split_domains` (`indirect_forbidden_split_syms`) becomes
     `INDIRECT_ACCESS`. The flag reads its shared-table dims from the node's `table`
-    operand and its partial-stick entry dims from `index`; whether the gather output
+    port and its partial-stick entry dims from its `index` port; whether the gather output
     was padded (`is_output_stick_aligned_for_entry`) is a fact the builder records;
   - `_matmul_layouts` becomes `MATMUL_STICKS`;
   - `_multi_arg_pointwise_layouts` and `_check_stick_all_same` become
