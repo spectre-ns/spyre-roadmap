@@ -55,6 +55,7 @@ classDiagram
 
     class SpyreOptimizer {
         +family: ModelAbstractFactory
+        +fallback: ModelAbstractFactory
         +cost_model: CostModel
         +settings: SolveSettings
         +plan_allocation(ir) SpyreOptimizationGraph
@@ -79,7 +80,7 @@ classDiagram
 
     SpyreOptimizer *-- SpyreOptimizationGraph
     SpyreOptimizer *-- SolveSettings
-    SpyreOptimizer ..> ModelAbstractFactory : family from config
+    SpyreOptimizer ..> ModelAbstractFactory : family and fallback from config
     SpyreOptimizer ..> CostModel : hands to the encoder
     SpyreOptimizer ..> Encoder : encode and read_back
     SpyreOptimizer ..> Restriction : check_decisions
@@ -273,8 +274,10 @@ left for its own design.
 #### Families
 
 One factory per solver family creates that family's encoder and owns its private
-backend. `CpmpyFactory`, `SAFactory` and their encoders are expansions, not part of
-this plan.
+backend, and each encoder builds its family's own model. OR-Tools builds a CP model.
+SA builds an `AnnealModel`, a port of today's `SaCoOptimizingSolver` state, because an
+annealer moves through divisions and a placement order rather than through CP
+variables. `CpmpyFactory` and its encoder are an expansion, not part of this plan.
 
 ```mermaid
 classDiagram
@@ -284,7 +287,6 @@ classDiagram
         <<abstract>>
         +encoder(cost_model) Encoder
         +solve(model, settings) Solution
-        +fallback(model, settings) Solution
     }
     class OrToolsFactory {
         +placement: no_overlap | pack
@@ -293,7 +295,7 @@ classDiagram
         <<expansion>>
     }
     class SAFactory {
-        <<expansion>>
+        +seed: int
     }
     class Backend {
         <<abstract>>
@@ -315,14 +317,25 @@ classDiagram
         <<expansion>>
     }
     class SAEncoder {
-        <<expansion>>
+        +ENCODES: Restriction
+        +cost_model: CostModel
+        +score(state) int
     }
     class Model {
+        <<abstract>>
         +provenance: list
         +pruned: list
         +symbols: dict
         +boxes: list~PlacementBox~
         +capacity: int
+    }
+    class CpModel {
+        +proto: CpModelProto
+    }
+    class AnnealModel {
+        +domains: dict~OpNode, DivisionSource~
+        +relations: dict~DataEdge, EdgeRelation~
+        +order: list~PlacementBox~
     }
     class CostModel
     class SpyreOptimizationGraph
@@ -337,6 +350,8 @@ classDiagram
     Encoder <|-- SAEncoder
     Encoder ..> CostModel : consumes objective
     Encoder ..> Model : returns
+    Model <|-- CpModel
+    Model <|-- AnnealModel
     Encoder ..> SpyreOptimizationGraph : read_back decodes a plan
     Backend ..> Model : solves and places
 ```
@@ -371,8 +386,8 @@ sequenceDiagram
     alt proven infeasible
         O->>O: warn naming the user hints, return the graph unchanged
     else out of time with no plan
-        O->>F: fallback(model, settings): anneal the same model
-        F-->>O: solution
+        O->>O: encode and solve again with the fallback family (SA)
+        O-->>O: solution
     end
     O->>E: read_back(solution, graph)
     E->>G: decode splits, layouts, residency, offsets, steps, in place
@@ -455,14 +470,14 @@ Data edges carry no restrictions.
 | In place | A variable on the edge, allowed only when the consumer reads at the producer's index, adjacent lifetimes, both resident, same layout and footprint, and at most one per op. The pair shares one offset. |
 | Objective | A sympy expression from the cost model. The encoder consumes it and encodes it into its own variables by symbol name, and an unknown name fails. More cores only break ties. |
 | Placement | A backend detail. CP-SAT places natively (offsets under a 2-D no-overlap) or by packing (a cumulative under a roof, then a first-fit packer; on overflow the roof comes down and the model is solved again). Annealing and MIP solvers pack. |
-| Families | One object encodes and solves, and its backend is private. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools comes first, and CPMpy and SA are expansion axes. |
+| Families | One object encodes and solves, and its backend is private. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools and SA are built here, each encoding into its own model; CPMpy is an expansion axis. |
 | Pins | Constraints that narrow the solve, never decisions, never dropped. They come from hints, graph-input arrival, the restickify pre-pass, hazards, and greedy pins the encoder may add to cut search. Internal pins must never be infeasible. |
-| Failure | A model proven infeasible is returned infeasible, with nothing decoded or committed and a warning naming the user hints. A solve out of time with no plan anneals the same model. A failed check raises `RuleViolation`, because it means a bug. |
+| Failure | A model proven infeasible is returned infeasible, with nothing decoded or committed and a warning naming the user hints. A solve out of time with no plan is retried with the fallback family (SA by default), which encodes the same graph into its own model. A failed check raises `RuleViolation`, because it means a bug. |
 | Decisions | They live in the solution. `read_back` decodes them onto the graph only from a plan, and commit lowers from the graph. |
 | Determinism | Opt-in. `SolveSettings(deterministic=True)` budgets by deterministic time with a fixed seed and interleaved search. Otherwise speed wins. |
 | Loops | Not modelled. User-written loops are opaque hazards, pinned and never re-tiled. Drains stay with whatever inserts them. |
 | After commit | `LxContextSwitchingPass` stays a separate pass. |
-| Out of the first implementation | Lazy work division, conflict explanation (MUS/MCS), `AxisRotation`, the `Transpose` step, multi-level tiles, and the CPMpy and SA families. |
+| Out of the first implementation | Lazy work division, conflict explanation (MUS/MCS), `AxisRotation`, the `Transpose` step, multi-level tiles, and the CPMpy family. |
 
 ## Stages
 
@@ -511,7 +526,7 @@ and either justified or fixed.
   - every op's stick as `propagate_layouts` fixed it;
   - the dim order `reorder_nonstick_dims` gives a gather table or scatter destination.
 - The stick pins keep Phases 1–2 at parity: commit then never changes a layout, and
-  Stage 10 lifts them.
+  Stage 11 lifts them.
 - Build from the allocator's full record list, never from a solver's filtered view.
 
 **Stage 3. Restrictions and the check.**
@@ -537,7 +552,7 @@ and either justified or fixed.
 - **Phase 1 exit:** across the unit and device suites, `check_decisions` reports nothing,
   or every report traces to a real bug that gets an issue.
 
-### Phase 2: the OR-Tools family, behind config
+### Phase 2: the OR-Tools and SA families, behind config
 
 **Stage 4. Cost model.**
 - `CostModel.objective(graph)` ports today's objective:
@@ -577,40 +592,68 @@ and either justified or fixed.
 - **Clone reads** are constraints between the clone's view and the consumer's.
 
 **Stage 7. Families and placement.**
-- Add `Model`, `ModelAbstractFactory` and `OrToolsFactory`, registered in `FACTORIES`
-  and chosen by a `config.layout_solver` value.
+- Add `Model`, `CpModel`, `ModelAbstractFactory` and `OrToolsFactory`, registered in
+  `FACTORIES` and chosen by a `config.layout_solver` value.
 - The private `CpSatBackend` places in one of two modes, set by a config option:
   natively, under a 2-D no-overlap, or by packing (a cumulative under a roof, then
   first-fit in several orders, lowering the roof on overflow).
   - An in-place pair packs as one box.
 - `SolveSettings` carries the time limit, workers and opt-in determinism.
 
-**Stage 8. `SpyreOptimizer`.**
+**Stage 8. `SAFactory`, today's SA co-optimizer as a family.**
+- `SAEncoder` builds an `AnnealModel`, not a CP model. It ports what
+  `SaCoOptimizingSolver` builds today:
+  - per node, a division source over the same work-division table as Stage 5
+    (`_MenuDivisions`), or drawn tilings when coarse tiling is on
+    (`_GeneratedDivisions`);
+  - per data edge, a relation between producer and consumer divisions
+    (`_TableRelation`, `_ViewRelation`); an edge with no compatible pair becomes a cut;
+  - the boxes to place, in a placement order that the first-fit packer
+    (`NativePermutationLayoutSolver`) turns into offsets.
+- The rules come from the same data as the OR-Tools encoder (`splits_while_stuck`,
+  `stick_tables`, the always-on rules). Unconditional rules prune the domains and edge
+  rules live in the relations, so every state the annealer visits is legal; nothing is
+  priced as a penalty. `ENCODES` and `coverage()` work as for OR-Tools.
+- `score` compiles the cost model's sympy objective once, by symbol name, into the
+  integer fixed-point evaluator `_build_score_fn` makes today. An unknown name fails,
+  as in the OR-Tools encoder.
+- The private `AnnealBackend` keeps today's moves (reorder, division flip, region
+  recolor), the Metropolis test, best-seen from the seed state, and a seeded `Random`,
+  so a run is reproducible.
+- Registered in `FACTORIES` under its own `config.layout_solver` value, and the
+  default `fallback` family.
+- Proven by: on the Stage 0 corpus with the same seed, the plans equal today's
+  `SaCoOptimizingSolver` plans wherever the rules agree, and `check_decisions` passes
+  on every one.
+
+**Stage 9. `SpyreOptimizer`.**
 - `optimize` runs encode → solve, then `read_back` → `check_decisions` → commit.
 - **A model proven infeasible** returns with a warning naming the user hints, and
   nothing is decoded or committed.
-- **A solve out of time with no plan** runs `fallback`, simulated annealing over the
-  same model, which packs. It replaces the greedy re-plan only once it matches today's
-  SA co-optimizer's plans across the corpus; until then the greedy re-plan stays as the
-  fallback.
+- **A solve out of time with no plan** encodes and solves the graph again with the
+  `fallback` family, SA by default. It replaces the greedy re-plan only once Stage 8's
+  parity holds; until then the greedy re-plan stays as the fallback.
 - **A failed check** raises `RuleViolation`.
-- **Phase 2 exit**, with the new family selected:
+- **Phase 2 exit**, with each new family selected in turn:
   - the unit and device suites pass;
-  - HBM traffic is no worse than `CoOptimizingAllocator`'s on the suites and the zoo,
-    including committed mode (every division pinned);
+  - HBM traffic is no worse than today's on the suites and the zoo:
+    `CoOptimizingAllocator` for OR-Tools, `SaCoOptimizingSolver` for SA, including
+    committed mode (every division pinned);
   - planning time on the zoo stays within run-to-run noise of today's.
 
 ### Phase 3: commit, sticks in the solve, switch-over
 
-**Stage 9. Commit.**
+**Stage 10. Commit.**
 - `SpyreOptimizer.commit` inserts each edge's steps in canonical order (pinned steps
   already exist), then commits divisions and offsets through `GraphEditor`. This
   replaces `_push_allocation`.
 - `LxContextSwitchingPass` runs after commit, unchanged.
 
-**Stage 10. Sticks in the solve.**
+**Stage 11. Sticks in the solve.**
 - Lift the Stage 2 stick pins, except graph inputs and pre-pass restickifies. The
-  solver then chooses each op's stick and places the restickifies it needs.
+  solver then chooses each op's stick and places the restickifies it needs. In
+  OR-Tools a stick is a variable; in SA it joins each node's domain, so a division flip
+  can change it and the edge relations force the restickifies.
 - This requires four things:
   - `propagate_layouts` accepts a stick decided by the solve;
   - codegen accepts layouts decided after LX planning;
@@ -620,19 +663,20 @@ and either justified or fixed.
 - `elide_proven_read_copies` goes, because a restickify is never present where the
   sticks agree.
 
-**Stage 11. Default flip.**
+**Stage 12. Default flip.**
 - Run the old and new paths side by side on CI models, comparing traffic, planning time
   and correctness, then make the new optimizer the default.
 
-**Stage 12. Deletions.**
+**Stage 13. Deletions.**
 - `ScratchpadAllocator` and `CoOptimizingAllocator`, whose role `SpyreOptimizer` takes
   over. Joint division and placement is the only mode, and placement-only is the same
   model with every division pinned.
 - `MemoryPlanSolver`, `CoreDivisionLayoutSolver` and `CpSatLayoutSolver`.
 - `GreedyLayoutSolver`, `FirstFitLayoutSolver`, `BestFitLayoutSolver` and
   `ExhaustiveSearchSolver`. First-fit lives on inside the backends that pack.
-- `SimulatedAnnealingLayoutSolver` and `SaCoOptimizingSolver`, once the annealing
-  fallback has replaced them.
+- `SimulatedAnnealingLayoutSolver` and `SaCoOptimizingSolver`, whose role the SA
+  family takes over. Placement-only annealing is the SA family with every division
+  pinned.
 - The `SolveError` re-plan in `scratchpad_planning`.
 - The stick rules now held once in the flags: `_matmul_layouts`,
   `_multi_arg_pointwise_layouts` and `_check_stick_all_same`.
@@ -653,10 +697,10 @@ and either justified or fixed.
   - `test_scratchpad_patterns`, `test_perm_layout_solver`, `test_scratchpad_use`,
     `test_solver_auto_coarse_tiling`;
   - the new graph-layer tests.
-- **Device suites after Stages 5, 6, 8, 9 and 10:** `test_scratchpad_use`,
+- **Device suites after Stages 5, 6, 8, 9, 10 and 11:** `test_scratchpad_use`,
   `test_work_division`, `test_solver_relayout_e2e`, `test_solver_auto_coarse_tiling`
-  and `test_lx_planning_suite`. After Stages 8 and 10, also the `test_inductor_ops_lx_*`
+  and `test_lx_planning_suite`. After Stages 9 and 11, also the `test_inductor_ops_lx_*`
   shards.
-- **Planning time, after Stages 5, 8 and 10:** replay the zoo captures on base and
+- **Planning time, after Stages 5, 8, 9 and 11:** replay the zoo captures on base and
   change, in one process and interleaved, and flag growth beyond noise.
 - **Housekeeping:** `pre-commit run --files <changed>` (ruff, mypy).
