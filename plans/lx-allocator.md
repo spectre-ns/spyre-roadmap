@@ -732,6 +732,9 @@ without changing them.
   user hints listed first and internal pins after, its explanation names user hints
   wherever a conflict made of them exists. `mcs` gives the fewest hints to drop, and
   `marco` enumerates the alternatives.
+  Reference: [CP2023, "Explainable Constraint Solving: A Hands-On
+  Tutorial"](https://www.youtube.com/watch?v=V9DPHZq0gXk), which walks through these
+  techniques in CPMpy.
 - **SA over the CPMpy model.** An annealer that walks assignments of the CPMpy model's
   variables, so SA and the CP families share one encoding instead of SA keeping its own
   `AnnealModel`. The open question is speed: each move evaluates CPMpy expressions
