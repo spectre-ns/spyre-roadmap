@@ -39,11 +39,19 @@ The design has two layers.
     the boxes to place, and consumes the cost model.
   - Its private backend solves the model and places the boxes.
 
-### Class diagram
+### Class diagrams
+
+The classes fall into four groups, one diagram each. A class drawn without members
+belongs to another group's diagram.
+
+#### Optimizer
+
+`SpyreOptimizer` owns the graph, takes its solver family from config and hands the cost
+model to that family's encoder.
 
 ```mermaid
 classDiagram
-    direction TB
+    direction LR
 
     class SpyreOptimizer {
         +family: ModelAbstractFactory
@@ -59,6 +67,35 @@ classDiagram
         +spill_cost(node) int
         +cut_traffic(node) list~sympy.Expr~
     }
+    class SolveSettings {
+        +time_limit: float
+        +workers: int
+        +deterministic: bool
+    }
+    class SpyreOptimizationGraph
+    class ModelAbstractFactory
+    class Encoder
+    class Restriction
+
+    SpyreOptimizer *-- SpyreOptimizationGraph
+    SpyreOptimizer *-- SolveSettings
+    SpyreOptimizer ..> ModelAbstractFactory : family from config
+    SpyreOptimizer ..> CostModel : hands to the encoder
+    SpyreOptimizer ..> Encoder : encode and read_back
+    SpyreOptimizer ..> Restriction : check_decisions
+    CostModel ..> SpyreOptimizationGraph : reads data
+```
+
+#### Graph
+
+The graph layer holds no solver types. Each node carries its output layout as a
+`FixedTiledLayout`, the host size and stride plus the `SpyreTensorLayout` that
+codegen uses, so every rule reads the same device layout the compiler commits.
+
+```mermaid
+classDiagram
+    direction TB
+
     class SpyreOptimizationGraph {
         +nodes: list~OpNode~
         +data_edges: list~DataEdge~
@@ -79,21 +116,19 @@ classDiagram
         +axes: tuple~Axis~
         +reads: tuple~dict~
         +writes: dict
-        +shape: tuple
         +size: int
-        +elems_per_stick: int
         +inputs: list~DataEdge~
         +outputs: list~DataEdge~
         +prev: ExecutionEdge
         +next: ExecutionEdge
         +work_split: WorkSplit
-        +layout: Layout
+        +layout: FixedTiledLayout
         +resident: bool
         +offset: int
         +restrictions: Restriction$
         +runs: bool$
         +padded_reductions() list
-        +whole_stick_factors(axis, elems_per_stick) tuple
+        +whole_stick_factors(axis) tuple
         +broadcast_dims(operand) list
         +same_index_read(operand) bool
         +footprint(splits, tiling, alignment) int
@@ -102,18 +137,27 @@ classDiagram
         restrictions = WHOLE_STICKS | POINTWISE_STICKS
     }
     class MatmulNode {
-        +x: int
-        +y: int
-        +k: str
-        +n: str
+        +k: Axis
+        +n: Axis
         restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT
     }
     class ReductionNode {
         restrictions = WHOLE_STICKS | PADDED_REDUCTION_UNSPLIT
     }
+    class IndirectNode {
+        +table: int
+        +index: int
+        +scatter: bool
+        restrictions = WHOLE_STICKS | INDIRECT_ACCESS
+    }
     class InputNode {
         runs = False
         restrictions = NONE
+    }
+    class FixedTiledLayout {
+        +size: list
+        +stride: list
+        +device_layout: SpyreTensorLayout
     }
     class DataEdge {
         +src: OpNode
@@ -121,7 +165,7 @@ classDiagram
         +operand: int
         +in_place: bool
         +transforms: list~Transform~
-        +read_layout() Layout
+        +read_layout() FixedTiledLayout
     }
     class ExecutionEdge {
         +before: OpNode
@@ -135,6 +179,55 @@ classDiagram
         +source: str
         +internal: bool
     }
+    class Restriction {
+        <<Flag>>
+        NONE
+        WHOLE_STICKS
+        PADDED_REDUCTION_UNSPLIT
+        MATMUL_STICKS
+        POINTWISE_STICKS
+        INDIRECT_ACCESS
+    }
+    class Transform
+
+    SpyreOptimizationGraph o-- OpNode : nodes
+    SpyreOptimizationGraph o-- Pin : pins
+    OpNode <|-- PointwiseNode
+    OpNode <|-- MatmulNode
+    OpNode <|-- ReductionNode
+    OpNode <|-- IndirectNode
+    OpNode <|-- InputNode
+    OpNode *-- FixedTiledLayout : output layout
+    OpNode o-- DataEdge : inputs and outputs
+    OpNode o-- ExecutionEdge : prev and next
+    OpNode ..> Restriction : frozen per type
+    DataEdge o-- Transform : steps
+    Pin ..> DataEdge : or a node
+```
+
+`MatmulNode.k` and `.n` are the contraction axis and the output-column axis that
+`MATMUL_STICKS` reads (x stuck on K, y and the output on N). The builder finds them once
+from the reads' index symbols, as `_matmul_layouts` does today with
+`find_reduction_var` and `find_matmul_generated_var`, including the `M = 1` and `N = 1`
+cases where one symbol simplifies away. The operands need no attributes: x and y are
+always operands 0 and 1 (`identify_matmul_inputs` confirms the positional order).
+
+`IndirectNode` is a gather (an indirect read) or a scatter (an indirect write,
+`scatter = True`). `table` is the operand holding the shared value table or scatter
+destination, and `index` the operand holding the indices. Every core reads the table
+at one base address, so `INDIRECT_ACCESS` keeps its data dims unsplit; only the
+index-entry dims carry the op's parallelism.
+
+#### Transforms
+
+A data edge carries an ordered list of steps that turn the producer's layout into the
+one the consumer reads. Each step has its own footprint, residency and offset, so
+placement treats it like a node.
+
+```mermaid
+classDiagram
+    direction TB
+
     class Transform {
         <<abstract>>
         +resident: bool
@@ -144,7 +237,7 @@ classDiagram
         +ORDER: int$
         +forced: bool$
         +in_lx: bool$
-        +apply(layout) Layout
+        +apply(layout) FixedTiledLayout
     }
     class CopyOut {
         ORDER = 0, forced, in HBM
@@ -158,13 +251,53 @@ classDiagram
         +reduction_split: int
         ORDER = 2, chosen
     }
-    class Restriction {
-        <<Flag>>
-        NONE
-        WHOLE_STICKS
-        PADDED_REDUCTION_UNSPLIT
-        MATMUL_STICKS
-        POINTWISE_STICKS
+    class Transpose {
+        <<out of scope>>
+        +perm: tuple~int~
+        chosen
+    }
+    class DataEdge
+
+    DataEdge o-- Transform : steps
+    Transform <|-- CopyOut
+    Transform <|-- Restickify
+    Transform <|-- Relayout
+    Transform <|-- Transpose
+```
+
+`Transpose` is in the diagram only to show where it would go: a step that permutes the
+device dims of a resident tile, priced like a relayout. It is not built in this plan
+(see "Out of the first implementation" below), and its `ORDER` among the other steps is
+left for its own design.
+
+#### Families
+
+One factory per solver family creates that family's encoder and owns its private
+backend. `CpmpyFactory`, `SAFactory` and their encoders are expansions, not part of
+this plan.
+
+```mermaid
+classDiagram
+    direction TB
+
+    class ModelAbstractFactory {
+        <<abstract>>
+        +encoder(cost_model) Encoder
+        +solve(model, settings) Solution
+        +fallback(model, settings) Solution
+    }
+    class OrToolsFactory {
+        +placement: no_overlap | pack
+    }
+    class CpmpyFactory {
+        <<expansion>>
+    }
+    class SAFactory {
+        <<expansion>>
+    }
+    class Backend {
+        <<abstract>>
+        +solve(model, settings) Solution
     }
     class Encoder {
         <<abstract>>
@@ -191,58 +324,20 @@ classDiagram
         +boxes: list~PlacementBox~
         +capacity: int
     }
-    class ModelAbstractFactory {
-        <<abstract>>
-        +encoder(cost_model) Encoder
-        +solve(model, settings) Solution
-        +fallback(model, settings) Solution
-    }
-    class OrToolsFactory {
-        +placement: no_overlap | pack
-    }
-    class CpmpyFactory {
-        <<expansion>>
-    }
-    class SAFactory {
-        <<expansion>>
-    }
-    class Backend {
-        <<abstract>>
-        +solve(model, settings) Solution
-    }
+    class CostModel
+    class SpyreOptimizationGraph
 
-    SpyreOptimizer *-- SpyreOptimizationGraph
-    SpyreOptimizer ..> ModelAbstractFactory : family from config
-    SpyreOptimizer ..> CostModel : hands to the encoder
-    SpyreOptimizer ..> Encoder : encode and read_back
-    SpyreOptimizer ..> Restriction : check_decisions
-    SpyreOptimizationGraph o-- OpNode : nodes
-    SpyreOptimizationGraph o-- Pin : pins
-    OpNode <|-- PointwiseNode
-    OpNode <|-- MatmulNode
-    OpNode <|-- ReductionNode
-    OpNode <|-- InputNode
-    OpNode o-- DataEdge : inputs and outputs
-    OpNode o-- ExecutionEdge : prev and next
-    OpNode ..> Restriction : frozen per type
-    DataEdge o-- Transform : steps
-    Transform <|-- CopyOut
-    Transform <|-- Restickify
-    Transform <|-- Relayout
-    Pin ..> DataEdge : or a node
-    CostModel ..> SpyreOptimizationGraph : reads data
-    Encoder ..> CostModel : consumes objective
-    Encoder <|-- OrToolsEncoder
-    Encoder <|-- CpmpyEncoder
-    Encoder <|-- SAEncoder
-    Encoder ..> Restriction : ENCODES
-    Encoder ..> Model : returns
-    Encoder ..> SpyreOptimizationGraph : read_back decodes a plan
-    ModelAbstractFactory ..> Encoder : creates
-    ModelAbstractFactory *-- Backend : private
     ModelAbstractFactory <|-- OrToolsFactory
     ModelAbstractFactory <|-- CpmpyFactory
     ModelAbstractFactory <|-- SAFactory
+    ModelAbstractFactory ..> Encoder : creates
+    ModelAbstractFactory *-- Backend : private
+    Encoder <|-- OrToolsEncoder
+    Encoder <|-- CpmpyEncoder
+    Encoder <|-- SAEncoder
+    Encoder ..> CostModel : consumes objective
+    Encoder ..> Model : returns
+    Encoder ..> SpyreOptimizationGraph : read_back decodes a plan
     Backend ..> Model : solves and places
 ```
 
@@ -297,12 +392,16 @@ class Restriction(Flag):
     MATMUL_STICKS = auto()             # x read stuck on K, y on N, the output on N
     POINTWISE_STICKS = auto()          # inputs that index the output's stick axis stick on it;
                                        # broadcast dims are exempt
+    INDIRECT_ACCESS = auto()           # a gather table's or scatter destination's data dims stay
+                                       # unsplit; so does an entry dim whose last index stick is
+                                       # partial, unless the gather output was padded to a stick
 
 class OpNode:
     restrictions: ClassVar[Restriction] = Restriction.WHOLE_STICKS
 
 class MatmulNode(OpNode):
-    x: int = 0; y: int = 1; k: str = "K"; n: str = "N"   # the attributes MATMUL_STICKS reads
+    k: Axis   # contraction axis, read by MATMUL_STICKS
+    n: Axis   # output-column axis, read by MATMUL_STICKS
     restrictions = OpNode.restrictions | Restriction.MATMUL_STICKS | Restriction.PADDED_REDUCTION_UNSPLIT
 ```
 
@@ -344,7 +443,7 @@ Data edges carry no restrictions.
 | topic | decision |
 |---|---|
 | Graph inputs | Leaf `InputNode`s with downstream edges only. How an input arrives (its stick) is a pin. |
-| Layout | One `Layout` per node (its output), with no ports. What a consumer needs is a restriction, and a mismatch is a step on the edge. |
+| Layout | One `FixedTiledLayout` per node (its output), carrying its `SpyreTensorLayout`, with no ports. What a consumer needs is a restriction, and a mismatch is a step on the edge. |
 | Memory | No `Buffer` class. Nodes and transform steps carry their own footprint, residency and offset, and placement works over both. |
 | Who applies rules | The family's encoder, at op, edge, op-op and graph level. There is no separate lookup or strategy object. |
 | Residency rules | Always on, applied while the table is built. A division is banned together with residency rather than removed. |
@@ -363,7 +462,7 @@ Data edges carry no restrictions.
 | Determinism | Opt-in. `SolveSettings(deterministic=True)` budgets by deterministic time with a fixed seed and interleaved search. Otherwise speed wins. |
 | Loops | Not modelled. User-written loops are opaque hazards, pinned and never re-tiled. Drains stay with whatever inserts them. |
 | After commit | `LxContextSwitchingPass` stays a separate pass. |
-| Out of the first implementation | Lazy work division, conflict explanation (MUS/MCS), `AxisRotation`, multi-level tiles, and the CPMpy and SA families. |
+| Out of the first implementation | Lazy work division, conflict explanation (MUS/MCS), `AxisRotation`, the `Transpose` step, multi-level tiles, and the CPMpy and SA families. |
 
 ## Stages
 
@@ -390,9 +489,11 @@ and either justified or fixed.
 
 **Stage 1. Graph types.**
 - Add `SpyreOptimizationGraph`, `OpNode` and its subtypes (`PointwiseNode`,
-  `MatmulNode` with `x`, `y`, `k`, `n`, `ReductionNode`, `InputNode`), `DataEdge`,
-  `ExecutionEdge`, `Pin`, `Transform`, `CopyOut`, `Restickify`, `Relayout`, `Layout`,
-  `WorkSplit` and `Axis`.
+  `MatmulNode` with `k` and `n`, `ReductionNode`, `IndirectNode` with `table`,
+  `index` and `scatter`, `InputNode`), `DataEdge`,
+  `ExecutionEdge`, `Pin`, `Transform`, `CopyOut`, `Restickify`, `Relayout`,
+  `WorkSplit` and `Axis`. Layouts are torch-spyre's own `FixedTiledLayout` and
+  `SpyreTensorLayout`, not a new type.
 - The graph layer imports no solver.
 - Unit tests cover each class: flags frozen per type, overrides, lifetimes, an edge's
   read layout after its steps, and pins by source.
@@ -407,7 +508,8 @@ and either justified or fixed.
   - restickifies the pre-pass inserted (pinned steps);
   - work-division hints;
   - hazards (user-written loops, drains);
-  - every op's stick as `propagate_layouts` fixed it.
+  - every op's stick as `propagate_layouts` fixed it;
+  - the dim order `reorder_nonstick_dims` gives a gather table or scatter destination.
 - The stick pins keep Phases 1–2 at parity: commit then never changes a layout, and
   Stage 10 lifts them.
 - Build from the allocator's full record list, never from a solver's filtered view.
@@ -421,6 +523,10 @@ and either justified or fixed.
     a flag on the node types it applies to, with its data taken from the node's facts.
     Examples are the qfp8wt K split domain, `plain_reduction_k_split_domains` and
     `reduction_window_blocked_vars`;
+  - `indirect_access_split_domains` (`indirect_forbidden_split_syms`) becomes
+    `INDIRECT_ACCESS`. The flag reads its shared-table dims from the node's `table`
+    operand and its partial-stick entry dims from `index`; whether the gather output
+    was padded (`is_output_stick_aligned_for_entry`) is a fact the builder records;
   - `_matmul_layouts` becomes `MATMUL_STICKS`;
   - `_multi_arg_pointwise_layouts` and `_check_stick_all_same` become
     `POINTWISE_STICKS`;
