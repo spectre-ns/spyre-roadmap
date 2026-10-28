@@ -1,0 +1,14 @@
+# python3 stack.py 8 120 8 1,0.1,0.04,0.02; python3 stack.py 16 300 8 1,0.02
+# OR-Tools 9.15, sympy 1.14, Python 3.13, 8 CP-SAT workers; wall time is the whole optimize (encode + solve + place + check)
+L=8 T=32 cap x1.0   no_overlap: OPTIMAL       12.8s objective  7572025888  spilled   1  peak 8322/16384  check: ok
+L=8 T=32 cap x1.0   pack      : OPTIMAL        1.2s objective  7572025888  spilled   1  peak 8322/16384  check: ok
+L=8 T=32 cap x0.1   no_overlap: OPTIMAL        5.8s objective  7616590368  spilled   1  peak 664/1638  check: ok
+L=8 T=32 cap x0.1   pack      : OPTIMAL        1.0s objective  7616590368  spilled   1  peak 664/1638  check: ok
+L=8 T=32 cap x0.04  no_overlap: OPTIMAL        7.9s objective  7616590368  spilled   1  peak 464/655  check: ok
+L=8 T=32 cap x0.04  pack      : OPTIMAL        1.3s objective  7616590368  spilled   1  peak 464/655  check: ok
+L=8 T=32 cap x0.02  no_overlap: OPTIMAL       13.7s objective  7633891872  spilled  17  peak 264/327  check: ok
+L=8 T=32 cap x0.02  pack      : OPTIMAL        2.4s objective  7633891872  spilled  16  peak 264/327  check: ok
+L=16 T=32 cap x1.0   no_overlap: OPTIMAL       43.8s objective 15145100320  spilled   1  peak 8322/16384  check: ok
+L=16 T=32 cap x1.0   pack      : OPTIMAL        3.6s objective 15145100320  spilled   0  peak 8322/16384  check: ok
+L=16 T=32 cap x0.02  no_overlap: OPTIMAL      299.3s objective 15270929440  spilled  33  peak 264/327  check: ok
+L=16 T=32 cap x0.02  pack      : OPTIMAL       16.4s objective 15270929440  spilled  33  peak 264/327  check: ok
