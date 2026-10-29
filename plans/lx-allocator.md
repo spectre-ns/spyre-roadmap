@@ -141,6 +141,7 @@ classDiagram
         +name: str
         +node: OpNode
         +axis_map: dict~Axis, int~
+        +facts: PortFact
     }
     class InPort {
         +operand: int
@@ -159,7 +160,7 @@ classDiagram
         PORTS = x, y
         +k: Axis
         +n: Axis
-        restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT
+        restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT | ENCODED_K_UNSPLIT
     }
     class ReductionNode {
         PORTS = in0
@@ -207,6 +208,15 @@ classDiagram
         MATMUL_STICKS
         POINTWISE_STICKS
         INDIRECT_ACCESS
+        ENCODED_K_UNSPLIT
+    }
+    class PortFact {
+        <<Flag>>
+        NONE
+        QFP8WT
+        STAGGERED_EA
+        OVERLAPPING_READ
+        DIRECT_READ_SOURCE
     }
     class Transform
 
@@ -226,6 +236,7 @@ classDiagram
     InPort o-- DataEdge : edge
     OpNode o-- ExecutionEdge : prev and next
     OpNode ..> Restriction : frozen per type
+    Port ..> PortFact : derived by the builder
     DataEdge o-- Transform : steps
     Pin ..> DataEdge : or a port or a node
 ```
@@ -234,6 +245,13 @@ An in port records how its operand is read: the operand index it is bound to, th
 read's index expression and its axis-to-dim map. The out port records the write's map.
 The builder works these out once, so a rule asks `node.port("x")` instead of searching
 the reads.
+
+A port also carries `facts`, a `PortFact` flag set the builder derives once. A fact
+describes the tensor or the read behind one operand, not the op. A rule keyed on a fact
+therefore applies to every op that touches that tensor, through the port that carries
+it, and the port's axis map turns the tensor dims it names into the op's loop axes.
+`QFP8WT` on a weight restricts both the op that writes it (its out port) and the matmul
+that reads it (port `y`), and neither node type mentions QFP8WT.
 
 `MatmulNode.k` and `.n` are the contraction axis and the output-column axis that
 `MATMUL_STICKS` reads (port `x` stuck on K, port `y` and the out port on N). The builder finds them once
@@ -439,6 +457,14 @@ class Restriction(Flag):
     INDIRECT_ACCESS = auto()           # a gather table's or scatter destination's data dims stay
                                        # unsplit; so does an entry dim whose last index stick is
                                        # partial, unless the gather output was padded to a stick
+    ENCODED_K_UNSPLIT = auto()         # K stays unsplit when a port is QFP8WT or STAGGERED_EA
+
+class PortFact(Flag):
+    NONE = 0
+    QFP8WT = auto()              # the tensor is QFP8WT (a 2x64 stick)
+    STAGGERED_EA = auto()        # FP32_TO_DL16 or DL16_TO_FP32: elements reordered in a stick
+    OVERLAPPING_READ = auto()    # the read overlaps itself, as in x.unfold
+    DIRECT_READ_SOURCE = auto()  # a staged copy whose read may later go straight to a graph input
 
 class OpNode:
     restrictions: ClassVar[Restriction] = Restriction.WHOLE_STICKS
@@ -447,7 +473,8 @@ class MatmulNode(OpNode):
     PORTS = ("x", "y")
     k: Axis   # contraction axis, read by MATMUL_STICKS
     n: Axis   # output-column axis, read by MATMUL_STICKS
-    restrictions = OpNode.restrictions | Restriction.MATMUL_STICKS | Restriction.PADDED_REDUCTION_UNSPLIT
+    restrictions = (OpNode.restrictions | Restriction.MATMUL_STICKS
+                    | Restriction.PADDED_REDUCTION_UNSPLIT | Restriction.ENCODED_K_UNSPLIT)
 ```
 
 - **Flags are frozen per node type.** Setting `restrictions` on an instance raises. A
@@ -461,6 +488,16 @@ class MatmulNode(OpNode):
   - `stick_tables(node, flag)` gives tables of legal sticks.
 
   Each family's encoder encodes that data, and `check_decisions` evaluates it.
+- **Port facts trigger rules a node type cannot.** A `Restriction` names what is special
+  about an op kind; a `PortFact` names what is special about one operand. A rule keyed
+  only on a fact is an always-on rule over every port that carries it:
+  - `QFP8WT`: the dims indexing the second stick coordinate and the batch dims stay
+    unsplit;
+  - `OVERLAPPING_READ`: the window variable splits so no core sweeps an overlap;
+  - `DIRECT_READ_SOURCE`: the source's stick dim splits in whole sticks.
+
+  A node flag can also require a fact. `ENCODED_K_UNSPLIT` keeps a matmul's K unsplit
+  only when one of its ports is `QFP8WT` or `STAGGERED_EA`.
 - **Coverage is checked.** `OrToolsEncoder.ENCODES` is itself a flag set, and
   `coverage()` reports any flag on the graph's node types that a family cannot encode.
 - **A new flag needs three things:** its data, an encoding in each family, and a check.
@@ -478,6 +515,7 @@ them; the encoder always applies them and `check_decisions` always checks them:
 - pinned steps stay;
 - a copy-out lives in HBM;
 - in-place conditions hold;
+- the rules each port fact names hold;
 - tiles line up inside a nest;
 - resident boxes fit LX and never overlap.
 
@@ -489,6 +527,7 @@ Data edges carry no restrictions.
 |---|---|
 | Graph inputs | Leaf `InputNode`s with downstream edges only. How an input arrives (its stick) is a pin. |
 | Ports | Every operand a node reads is a named `InPort` and its output an `OutPort`, with names declared per node type. Data edges run from an out port to an in port, and rules and pins name ports, never operand indices. |
+| Port facts | A `PortFact` set on each port, derived once by the builder. Out-port facts come from the layout's element arrangement. In-port facts come from the edge's read layout, so a step that changes the layout changes them, and from the read itself (overlap, direct-read provenance). Rules keyed on a tensor property live here, not on node types. |
 | Layout | One `FixedTiledLayout` per node, on its out port, carrying its `SpyreTensorLayout`. An in port holds no layout of its own: what a consumer needs is a restriction over its port names, and a mismatch is a step on the edge. |
 | Memory | No `Buffer` class. Nodes and transform steps carry their own footprint, residency and offset, and placement works over both. |
 | Who applies rules | The family's encoder, at op, edge, op-op and graph level. There is no separate lookup or strategy object. |
@@ -534,13 +573,13 @@ and either justified or fixed.
 - No production code changes in this stage.
 
 **Stage 1. Graph types.**
-- Add `SpyreOptimizationGraph`, `Port`, `InPort`, `OutPort`, `OpNode` and its subtypes
+- Add `SpyreOptimizationGraph`, `Port`, `InPort`, `OutPort`, `PortFact`, `OpNode` and its subtypes
   with their `PORTS` (`PointwiseNode`, `MatmulNode` with `k` and `n`, `ReductionNode`,
   `IndirectNode` with `scatter`, `InputNode`), `DataEdge`, `ExecutionEdge`, `Pin`,
   `Transform`, `CopyOut`, `Restickify`, `Relayout`, `WorkSplit` and `Axis`. Layouts are torch-spyre's own `FixedTiledLayout` and
   `SpyreTensorLayout`, not a new type.
 - The graph layer imports no solver.
-- Unit tests cover each class: flags frozen per type, overrides, ports by name, lifetimes,
+- Unit tests cover each class: flags frozen per type, overrides, ports by name, port facts, lifetimes,
   an edge's read layout after its steps, and pins by source.
 
 **Stage 2. Builder.**
@@ -549,6 +588,10 @@ and either justified or fixed.
 - It binds each operand to the node type's in port, works out each port's axis-to-dim
   map once from the read's index expression, connects data edges from out port to in
   port, and builds execution edges from op order.
+- It derives each port's facts: `QFP8WT` and `STAGGERED_EA` from the layout's element
+  arrangement, `OVERLAPPING_READ` from the read's coordinates
+  (`overlapping_coordinate_extents`), and `DIRECT_READ_SOURCE` from a staged copy's
+  saved direct-read record.
 - It adds pins for:
   - graph-input arrival;
   - restickifies the pre-pass inserted (pinned steps);
@@ -573,6 +616,11 @@ and either justified or fixed.
     `INDIRECT_ACCESS`. The flag reads its shared-table dims from the node's `table`
     port and its partial-stick entry dims from its `index` port; whether the gather output
     was padded (`is_output_stick_aligned_for_entry`) is a fact the builder records;
+  - the rules keyed on a tensor property become port-fact rules:
+    `qfp8wt_split_domains` (`QFP8WT`), `overlapping_window_split_domains`
+    (`OVERLAPPING_READ`) and `direct_read_source_stick_split_domains`
+    (`DIRECT_READ_SOURCE`). `qfp8wt_matmul_k_split_domains` becomes
+    `ENCODED_K_UNSPLIT`, a node flag that reads its ports' facts;
   - `_matmul_layouts` becomes `MATMUL_STICKS`;
   - `_multi_arg_pointwise_layouts` and `_check_stick_all_same` become
     `POINTWISE_STICKS`;
@@ -689,7 +737,9 @@ and either justified or fixed.
   - `propagate_layouts` accepts a stick decided by the solve;
   - codegen accepts layouts decided after LX planning;
   - the Stage 6 cross-frame hazard holds;
-  - a restickify's compute time is accounted for.
+  - a restickify's compute time is accounted for;
+  - port facts that come from a layout become conditional on the layout the solve
+    picks, posted under its literal like the stick rules.
 - The restickify pre-pass stays as the source of pinned steps.
 - `elide_proven_read_copies` goes, because a restickify is never present where the
   sticks agree.
