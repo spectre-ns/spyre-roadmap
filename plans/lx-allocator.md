@@ -41,8 +41,9 @@ The design has two layers.
 
 ### Class diagrams
 
-The classes fall into four groups, one diagram each. A class drawn without members
-belongs to another group's diagram.
+The classes fall into six groups, one diagram each. A class drawn without members
+belongs to another group's diagram. A node class appears in each diagram with only the
+members that diagram is about.
 
 #### Optimizer
 
@@ -89,12 +90,9 @@ classDiagram
 
 #### Graph
 
-The graph layer holds no solver types. A node connects to data edges through named
-ports: one `InPort` per operand it reads and one `OutPort` for what it writes. Each node
-type declares its port names in `PORTS`, so rules, pins and edges name an operand
-(`x`, `table`) rather than an index. The out port carries the node's output layout as a
-`FixedTiledLayout`, the host size and stride plus the `SpyreTensorLayout` that codegen
-uses, so every rule reads the same device layout the compiler commits.
+The graph layer holds no solver types. Op nodes are joined by data edges, which carry
+transform steps, and by execution edges, which order them. Pins narrow the solve. Ports
+and restrictions have their own diagrams below.
 
 ```mermaid
 classDiagram
@@ -119,67 +117,31 @@ classDiagram
         +name: str
         +axes: tuple~Axis~
         +size: int
-        +in_ports: dict~str, InPort~
-        +out: OutPort
         +prev: ExecutionEdge
         +next: ExecutionEdge
         +work_split: WorkSplit
         +resident: bool
         +offset: int
-        +PORTS: tuple~str~$
-        +restrictions: Restriction$
         +runs: bool$
-        +port(name) InPort
         +padded_reductions() list
         +whole_stick_factors(axis) tuple
         +broadcast_dims(port) list
         +same_index_read(port) bool
         +footprint(splits, tiling, alignment) int
     }
-    class Port {
-        <<abstract>>
-        +name: str
-        +node: OpNode
-        +axis_map: dict~Axis, int~
-        +facts: PortFact
-    }
-    class InPort {
-        +operand: int
-        +index: sympy.Expr
-        +edge: DataEdge
-    }
-    class OutPort {
-        +layout: FixedTiledLayout
-        +edges: list~DataEdge~
-    }
-    class PointwiseNode {
-        PORTS = in0 .. inN
-        restrictions = WHOLE_STICKS | POINTWISE_STICKS
-    }
+    class InPort
+    class OutPort
+    class PointwiseNode
     class MatmulNode {
-        PORTS = x, y
         +k: Axis
         +n: Axis
-        restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT | ENCODED_K_UNSPLIT
     }
-    class ReductionNode {
-        PORTS = in0
-        restrictions = WHOLE_STICKS | PADDED_REDUCTION_UNSPLIT
-    }
+    class ReductionNode
     class IndirectNode {
-        PORTS = table, index, values
         +scatter: bool
-        restrictions = WHOLE_STICKS | INDIRECT_ACCESS
     }
     class InputNode {
-        PORTS = none
         runs = False
-        restrictions = NONE
-    }
-    class FixedTiledLayout {
-        +size: list
-        +stride: list
-        +device_layout: SpyreTensorLayout
     }
     class DataEdge {
         +src: OutPort
@@ -200,24 +162,7 @@ classDiagram
         +source: str
         +internal: bool
     }
-    class Restriction {
-        <<Flag>>
-        NONE
-        WHOLE_STICKS
-        PADDED_REDUCTION_UNSPLIT
-        MATMUL_STICKS
-        POINTWISE_STICKS
-        INDIRECT_ACCESS
-        ENCODED_K_UNSPLIT
-    }
-    class PortFact {
-        <<Flag>>
-        NONE
-        QFP8WT
-        STAGGERED_EA
-        OVERLAPPING_READ
-        DIRECT_READ_SOURCE
-    }
+    class Restriction
     class Transform
 
     SpyreOptimizationGraph o-- OpNode : nodes
@@ -229,29 +174,13 @@ classDiagram
     OpNode <|-- InputNode
     OpNode *-- InPort : in_ports
     OpNode *-- OutPort : out
-    Port <|-- InPort
-    Port <|-- OutPort
-    OutPort *-- FixedTiledLayout : output layout
     OutPort o-- DataEdge : edges
     InPort o-- DataEdge : edge
     OpNode o-- ExecutionEdge : prev and next
     OpNode ..> Restriction : frozen per type
-    Port ..> PortFact : derived by the builder
     DataEdge o-- Transform : steps
     Pin ..> DataEdge : or a port or a node
 ```
-
-An in port records how its operand is read: the operand index it is bound to, the
-read's index expression and its axis-to-dim map. The out port records the write's map.
-The builder works these out once, so a rule asks `node.port("x")` instead of searching
-the reads.
-
-A port also carries `facts`, a `PortFact` flag set the builder derives once. A fact
-describes the tensor or the read behind one operand, not the op. A rule keyed on a fact
-therefore applies to every op that touches that tensor, through the port that carries
-it, and the port's axis map turns the tensor dims it names into the op's loop axes.
-`QFP8WT` on a weight restricts both the op that writes it (its out port) and the matmul
-that reads it (port `y`), and neither node type mentions QFP8WT.
 
 `MatmulNode.k` and `.n` are the contraction axis and the output-column axis that
 `MATMUL_STICKS` reads (port `x` stuck on K, port `y` and the out port on N). The builder finds them once
@@ -266,6 +195,148 @@ cases where one symbol simplifies away. Ports `x` and `y` bind to operands 0 and
 unbound). Every core reads the table
 at one base address, so `INDIRECT_ACCESS` keeps its data dims unsplit; only the
 index-entry dims carry the op's parallelism.
+
+#### Ports
+
+A node connects to data edges through named
+ports: one `InPort` per operand it reads and one `OutPort` for what it writes. Each node
+type declares its port names in `PORTS`, so rules, pins and edges name an operand
+(`x`, `table`) rather than an index. The out port carries the node's output layout as a
+`FixedTiledLayout`, the host size and stride plus the `SpyreTensorLayout` that codegen
+uses, so every rule reads the same device layout the compiler commits.
+
+```mermaid
+classDiagram
+    direction TB
+
+    class OpNode {
+        <<abstract>>
+        +in_ports: dict~str, InPort~
+        +out: OutPort
+        +PORTS: tuple~str~$
+        +port(name) InPort
+    }
+    class Port {
+        <<abstract>>
+        +name: str
+        +node: OpNode
+        +axis_map: dict~Axis, int~
+        +facts: PortFact
+    }
+    class InPort {
+        +operand: int
+        +index: sympy.Expr
+        +edge: DataEdge
+    }
+    class OutPort {
+        +layout: FixedTiledLayout
+        +edges: list~DataEdge~
+    }
+    class PointwiseNode {
+        PORTS = in0 .. inN
+    }
+    class MatmulNode {
+        PORTS = x, y
+    }
+    class ReductionNode {
+        PORTS = in0
+    }
+    class IndirectNode {
+        PORTS = table, index, values
+    }
+    class InputNode {
+        PORTS = none
+    }
+    class FixedTiledLayout {
+        +size: list
+        +stride: list
+        +device_layout: SpyreTensorLayout
+    }
+    class PortFact {
+        <<Flag>>
+        NONE
+        QFP8WT
+        STAGGERED_EA
+        OVERLAPPING_READ
+        DIRECT_READ_SOURCE
+    }
+    class DataEdge
+
+    OpNode <|-- PointwiseNode
+    OpNode <|-- MatmulNode
+    OpNode <|-- ReductionNode
+    OpNode <|-- IndirectNode
+    OpNode <|-- InputNode
+    OpNode *-- InPort : in_ports
+    OpNode *-- OutPort : out
+    Port <|-- InPort
+    Port <|-- OutPort
+    OutPort *-- FixedTiledLayout : output layout
+    OutPort o-- DataEdge : edges
+    InPort o-- DataEdge : edge
+    Port ..> PortFact : derived by the builder
+```
+
+An in port records how its operand is read: the operand index it is bound to, the
+read's index expression and its axis-to-dim map. The out port records the write's map.
+The builder works these out once, so a rule asks `node.port("x")` instead of searching
+the reads.
+
+A port also carries `facts`, a `PortFact` flag set the builder derives once. A fact
+describes the tensor or the read behind one operand, not the op. A rule keyed on a fact
+therefore applies to every op that touches that tensor, through the port that carries
+it, and the port's axis map turns the tensor dims it names into the op's loop axes.
+`QFP8WT` on a weight restricts both the op that writes it (its out port) and the matmul
+that reads it (port `y`), and neither node type mentions QFP8WT.
+
+#### Node restrictions
+
+Each node type ORs together the `Restriction` flags that apply to it and freezes them.
+[Restrictions](#restrictions) gives what each flag means.
+
+```mermaid
+classDiagram
+    direction LR
+
+    class OpNode {
+        <<abstract>>
+        +restrictions: Restriction$
+    }
+    class PointwiseNode {
+        restrictions = WHOLE_STICKS | POINTWISE_STICKS
+    }
+    class MatmulNode {
+        restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT | ENCODED_K_UNSPLIT
+    }
+    class ReductionNode {
+        restrictions = WHOLE_STICKS | PADDED_REDUCTION_UNSPLIT
+    }
+    class IndirectNode {
+        restrictions = WHOLE_STICKS | INDIRECT_ACCESS
+    }
+    class InputNode {
+        restrictions = NONE
+    }
+    class Restriction {
+        <<Flag>>
+        NONE
+        WHOLE_STICKS
+        PADDED_REDUCTION_UNSPLIT
+        MATMUL_STICKS
+        POINTWISE_STICKS
+        INDIRECT_ACCESS
+        ENCODED_K_UNSPLIT
+    }
+    class PortFact
+
+    OpNode <|-- PointwiseNode
+    OpNode <|-- MatmulNode
+    OpNode <|-- ReductionNode
+    OpNode <|-- IndirectNode
+    OpNode <|-- InputNode
+    OpNode ..> Restriction : frozen per type
+    Restriction ..> PortFact : ENCODED_K_UNSPLIT requires a fact
+```
 
 #### Transforms
 
