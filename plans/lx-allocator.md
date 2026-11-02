@@ -11,8 +11,8 @@ optimizer. The optimizer runs in five steps:
 4. check the decoded plan without a solver;
 5. commit the plan.
 
-That one solve decides work division, sticks, restickify, relayout, copy-out, in place,
-coarse tiling and LX placement.
+That one solve decides work division, sticks, restickify, relayout, copy-out, LX prefetch,
+in-place overwrite, coarse tiling and LX placement.
 
 Today the same stick rule can exist in up to three places (`propagate_layouts`,
 `optimize_restickify` and `op_spec_validation`), each dispatched differently. Several
@@ -491,7 +491,7 @@ sequenceDiagram
     F-->>O: encoder
     O->>E: encode(graph, restrictions)
     E->>E: op level: table, residency rules, sticks, node-type flags
-    E->>E: edge and op-op level: restickify, relayout, copy-out, cuts, in place
+    E->>E: edge and op-op level: restickify, relayout, copy-out, cuts, in-place overwrite
     E->>E: graph level: record the boxes to place
     E->>C: objective(graph)
     C-->>E: sympy expression over named symbols
@@ -508,7 +508,7 @@ sequenceDiagram
         O-->>O: solution
     end
     O->>E: read_back(solution, graph)
-    E->>G: decode splits, layouts, residency, offsets, steps, in place
+    E->>G: decode splits, layouts, residency, offsets, steps, in-place overwrite
     O->>O: check_decisions(graph): every rule, no solver
     O->>IR: commit: insert steps in order, divisions, offsets
 ```
@@ -608,7 +608,8 @@ Data edges carry no restrictions.
 | Copy-out | Forced when a cut lies between a data edge's ends. Its buffer lives in HBM, filled tile by tile, and is never placed in LX. There is one per producer, shared by every reader outside the nest, and its traffic is priced by the cost model. |
 | Restickify | A transform, forced where the read stick differs, so it needs no elision. A restickify inserted before the graph is built is a pinned step. |
 | Relayout | A chosen step, keyed by the producer's reduction split as well as the two layouts, so a completed-reduction route can read only the last core of each K group. Only from a resident source: a spilled producer reloads from HBM in the consumer's configuration. Inside a tile it is priced per tile times the trip count. Never across a cut. |
-| In place | A variable on the edge, allowed only when the consumer reads at the producer's index, adjacent lifetimes, both resident, same layout and footprint, and at most one per op. The pair shares one offset. |
+| In-place overwrite | A variable on the edge: the consumer's output overwrites the producer's storage in LX. Allowed only when the read pattern is safe, with adjacent lifetimes, both resident, same layout and footprint, and at most one per op. The pair shares one offset. Safety is a property of the memory read pattern, not of the op kind. The first implementation keeps today's eligibility (`get_op_pointwise_inputs`, a read at the producer's index) so plans stay at parity, and "Future work" widens it. |
+| LX prefetch | Loading a graph input into LX once, ahead of its readers, so each reader avoids its own HBM read. The code calls this an input clone. Whether and where to prefetch is an optimization axis, and where that is decided is an implementation detail: the solve or a pre-solve pass. The first implementation decides it as today: `_eligible_clone_inputs` names the inputs read more than once that fit LX, and the solve chooses their residency and view. Output clones copy a value back to HBM, so they are not prefetches and keep their name. |
 | Objective | A sympy expression from the cost model. The encoder consumes it and encodes it into its own variables by symbol name, and an unknown name fails. More cores only break ties. |
 | Placement | A backend detail. CP-SAT places natively (offsets under a 2-D no-overlap) or by packing (a cumulative under a roof, then a first-fit packer; on overflow the roof comes down and the model is solved again). Annealing and MIP solvers pack. |
 | Families | One object encodes and solves, and its backend is private. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools and SA are built here, each encoding into its own model; CPMpy is future work. |
@@ -738,8 +739,8 @@ and either justified or fixed.
   - A tiled op's live range starts at its nest's start, a solve decision as in today's
     `_add_nest_starts`.
   - The partial-reduction cut guard is an always-on rule.
-- **In place** is a variable on the edge.
-- **Clone reads** are constraints between the clone's view and the consumer's.
+- **In-place overwrite** is a variable on the edge.
+- **LX prefetch reads** are constraints between the prefetched input's view and the consumer's.
 
 **Stage 7. Families and placement.**
 - Add `Model`, `CpModel`, `ModelAbstractFactory` and `OrToolsFactory`, registered in
@@ -885,6 +886,27 @@ without changing them.
   The logical size stays the same, as with the gather padding today. A padded
   dim's extent becomes a decision on the out port's layout, priced by the cost model.
   Any read of the pad needs the masking padded reductions already get.
+- **In-place overwrite beyond pointwise ops.** Pointwise is only the obvious case. A
+  matmul `C += A @ B` could overwrite a resident `C`, if the hardware allows it. The check
+  should come from the memory read pattern. Say the op's accesses run from index `0` to
+  `N - 1`, and at index `i` it writes output position `j`. Overwriting is safe when `j` is
+  not in the set of positions it reads later, `arg(n)` for `n` from `i + 1` to `N - 1`.
+  The rule replaces the op-kind test behind `In-place overwrite` and changes plans, so it
+  is listed as a rule change. It needs confirming that the hardware's actual read order
+  matches this model.
+- **LX fragmentation as an objective.** There are two ways to minimize it:
+  - **A cost term.** The cost model gains a calibrated cost on peak LX use. Depending on
+    the calibration, plans may then favour more core divisions and relayouts at the
+    expense of some performance. Ideally the term would estimate the cost of filling LX
+    incrementally, but that looks hard.
+  - **A constraint.** Set a bound and search for the minimum relaxation over some
+    criterion. The code base does not use constraint relaxation today, so this is new
+    work to build and tune.
+- **Soft checks after the scheduler and codegen.** The optimizer runs before both, so the
+  final SuperDSC can drift from the plan. `SpyreOptimizationGraph` gives one representation
+  of the plan that does not depend on the solving method, which is what such a check can
+  compare against. It would report drift without failing the compile, as `check_decisions`
+  does in Phase 1.
 
 ## Verification
 
