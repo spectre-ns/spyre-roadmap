@@ -1,17 +1,19 @@
 # LX allocator, Stage 4: Cost model
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0, 1, 2, with Stage 3's Phase 1 exit closed.
 Needed by: Stages 5, 6, 7, 8, 9, 10, 11, 12, 13.
 
 ## Goal
 
-When this PR merges, `CostModel`, `Sym` and the objective types exist, and the printer
-can lower them by name. `CostModel` produces, from the graph plus the encoder's domains,
-the same sympy expression `CoOptimizingAllocator._solve` builds today, and the same
-terms as each stage of `CpSatLayoutSolver._run`'s lexicographic ladder. A shadow check
-proves that solve for solve. Nothing in production calls `CostModel` yet: the planner,
-every CP model, every SA score and every committed plan stay as they were.
+When this PR merges, `SpyreCostModel`, `Sym` and the objective types exist,
+`select_target` attaches a `SpyreCostModel` to the `SPYRE` target it returns, and the
+printer can lower them by name. The cost model
+produces, from the graph plus the encoder's domains, the same sympy expression
+`CoOptimizingAllocator._solve` builds today, and the same terms as each stage of
+`CpSatLayoutSolver._run`'s lexicographic ladder. A shadow check proves that solve for
+solve. Nothing in production reads `graph.target.cost_model` yet: the planner, every CP
+model, every SA score and every committed plan stay as they were.
 
 ## Today
 
@@ -227,11 +229,11 @@ for the shadow check until Stage 13. Everything below it stays shared.
 
 | old | new home | moves or copied | who deletes the old |
 |---|---|---|---|
-| `_solve`'s pricing steps, `_extract_op_features`, `_pricing_operations` | `CostModel.bundle_terms` | copied | Stage 13, with `CoOptimizingAllocator` |
-| `RelayoutCopyBuffer.cost_term` | `CostModel._charge` | copied, re-keyed | Stage 13 |
-| `spill_cost`, `_spill_cost` | `CostModel.spill_cost` | copied, a test pins all three equal | Stage 13 |
-| `_cut_traffic_terms` | `CostModel.cut_traffic` | copied | Stage 13 |
-| ladder term lists in `_run` | `CostModel.ladder` | copied | Stage 13 |
+| `_solve`'s pricing steps, `_extract_op_features`, `_pricing_operations` | `SpyreCostModel.bundle_terms` | copied | Stage 13, with `CoOptimizingAllocator` |
+| `RelayoutCopyBuffer.cost_term` | `SpyreCostModel._charge` | copied, re-keyed | Stage 13 |
+| `spill_cost`, `_spill_cost` | `SpyreCostModel.spill_cost` | copied, a test pins all three equal | Stage 13 |
+| `_cut_traffic_terms` | `SpyreCostModel.cut_traffic` | copied | Stage 13 |
+| ladder term lists in `_run` | `SpyreCostModel.ladder` | copied | Stage 13 |
 | `_COST_PARAMS` | `ALLOCATOR_COST_PARAMS` in `lx_allocator/cost.py` | moved; `allocator._COST_PARAMS` stays an alias (`test_cost_model_decode.py:820`) | stays |
 | `sa_cooptimizer._work_slices` | `utils.division_work_slices` | moved; alias stays | Stage 13 |
 | `sym_is_lx`, `sym_core_divs`, `sym_tile_counts` name strings | `Sym` | moved; the properties delegate | Stage 13 |
@@ -292,7 +294,7 @@ class Sym:
 | `restick(e, row)` | `restick_<e>`, or `restick_<e>_<row>` | integer, nonnegative | a restickify on edge `e`, in the table row keyed `row` | Stage 6 binds it, Stage 11 prices it |
 | `stick(n)` | `stick_<n>` | integer, nonnegative | `n`'s solved stick | Stage 11 |
 | `split_product(names)` | `_product_<sorted names>` | none | printer only, as today | printer |
-| derived | `log2_<factor>`, `inv_<factor>`, `inv__product_...` | integer, nonnegative | made by the rewrite, never by `CostModel` | printer |
+| derived | `log2_<factor>`, `inv_<factor>`, `inv__product_...` | integer, nonnegative | made by the rewrite, never by the cost model | printer |
 
 Rules:
 
@@ -307,14 +309,14 @@ Rules:
   every node with no split key shares `_product_` (`ilp_solver_ortools.py:856`). That is
   harmless where nothing reads it and wrong for a per-node ladder term.
 - `division_<n>` is not in `Sym`. It is a menu position, so it stays inside the encoder
-  (`plan_solver.division_symbol`). `CostModel` never emits it.
+  (`plan_solver.division_symbol`). The cost model never emits it.
 - A new kind of symbol needs a prefix here, a binding in each family and a row in this
-  table. `CostModel` emits neither `restick_` nor `stick_` in this stage.
+  table. The cost model emits neither `restick_` nor `stick_` in this stage.
 
 ### A relayout charge with no menu index
 
 `RelayoutCharge(is_lx, division, *prices)` is a table over menu positions, so it cannot
-appear in the graph layer's output. `CostModel` emits this instead:
+appear in the graph layer's output. The cost model emits this instead:
 
 ```python
 class SplitKeyedCharge(sympy.Function):
@@ -393,7 +395,26 @@ as `_get_children` and `_op_readers` do, and `tileable` as the `position` filter
 no LX prefetch is not in the solve (`allocator.py:4237-4238`), so it has no symbol and prices
 as a constant, as today.
 
-### `CostModel`
+### `SpyreCostModel`
+
+The target holds the cost model, so `encode` takes none. Every caller reaches it as
+`graph.target.cost_model`, and the cost model takes no target argument: any card size it
+reads comes from `graph.target`, the same card the encoder and `check_decisions` read.
+The `CostModel` protocol, with the public methods below, and the per-card table live in
+`cost.py`:
+
+```python
+COST_MODELS: Mapping[str, CostModel] = {"spyre": SpyreCostModel()}   # keyed by Target.name
+```
+
+`graph/` must not import `cost.py`, which reads today's cost features, so `SPYRE.cost_model`
+stays `None` in `graph/target.py`, and `target.py` names `CostModel` only in an
+`if TYPE_CHECKING:` import, which the boundary test skips. This stage adds one line to Stage
+2's `select_target`, which sits outside `graph/`: its `replace` call also passes
+`cost_model=COST_MODELS.get(target.name)`. Every compiled graph therefore reaches
+`SpyreCostModel()` as `graph.target.cost_model`. A derived target swaps the model with
+`replace(target, cost_model=SpyreCostModel(traffic_only=True))`, which is how committed mode
+reaches the encoder (Stage 9).
 
 ```python
 class Sense(Enum):
@@ -412,7 +433,7 @@ class ObjectiveStage:
     unit: Unit
     terms: tuple[sympy.Expr, ...]   # integer-linear over Sym names; never summed
 
-class CostModel:
+class SpyreCostModel:          # implements CostModel
     def __init__(self, params: CostParams = ALLOCATOR_COST_PARAMS, *,
                  traffic_only: bool = False) -> None: ...
 
@@ -500,10 +521,10 @@ def traffic_sizes(graph: SpyreOptimizationGraph) -> dict[str, int]:
 
 ### Term table
 
-Every term of today's objective, and what `CostModel` does with it. "Reused" means the
-code in that row is called as it stands.
+Every term of today's objective, and what `SpyreCostModel` does with it. "Reused" means
+the code in that row is called as it stands.
 
-| term | source | symbols and sympy shape | in `CostModel` |
+| term | source | symbols and sympy shape | in `SpyreCostModel` |
 |---|---|---|---|
 | HBM read, write | `_fused_hbm_bytes`, `cost_model.py:1346` | linear in `1 - is_lx`, `Max` for shared inputs; `Piecewise` from replication | reused |
 | peak memory | `_peak_mem_ns`, `:2256` | `(r+w)/bw + c*Min(r, w)`, unevaluated `Min` | reused |
@@ -561,8 +582,9 @@ Each keeps the proto byte-identical on the legacy path.
    `<func>_division_<name>_<n>` at line 896.
 3. **`bind_division_owner(sym_map, buffer_map, owner)`** is the body of
    `ilp_solver_ortools.py:843-862`, moved. `sym_map[sym_is_lx.name] = in_buffer` stays
-   in the caller. `OpVars` implements `DivisionOwner`, `_bind_symbols` (Stage 5) calls this
-   per node, and `Model.symbols` is `sym_map`. `buffer_map` stays private to the encoder.
+   in the caller. `OpVars` implements `DivisionOwner`, `bind_symbols` (Stage 5) calls this
+   per node, and `Encoding.symbols` is `sym_map`. `buffer_map` stays private to the OR-Tools
+   family's encoding.
 4. **`strict`.** `cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr, *,
    strict=False)`, and the same keyword on `_SympyExprToCpSat.__init__`, whose three
    positional arguments stay because `test_scratchpad_solver.py` calls it directly.
@@ -571,7 +593,8 @@ Each keeps the proto byte-identical on the legacy path.
    `_print_RelayoutCharge` and `_resolve_keyed_charges`, and the three zero returns in
    `_print_AppliedUndef`. `UnknownSymbolError` subclasses `KeyError`, so the
    `except (RuntimeError, TypeError, ValueError)` at `ilp_solver_ortools.py:886` does
-   not swallow it. The legacy caller stays non-strict, and `OrToolsEncoder` lowers strict.
+   not swallow it. The legacy caller stays non-strict, and `OrToolsFamily.encode` lowers
+   strict.
 5. **`_resolve_keyed_charges`**, as above, plus `_print_SplitKeyedCharge`, which raises.
    A keyed charge reaching print means it was nested, which `objective` never does.
 6. **`linear_terms_to_cpsat(sym_map, terms)`** lowers a ladder stage: for each term,
@@ -673,7 +696,7 @@ remaining saving. It risks the proto, needs its own gate, and is unmeasured.
 
 ### What a non-enumerating encoder adds
 
-Nothing in `Sym`, `CostModel` or the expression changes. It binds `is_lx_*`, `split_*`
+Nothing in `Sym`, `SpyreCostModel` or the expression changes. It binds `is_lx_*`, `split_*`
 and `tile_*` to its own variables and supplies domains through `buffer_map` entries of
 `(None, values)`, which the printer accepts today for `inv_*` (`:251-255`). The printer
 then needs three things, none built here because nothing would call them:
@@ -692,7 +715,9 @@ tuple tables, same objective 64/64.
 | file | change |
 |---|---|
 | `torch_spyre/_inductor/scratchpad/lx_allocator/graph/symbols.py` | new: `Sym`, `SplitKeyedCharge`, `Unit`, `UnknownSymbolError` |
-| `torch_spyre/_inductor/scratchpad/lx_allocator/cost.py` | new: `CostModel`, `ObjectiveStage`, `Sense`, `NodeDomain`, `RelayoutOffer`, `CostDomains`, `domains_from_buffers`, `traffic_sizes`, `ALLOCATOR_COST_PARAMS`, `objective_size` |
+| `torch_spyre/_inductor/scratchpad/lx_allocator/cost.py` | new: `CostModel`, `COST_MODELS`, `SpyreCostModel`, `ObjectiveStage`, `Sense`, `NodeDomain`, `RelayoutOffer`, `CostDomains`, `domains_from_buffers`, `traffic_sizes`, `ALLOCATOR_COST_PARAMS`, `objective_size` |
+| `torch_spyre/_inductor/scratchpad/lx_allocator/graph/target.py` | `Target.cost_model` annotated `CostModel \| None` through an `if TYPE_CHECKING:` import from `cost.py`; `SPYRE.cost_model` stays `None` |
+| `torch_spyre/_inductor/scratchpad/lx_allocator/graph_builder.py` | `select_target` passes `cost_model=COST_MODELS.get(target.name)` to `replace` |
 | `torch_spyre/_inductor/scratchpad/cpsat_expr_printer.py` | printer changes 1 to 6 |
 | `torch_spyre/_inductor/scratchpad/ilp_solver_ortools.py` | `_minimize_cost_expr` calls `bind_division_owner`; `DivisionOwner` members on the wrapper |
 | `torch_spyre/_inductor/scratchpad/plan_solver.py` | symbol properties delegate to `Sym` |
@@ -705,7 +730,7 @@ tuple tables, same objective 64/64.
 | `tests/inductor/test_lx_cost_parity.py` | new |
 | `tests/inductor/lx_objective_shadow.py` | new: the shadow check as a Stage 0 `Observer` |
 | `tests/configs/torch_spyre_tests/inductor/test_lx_cost_*_config.yaml` | new shard configs, one per test file; `make check-all-configs` |
-| `docs/source/compiler/cost_model.md` | a short section on `CostModel` and `Sym` |
+| `docs/source/compiler/cost_model.md` | a short section on `SpyreCostModel`, the target that holds it, and `Sym` |
 
 Commits, each green with `intree` and the fixed set unchanged:
 
@@ -717,9 +742,10 @@ Commits, each green with `intree` and the fixed set unchanged:
    `_resolve_keyed_charges`.
 5. `compile_fixed_point`, `division_work_slices`, `input_footprint`,
    `ALLOCATOR_COST_PARAMS`; legacy callers delegate.
-6. `CostModel.spill_cost`, `cut_traffic`, `ladder`, `traffic_only`, `traffic_sizes`, with
-   replay parity on the fixtures.
-7. `CostModel.bundle_terms`, `objective`, `priced_objective`, with stubbed-op tests.
+6. `SpyreCostModel.spill_cost`, `cut_traffic`, `ladder`, `traffic_only`, `traffic_sizes`,
+   with replay parity on the fixtures.
+7. `SpyreCostModel.bundle_terms`, `objective`, `priced_objective`, with stubbed-op tests;
+   the `CostModel` protocol, `COST_MODELS`, and `select_target` attaching it.
 8. Shadow plug-in, corpus parity test, `objective_size` guard.
 9. Bulk `Add` in the allocator, on its own so it can be reverted alone.
 10. Docs.
@@ -731,7 +757,10 @@ Consumes:
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
 | Phase 1 exit | closed before this PR merges | 3 | dependency only; nothing else from Stage 3 is used |
-| `build_graph` | `build_graph(ir, *, capacity=None, alignment=128, divisions_committed=False, drain_plans=None, lx_relayout_plans=()) -> SpyreOptimizationGraph`, called with defaults | 2 | shadow check |
+| `build_graph` | `build_graph(ir, target, *, divisions_committed=False, drain_plans=None, lx_relayout_plans=()) -> SpyreOptimizationGraph`, called with keyword defaults | 2 | shadow check |
+| `select_target` | `(config) -> Target`, built with `replace(TARGETS[config.target], ...)` | 2 | shadow check; this stage adds `cost_model=COST_MODELS.get(target.name)` to its `replace` |
+| `Target`, `SPYRE` | frozen dataclass with `cost_model: CostModel \| None = None`; `SPYRE.cost_model` is `None` | 1 | `Target.name` keys `COST_MODELS` |
+| `SpyreOptimizationGraph.target` | `Target`, stored by `build_graph` | 1, filled by 2 | `graph.target.cost_model` in the shadow and tests |
 | `SpyreOptimizationGraph.nodes`, `.node` | `list[OpNode]`; `node(name) -> OpNode` | 1 | ladder, shadow |
 | `SpyreOptimizationGraph.ir` | `GraphLowering`, final | 1, filled by 2 | `bundle_terms`, `traffic_sizes` |
 | `OpNode.name` | `str`, the op's buffer name; the input's name on an `InputNode` | 1 | `Sym`, domain lookup |
@@ -757,7 +786,9 @@ Provides:
 | `NodeDomain` | as above | 5, 6, 8, 10 | final |
 | `RelayoutOffer` | as above | 6 | final |
 | `CostDomains` | `(nodes, relayouts=())` | 5, 6, 8, 10 | final |
-| `CostModel` | `(params=ALLOCATOR_COST_PARAMS, *, traffic_only=False)` | 5, 7, as a type; 6, 8-13 | final |
+| `CostModel` | protocol in `lx_allocator/cost.py`: `objective`, `priced_objective`, `bundle_terms`, `ladder`, `spill_cost`, `cut_traffic`; `graph/target.py` imports it only under `TYPE_CHECKING` | 5-13, through `graph.target.cost_model` | final |
+| `SpyreCostModel` | `(params=ALLOCATOR_COST_PARAMS, *, traffic_only=False)`, in `lx_allocator/cost.py` | 9 (committed mode), tests | final |
+| `COST_MODELS` | `Mapping[str, CostModel]`, `{"spyre": SpyreCostModel()}`, in `lx_allocator/cost.py`, keyed by `Target.name` | 2 (`select_target` attaches `COST_MODELS.get(target.name)`), 5-13 through `graph.target.cost_model` | final |
 | `traffic_sizes` | `(graph) -> dict[str, int]` | 8, 9 | final |
 | `CostModel.priced_objective` | `(graph, domains, *, linear_only) -> sympy.Expr \| None` | 6, 8, 11 | final |
 | `CostModel.objective` | `(graph, domains) -> sympy.Expr`, may raise | 11, row terms | final |
@@ -765,7 +796,7 @@ Provides:
 | `CostModel.ladder` | `(graph, domains) -> tuple[ObjectiveStage, ...]` | 6, 9 | final |
 | `CostModel.spill_cost` | `(node, *, boundary_known=True, clamp_unsized=False, size=None) -> int` | 8 | final |
 | `CostModel.cut_traffic` | `(node, domains, *, count_unmodelled=True) -> list[sympy.Expr]` | 8, as the reference for its companion loop | final |
-| `ALLOCATOR_COST_PARAMS` | `CostParams`, in `lx_allocator/cost.py`; `CostModel`'s default | 9, through that default | final |
+| `ALLOCATOR_COST_PARAMS` | `CostParams`, in `lx_allocator/cost.py`; `SpyreCostModel`'s default | 9, through that default | final |
 | `objective_size` | `(expr) -> ObjectiveSize` | this stage's size guard | final |
 | `domains_from_buffers` | `(buffers) -> CostDomains` | 5, 6 for parity | temporary, removed in Stage 13 |
 | `cost_expr_to_cpsat` | `(model, sym_map, buffer_map, cost_expr, *, strict=False)` | 5, 6 | final |
@@ -777,18 +808,21 @@ Provides:
 
 What each later stage does with these:
 
-- Stage 5: `OrToolsEncoder._cost_domains() -> CostDomains` builds `nodes`. `_bind_symbols`
-  calls `bind_division_owner`.
-- Stage 6: extends `_cost_domains` with one `RelayoutOffer` per group, with `prices_ns`
+- Stage 5: `cost_domains`, called from `OrToolsFamily.encode`, builds `nodes`.
+  `bind_symbols` calls `bind_division_owner`.
+- Stage 6: extends `cost_domains` with one `RelayoutOffer` per group, with `prices_ns`
   keyed by `NodeDomain.selector_values`. It registers `cut_*`, `resident_cut_*`,
-  `reads_full_*`, `cores_*`, `shape_*` and `tiles_*`. `_encode_objective` calls
-  `priced_objective(linear_only=True)` and lowers it with `strict=True` into one
-  `SolveStage` named `cost`. When that returns `None` or lowering raises, it pins relayouts
-  out and lowers each ladder stage with `linear_terms_to_cpsat` into a `SolveStage`.
-- Stage 7: runs `CpModel.objective_stages` and adds the locks.
-- Stage 8: `priced_objective(graph, CostDomains(nodes, relayouts=()), linear_only=False)`,
+  `reads_full_*`, `cores_*`, `shape_*` and `tiles_*`. `encode_objective` calls
+  `graph.target.cost_model.priced_objective(linear_only=True)` and lowers it with
+  `strict=True` into one `SolveStage` named `cost`. When that returns `None` or lowering
+  raises, it pins relayouts out and lowers each ladder stage with `linear_terms_to_cpsat`
+  into a `SolveStage`.
+- Stage 7: `OrToolsFamily.solve` runs `enc.ortools.objective_stages` and adds the locks.
+- Stage 8: through `graph.target.cost_model`,
+  `priced_objective(graph, CostDomains(nodes, relayouts=()), linear_only=False)`,
   `compile_fixed_point` through `compile_objective`, `spill_cost(node, clamp_unsized=True)`.
-- Stage 9: `CostModel(traffic_only=committed)`.
+- Stage 9: committed mode builds with
+  `replace(target, cost_model=SpyreCostModel(traffic_only=True))`.
 - Stage 10: `bundle_terms` for the full `cost_expr_record`.
 
 ## Tests
@@ -826,7 +860,9 @@ What each later stage does with these:
 | `test_bundle_terms_match_the_allocator_on_stub_ops` | with `estimate_bundles` stubbed as `test_cost_expr_dump.py:200` does and `extract_op_features` replaced by a spy on the importing module as `test_cost_model_loop_operands.py:136` does, `is_lx`, work slices and menu arrive as `_extract_op_features` passes them |
 | `test_expression_has_no_menu_symbol` | no free symbol starts `division_` |
 | `test_bulk_add_equals_left_fold` | float coefficients on shared monomials across bundles: `Add(*terms)` equals `sum(terms)` under `srepr` |
-| `test_cost_imports_no_solver` | importing `lx_allocator.cost` loads neither `ortools` nor `sa_cooptimizer` |
+| `test_cost_imports_no_solver` | importing `lx_allocator.cost`, or `graph.target` with it, loads neither `ortools` nor `sa_cooptimizer` |
+| `test_select_target_attaches_the_cost_model` | `SPYRE.cost_model` is `None`; `select_target(config).cost_model` is `COST_MODELS["spyre"]`, a `SpyreCostModel` with `ALLOCATOR_COST_PARAMS` and `traffic_only` false, and a graph built for that target reaches the same object as `graph.target.cost_model` |
+| `test_derived_target_swaps_the_cost_model` | a graph built for `replace(SPYRE, cost_model=SpyreCostModel(traffic_only=True))` gets `residency` alone from `graph.target.cost_model.ladder` |
 
 `tests/inductor/test_lx_cost_printer.py`:
 
@@ -876,9 +912,9 @@ it proves parity, not production plans. No gate here needs a card otherwise.
 on the joint allocator:
 
 ```python
-graph = build_graph(ir)
+graph = build_graph(ir, select_target(config))
 domains = domains_from_buffers(buffers)
-new = CostModel().priced_objective(
+new = graph.target.cost_model.priced_objective(
     graph, domains, linear_only=solver.linear_cost_only()
 )
 ```
@@ -900,7 +936,7 @@ carries the share CI runs.
 **G2, ladder.** For each ladder stage in a Stage 0 record, take the stored proto's
 objective, translate var names by the table below, and compare the `{name: coefficient}`
 map and the offset with `ObjectiveStage.terms`, after substituting known constants. A
-placement-only solve compares with `CostModel(traffic_only=True)`. This is exact linear
+placement-only solve compares with `SpyreCostModel(traffic_only=True)`. This is exact linear
 equality over all assignments, not agreement at the solved point, and it replays from
 recorded protos.
 
@@ -941,8 +977,8 @@ is a bug in this PR. It is fixed, not listed.
   `functools.reduce(operator.add, terms)` for the bundles and keeps bulk for charges.
 - **`V.graph` is not active.** `_graph_boundary_names` then returns `None` and args stay
   unstamped (`cost_features.py:1139-1144`), which silently changes LX prefetch pricing.
-  Caught by G1. Stage 9 must call the encoder inside the same context.
-- **`_cost_domains` differs from `domains_from_buffers`.** Then a symbol set changes.
+  Caught by G1. Stage 9 must call the family's `encode` inside the same context.
+- **`cost_domains` differs from `domains_from_buffers`.** Then a symbol set changes.
   This stage cannot catch it. Stage 6's gate, which includes the first-stage objective,
   does.
 - **A ladder stage through sympy changes the proto.** The CP-SAT facts under Today say it
@@ -977,9 +1013,10 @@ is a bug in this PR. It is fixed, not listed.
 
 ## Deviations from the parent plan
 
-1. **The objective is not one expression.** The plan says `CostModel.objective(graph)`
-   ports `spill_cost`, `_cut_traffic_terms`, the per-bundle terms, relayout charges, and
-   cores "only to break ties", as one sympy expression. The code has separate objectives
+1. **The objective is not one expression.** The plan says
+   `SpyreCostModel.objective(graph)`, held by the `SPYRE` target, ports `spill_cost`,
+   `_cut_traffic_terms`, the per-bundle terms, relayout charges, and cores "only to break
+   ties", as one sympy expression. The code has separate objectives
    that never combine (`ilp_solver_ortools.py:1442-1523`), in different units, and the
    ladder's locks cannot be written as one expression without weights that change plans.
    Cores do reach the priced expression, through split symbols and `_product_*` bound to
@@ -1008,7 +1045,7 @@ is a bug in this PR. It is fixed, not listed.
 4. **`score` is not one compiled expression.** Stage 8 says `score` compiles the sympy
    objective into `_build_score_fn`'s evaluator. Today's score also adds companions,
    rounded apart (`sa_cooptimizer.py:1447`), and companions differ from
-   `_cut_traffic_terms` by `U`. Resolution: `SAEncoder.score` adds the companions to the
+   `_cut_traffic_terms` by `U`. Resolution: `SAFamily.score` adds the companions to the
    compiled expression as a second integer, and `cut_traffic(count_unmodelled=False)` is
    held equal to them, so Stage 8 can match today's SA exactly.
 
@@ -1022,6 +1059,12 @@ is a bug in this PR. It is fixed, not listed.
 
 6. **The gate is met by a shadow check.** It cannot compare two encoders, because the
    second does not exist. Resolution: G1 to G4.
+7. **`SPYRE` does not hold the cost model.** The parent builds `SPYRE` with
+   `cost_model=SpyreCostModel()` in `graph/target.py`, but the `graph/` boundary test forbids
+   that module importing `cost.py`. Resolution: `SPYRE.cost_model` stays `None`, `cost.py`
+   holds the `CostModel` protocol and `COST_MODELS`, and `select_target` attaches
+   `COST_MODELS.get(target.name)`, so every compiled graph still reads its cost model from
+   `graph.target.cost_model`.
 
 ## Open questions
 
@@ -1029,18 +1072,18 @@ None.
 
 ## Out of scope
 
-- `OrToolsEncoder.symbol` and `_cost_domains`: Stage 5.
-- `_encode_objective`, lowering, registering cut, ladder and relayout symbols, producing
+- `symbol` and `cost_domains`: Stage 5.
+- `encode_objective`, lowering, registering cut, ladder and relayout symbols, producing
   `RelayoutOffer`s, and the relayout pin: Stage 6.
 - Running the stages and adding the locks: Stage 7.
-- `SAEncoder.score` and SA's symbol binding: Stage 8.
+- `SAFamily.score` and SA's symbol binding: Stage 8.
 - Choosing committed mode: Stage 9.
 - The cost dump on the new path (`cost_expr_record`, `solved_bindings`): Stage 10.
 - A restickify's compute time and any layout-dependent term: Stage 11.
 - Deleting the old orchestration, the duplicate spill and cut formulas,
   `RelayoutCharge` emission from `cost_term`, and `domains_from_buffers`: Stage 13.
 - The relayout price law (`solver_relayout_pair_cost`, `relayout_ns`), enumeration
-  capping and `_relayout_consumer_costs`: Stage 6 keeps them. `CostModel` takes prices as
+  capping and `_relayout_consumer_costs`: Stage 6 keeps them. The cost model takes prices as
   data.
 - `cost_model_pass.py`, `dump_cost_model.py` and the `cost_model.py` terms: unchanged.
 - A memoizing `_rewrite` and the non-enumerating lowerings: future work.
