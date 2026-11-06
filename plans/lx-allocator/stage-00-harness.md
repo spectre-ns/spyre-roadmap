@@ -1,6 +1,6 @@
 # LX allocator, Stage 0: Harness and baseline
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: none. Needed by: Stages 1-13.
 
 ## Goal
@@ -240,7 +240,7 @@ All hooks are process-local monkeypatches installed by `install()` and restored 
 sides of a diff and a target can exist on only one of them. A missing target outside
 `optional` raises. It defaults to `OPTIONAL_TARGETS`, so the CLI and the plugin get the same
 list. That ships naming Stage 7's two targets under `torch_spyre._inductor.scratchpad`,
-`lx_allocator.family.ortools_family.CpSatBackend._run_stages` and
+`lx_allocator.family.ortools_family.OrToolsFamily._run_stages` and
 `lx_allocator.family.placement.SolveSettings.from_config`.
 
 The compile driver sets `torch._inductor.config.fx_graph_cache = False` and
@@ -355,7 +355,7 @@ A capture is a local fast loop for today's CP-SAT solver, nothing more.
 - **SA cannot replay.** With `division_space` blanked it runs from menus
   (`sa_cooptimizer.py:1123`), with no `residency_edges` it uses pair tables (`:1081`), and
   a capture from a CP-SAT compile holds relayout copies SA never sees.
-- **It is no route to the new encoder.** Replay stops at the buffers, and the graph holds
+- **It is no route to the families' `encode`.** Replay stops at the buffers, and the graph holds
   live ops, so it does not pickle. `fake` compiles serve Stages 5 to 8 on the zoo. The
   in-repo graphs stay their CI arm, through Stage 5's `replay_graph` and Stage 6's
   `edge_tables_from_buffers`.
@@ -552,8 +552,9 @@ class Recorder:
     def record_final(self, record: FinalRecord) -> None: ...
 
 def proto_text(model: object) -> str:
-    """str(model.proto), for anything with a .proto: cp_model.CpModel today, the
-    parent plan's CpModel from Stage 5. The one definition of the bytes compared."""
+    """str(model.proto), for anything with a .proto: a cp_model.CpModel, today's or
+    the Encoding.model of the OR-Tools family from Stage 5. The one definition of the
+    bytes compared."""
 
 def provenance_record(p: "Provenance") -> dict[str, object]:
     """One JSON row: constraint, rule, subject name, outcome. Reads Stage 5's
@@ -869,11 +870,11 @@ lands.
 - **Stages 2, 4, 5 and 8** register an `Observer`. `on_solve_begin` is their point with the
   allocator and `GraphLowering` in hand, and `record_compile(observers=...)` runs one on a
   `fake` compile. `allocator` and `ir` are `None` on a solver-only run.
-- **Stage 5** passes `[provenance_record(p) for p in model.provenance]` to `record_stage`
-  when it records its own model. `diff` aligns top-level proto blocks with
+- **Stage 5** passes `[provenance_record(p) for p in encoding.provenance]` to
+  `record_stage` when it records its own model. `diff` aligns top-level proto blocks with
   `difflib.SequenceMatcher` and fills `Difference.rule` from the side that has provenance,
   skipping rows with no constraint. That is what "listed by rule in its PR" reads.
-- **Stage 7** adds the `CpSatBackend._run_stages` and `SolveSettings.from_config` rows to
+- **Stage 7** adds the `OrToolsFamily._run_stages` and `SolveSettings.from_config` rows to
   `install` in `lx_equivalence.py`, the first applying `SolveParams` and `ForcedFailure` and
   calling `record_stage`, and adds `buffer_decision(decision, alignment)`, which turns a
   `NodeDecision` into a `BufferDecision` in bytes with `menu_index=None`, `relayouts={}`.
@@ -881,10 +882,10 @@ lands.
 - **Stages 7 and 8** leave `sizes` to its default. The size guard then bounds a stage's
   variables and constraints per decision, and skips the menu bound.
 - **Stage 9** adds `decisions_from_graph` over Stage 3's `decisions`, the `ortools` and `sa`
-  cells, and the `install` rows that open and close family solves on `AnnealBackend.solve`,
-  both `read_back`s and `SpyreOptimizer._solve_with`.
-- **Stage 10** retargets the commit hook at `SpyreOptimizer.commit` and calls
-  `snapshot_commit` with `allocator="SpyreOptimizer"`.
+  cells, and the `install` rows that open and close family solves on `SAFamily.solve`,
+  both families' `read_back`s and `optimize`.
+- **Stage 10** retargets the commit hook at `commit(graph)` and calls `snapshot_commit` with
+  `allocator="plan_allocation"`.
 - **Stages 8, 9 and 10** state that their gate runs HEAD's harness over the base tree.
 - **A stage that removes a hook target** moves the hook in the same PR and adds the old
   target to `OPTIONAL_TARGETS`.
@@ -1068,7 +1069,7 @@ time is unmeasured.
 
 4. **Planning time is not measured from captures in one process.** Verification says to
    replay zoo captures "on base and change, in one process and interleaved". A capture
-   holds buffers, so the new encoder cannot replay one, and two source trees cannot be
+   holds buffers, so no family's `encode` can replay one, and two source trees cannot be
    imported in one process (the earlier A/B alternated, `~/cpsat_equiv/scripts/build_ab.sh`).
    **Resolution:** `lx_corpus.py timing` alternates cold processes (ABAB) on live compiles.
 
@@ -1091,8 +1092,8 @@ None.
 ## Out of scope
 
 - `check_decisions`, the Phase 1 report and the buffers-to-graph adapter: Stage 3.
-- `Model.provenance` content and rule attribution beyond the reserved field: Stage 5.
-- The `CpSatBackend._run_stages` and `SolveSettings.from_config` hooks and
+- `Encoding.provenance` content and rule attribution beyond the reserved field: Stage 5.
+- The `OrToolsFamily._run_stages` and `SolveSettings.from_config` hooks and
   `buffer_decision`: Stage 7.
 - `decisions_from_graph`: Stage 9.
 - `test_lx_live_parity.py`: Stage 5.
@@ -1102,5 +1103,5 @@ None.
   and `insert_post_mutation_restickify`: a prerequisite of Stage 11. Its weekly perf run:
   Stages 11 and 12.
 - Any fix to production nondeterminism that G1 finds. It gets an issue, not a change here.
-- Greedy as an encoder-then-solver family. Nothing here rules it out: `family` is a free
+- Greedy as an encode-then-solve family. Nothing here rules it out: `family` is a free
   string, and a family with no stages records like SA.
