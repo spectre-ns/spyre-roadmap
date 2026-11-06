@@ -21,91 +21,71 @@ plan is done:
 
 - each rule exists once;
 - one solver family encodes and solves the problem;
-- a single solver-free check judges every plan, however it was produced.
+- a single solver-free check judges every plan, however it was produced;
+- a new accelerator card is a configuration, not new classes.
 
 ## Design
 
-The design has two layers.
+The design has three parts.
 
-- **The graph layer holds no solver types.** It is plain data, so a family can encode
-  it, it can be annealed, and it can be tested without a solver.
-  - The optimizer owns a graph of op nodes, data edges carrying transform steps,
-    execution edges and pins.
-  - A cost model writes the objective as a sympy expression.
-  - What is special about an op type is a set of `Restriction` flags that its node type
-    ORs together and freezes.
-- **The family layer** is one object per solver family that encodes and solves.
-  - Its encoder applies the rules at every level (op, edge, op-op and graph), records
-    the boxes to place, and consumes the cost model.
-  - Its private backend solves the model and places the boxes.
+- **The graph holds no solver types.** It is plain data, so a family can encode it, it can
+  be annealed, and it can be tested without a solver.
+  - Op nodes are joined by data edges, which carry transform steps. The graph also keeps
+    the op order and the pins.
+  - Every node is one `OpNode` dataclass. Its kind is an `OpKind` value, and the target's
+    op factory sets its ports and `Restriction` flags when the builder makes it.
+- **The target describes the card.** A frozen `Target` holds everything that differs
+  between accelerator cards: the op factory, the sizes, the rules that vary by card, the
+  steps the card can perform, the optimizations the solve may use, and the cost model. It
+  is chosen from config, and the graph keeps it.
+- **A family encodes and solves.** One object per solver family:
+  - it applies the rules at every level (op, edge, op-op and graph);
+  - it records the boxes to place and consumes the cost model;
+  - it solves the model and reads the plan back onto the graph.
+
+Plain data is a dataclass. A kind that differs from another only in constants is an enum
+value with a row in a table, not a subclass. Behaviour lives in functions and in the
+families.
+
+### Entry point
+
+There is no optimizer class. One function runs the five steps:
+
+```python
+def plan_allocation(ir, config) -> SpyreOptimizationGraph:
+    target = TARGETS[config.target]
+    graph = build_graph(ir, target)
+    optimize(graph, FAMILIES[config.layout_solver], FAMILIES[config.fallback_solver],
+             SolveSettings.from_config(config))
+    commit(graph)
+    return graph
+```
+
+`SolveSettings` is a dataclass holding the time limit, the workers and opt-in
+determinism.
 
 ### Class diagrams
 
-The classes fall into six groups, one diagram each. A class drawn without members
-belongs to another group's diagram. A node class appears in each diagram with only the
-members that diagram is about.
-
-#### Optimizer
-
-`SpyreOptimizer` owns the graph, takes its solver family from config and hands the cost
-model to that family's encoder.
-
-```mermaid
-classDiagram
-    direction LR
-
-    class SpyreOptimizer {
-        +family: ModelAbstractFactory
-        +fallback: ModelAbstractFactory
-        +cost_model: CostModel
-        +settings: SolveSettings
-        +plan_allocation(ir) SpyreOptimizationGraph
-        +optimize(graph, restrictions) SpyreOptimizationGraph
-        +build_graph(ir) SpyreOptimizationGraph
-        +commit(graph)
-    }
-    class CostModel {
-        +objective(graph) sympy.Expr
-        +spill_cost(node) int
-        +cut_traffic(node) list~sympy.Expr~
-    }
-    class SolveSettings {
-        +time_limit: float
-        +workers: int
-        +deterministic: bool
-    }
-    class SpyreOptimizationGraph
-    class ModelAbstractFactory
-    class Encoder
-    class Restriction
-
-    SpyreOptimizer *-- SpyreOptimizationGraph
-    SpyreOptimizer *-- SolveSettings
-    SpyreOptimizer ..> ModelAbstractFactory : family and fallback from config
-    SpyreOptimizer ..> CostModel : hands to the encoder
-    SpyreOptimizer ..> Encoder : encode and read_back
-    SpyreOptimizer ..> Restriction : check_decisions
-    CostModel ..> SpyreOptimizationGraph : reads data
-```
+The classes fall into five groups, one diagram each. A class drawn without members
+belongs to another group's diagram.
 
 #### Graph
 
-The graph layer holds no solver types. Op nodes are joined by data edges, which carry
-transform steps, and by execution edges, which order them. Pins narrow the solve. Ports
-and restrictions have their own diagrams below.
+Op nodes are joined by data edges, which carry steps. The node list is in op order, which
+replaces execution edges: `cuts` holds the positions in that order where the solve cut a
+nest. Pins narrow the solve.
 
 ```mermaid
 classDiagram
     direction TB
 
     class SpyreOptimizationGraph {
+        +target: Target
         +nodes: list~OpNode~
         +data_edges: list~DataEdge~
-        +execution_edges: list~ExecutionEdge~
         +pins: list~Pin~
-        +alignment: int
-        +capacity: int
-        +add_node(node) OpNode
+        +cuts: set~int~
+        +add_node(kind, name, axes, attrs) OpNode
         +connect(out, in_port) DataEdge
         +pin(target, what, value, source) Pin
         +pins_on(target, what) list~Pin~
@@ -113,95 +93,87 @@ classDiagram
         +lifetime(node) tuple
     }
     class OpNode {
-        <<abstract>>
+        <<dataclass>>
+        +kind: OpKind
         +name: str
         +axes: tuple~Axis~
         +size: int
-        +prev: ExecutionEdge
-        +next: ExecutionEdge
+        +in_ports: dict~str, InPort~
+        +out: OutPort
+        +restrictions: Restriction
+        +k: Axis | None
+        +n: Axis | None
+        +scatter: bool
         +work_split: WorkSplit
         +resident: bool
         +offset: int
-        +runs: bool$
+        +port(name) InPort
         +padded_reductions() list
         +whole_stick_factors(axis) tuple
         +broadcast_dims(port) list
         +same_index_read(port) bool
-        +footprint(splits, tiling, alignment) int
+        +footprint(splits, tiling) int
     }
-    class InPort
-    class OutPort
-    class PointwiseNode
-    class MatmulNode {
-        +k: Axis
-        +n: Axis
-    }
-    class ReductionNode
-    class IndirectNode {
-        +scatter: bool
-    }
-    class InputNode {
-        runs = False
+    class OpKind {
+        <<enum>>
+        POINTWISE
+        MATMUL
+        REDUCTION
+        INDIRECT
+        INPUT
     }
     class DataEdge {
+        <<dataclass>>
         +src: OutPort
         +dst: InPort
         +in_place: bool
-        +transforms: list~Transform~
+        +steps: list~Step~
         +read_layout() FixedTiledLayout
     }
-    class ExecutionEdge {
-        +before: OpNode
-        +after: OpNode
-        +cut: bool
-    }
     class Pin {
-        +target: OpNode | Port | DataEdge
+        <<dataclass>>
+        +target: OpNode | InPort | OutPort | DataEdge
         +what: str
         +value
         +source: str
         +internal: bool
     }
-    class Restriction
-    class Transform
+    class InPort
+    class OutPort
+    class Step
+    class Target
 
-    SpyreOptimizationGraph o-- OpNode : nodes
+    SpyreOptimizationGraph o-- OpNode : nodes, in op order
+    SpyreOptimizationGraph o-- DataEdge : data_edges
     SpyreOptimizationGraph o-- Pin : pins
-    OpNode <|-- PointwiseNode
-    OpNode <|-- MatmulNode
-    OpNode <|-- ReductionNode
-    OpNode <|-- IndirectNode
-    OpNode <|-- InputNode
+    SpyreOptimizationGraph --> Target : target
+    OpNode --> OpKind : kind
     OpNode *-- InPort : in_ports
     OpNode *-- OutPort : out
-    OutPort o-- DataEdge : edges
-    InPort o-- DataEdge : edge
-    OpNode o-- ExecutionEdge : prev and next
-    OpNode ..> Restriction : frozen per type
-    DataEdge o-- Transform : steps
+    DataEdge o-- Step : steps
     Pin ..> DataEdge : or a port or a node
 ```
 
-`MatmulNode.k` and `.n` are the contraction axis and the output-column axis that
-`MATMUL_STICKS` reads (port `x` stuck on K, port `y` and the out port on N). The builder finds them once
-from the reads' index symbols, as `_matmul_layouts` does today with
-`find_reduction_var` and `find_matmul_generated_var`, including the `M = 1` and `N = 1`
-cases where one symbol simplifies away. Ports `x` and `y` bind to operands 0 and 1
-(`identify_matmul_inputs` confirms the positional order).
+`k` and `n` are set only on a matmul, and `scatter` only on an indirect op. `k` and `n`
+are the contraction axis and the output-column axis that `MATMUL_STICKS` reads (port `x`
+stuck on K, port `y` and the out port on N). The builder finds them once from the reads' index symbols, as
+`_matmul_layouts` does today with `find_reduction_var` and `find_matmul_generated_var`,
+including the `M = 1` and `N = 1` cases where one symbol simplifies away. Ports `x` and
+`y` bind to operands 0 and 1 (`identify_matmul_inputs` confirms the positional order).
 
-`IndirectNode` is a gather (an indirect read) or a scatter (an indirect write,
+An `INDIRECT` node is a gather (an indirect read) or a scatter (an indirect write,
 `scatter = True`). Port `table` reads the shared value table or scatter destination,
 `index` reads the indices, and `values` reads a scatter's source (a gather leaves it
-unbound). Every core reads the table
-at one base address, so `INDIRECT_ACCESS` keeps its data dims unsplit; only the
-index-entry dims carry the op's parallelism.
+unbound). Every core reads the table at one base address, so `INDIRECT_ACCESS` keeps its
+data dims unsplit; only the index-entry dims carry the op's parallelism.
 
 #### Ports
 
-A node connects to data edges through named
-ports: one `InPort` per operand it reads and one `OutPort` for what it writes. Each node
-type declares its port names in `PORTS`, so rules, pins and edges name an operand
-(`x`, `table`) rather than an index. The out port carries the node's output layout as a
+A node connects to data edges through named ports: one `InPort` per operand it reads and
+one `OutPort` for what it writes. The op's `OpConfig` declares its port names, so rules,
+pins and edges name an operand (`x`, `table`) rather than an index. Both are dataclasses
+with no shared base. They are not frozen, because `connect` attaches the edges after the
+builder makes them. The out port carries the node's output layout as a
 `FixedTiledLayout`, the host size and stride plus the `SpyreTensorLayout` that codegen
 uses, so every rule reads the same device layout the compiler commits.
 
@@ -209,43 +181,24 @@ uses, so every rule reads the same device layout the compiler commits.
 classDiagram
     direction TB
 
-    class OpNode {
-        <<abstract>>
-        +in_ports: dict~str, InPort~
-        +out: OutPort
-        +PORTS: tuple~str~$
-        +port(name) InPort
-    }
-    class Port {
-        <<abstract>>
+    class InPort {
+        <<dataclass>>
         +name: str
         +node: OpNode
         +axis_map: dict~Axis, int~
         +facts: PortFact
-    }
-    class InPort {
         +operand: int
         +index: sympy.Expr
         +edge: DataEdge
     }
     class OutPort {
+        <<dataclass>>
+        +name: str
+        +node: OpNode
+        +axis_map: dict~Axis, int~
+        +facts: PortFact
         +layout: FixedTiledLayout
         +edges: list~DataEdge~
-    }
-    class PointwiseNode {
-        PORTS = in0 .. inN
-    }
-    class MatmulNode {
-        PORTS = x, y
-    }
-    class ReductionNode {
-        PORTS = in0
-    }
-    class IndirectNode {
-        PORTS = table, index, values
-    }
-    class InputNode {
-        PORTS = none
     }
     class FixedTiledLayout {
         +size: list
@@ -262,260 +215,267 @@ classDiagram
     }
     class DataEdge
 
-    OpNode <|-- PointwiseNode
-    OpNode <|-- MatmulNode
-    OpNode <|-- ReductionNode
-    OpNode <|-- IndirectNode
-    OpNode <|-- InputNode
-    OpNode *-- InPort : in_ports
-    OpNode *-- OutPort : out
-    Port <|-- InPort
-    Port <|-- OutPort
     OutPort *-- FixedTiledLayout : output layout
     OutPort o-- DataEdge : edges
     InPort o-- DataEdge : edge
-    Port ..> PortFact : derived by the builder
+    InPort ..> PortFact : derived by the builder
+    OutPort ..> PortFact : derived by the builder
 ```
 
-An in port records how its operand is read: the operand index it is bound to, the
-read's index expression and its axis-to-dim map. The out port records the write's map.
-The builder works these out once, so a rule asks `node.port("x")` instead of searching
-the reads.
+An in port records how its operand is read: the operand index it is bound to, the read's
+index expression and its axis-to-dim map. The out port records the write's map. The
+builder works these out once, so a rule asks `node.port("x")` instead of searching the
+reads.
 
-A port also carries `facts`, a `PortFact` flag set the builder derives once. A fact
+A port also carries `facts`, a `PortFact` flag set the builder derives once, masked by
+the op config's `facts`, so a card that lacks a format never derives its fact. A fact
 describes the tensor or the read behind one operand, not the op. A rule keyed on a fact
 therefore applies to every op that touches that tensor, through the port that carries
 it, and the port's axis map turns the tensor dims it names into the op's loop axes.
 `QFP8WT` on a weight restricts both the op that writes it (its out port) and the matmul
-that reads it (port `y`), and neither node type mentions QFP8WT.
+that reads it (port `y`), and no op config mentions QFP8WT.
 
-#### Node restrictions
+#### Target and op factory
 
-Each node type ORs together the `Restriction` flags that apply to it and freezes them.
-[Restrictions](#restrictions) gives what each flag means.
+A `Target` is one card. Its `OpFactory` holds one `OpConfig` per op kind, and
+`make` stamps that config onto each node it builds. The node class is the same for every
+kind and every card; what differs is the configuration.
+
+```mermaid
+classDiagram
+    direction TB
+
+    class Target {
+        <<frozen dataclass>>
+        +name: str
+        +ops: OpFactory
+        +cores: int
+        +lx_bytes: int
+        +alignment: int
+        +stick_bytes: int
+        +rules: Rule
+        +steps: frozenset~StepKind~
+        +optimizations: Optimization
+        +cost_model: CostModel
+    }
+    class OpFactory {
+        <<frozen dataclass>>
+        +ops: dict~OpKind, OpConfig~
+        +make(kind, name, axes, attrs) OpNode
+        +with_kind(kind, changes) OpFactory
+    }
+    class OpConfig {
+        <<frozen dataclass>>
+        +ports: tuple~str~
+        +restrictions: Restriction
+        +facts: PortFact
+        +runs: bool
+    }
+    class CostModel {
+        +objective(graph) sympy.Expr
+        +spill_cost(node) int
+        +cut_traffic(node) list~sympy.Expr~
+    }
+    class Restriction {
+        <<Flag>>
+    }
+    class Rule {
+        <<Flag>>
+    }
+    class Optimization {
+        <<Flag>>
+    }
+    class OpKind
+
+    Target *-- OpFactory : ops
+    Target *-- CostModel : cost_model
+    Target ..> Rule
+    Target ..> Optimization
+    OpFactory *-- OpConfig : one per OpKind
+    OpFactory ..> OpKind
+    OpConfig ..> Restriction
+```
+
+Every target fills `ops` for every `OpKind`. A second card that shares most of the first
+card's rules is derived from it, so the shared part is defined once and the differences
+are visible in one place:
+
+```python
+SPYRE = Target(name="spyre", ops=SPYRE_OPS, cores=SPYRE_CORES, lx_bytes=SPYRE_LX_BYTES,
+               alignment=SPYRE_ALIGNMENT, stick_bytes=SPYRE_STICK_BYTES, rules=~Rule.NONE,
+               steps=frozenset({StepKind.COPY_OUT, StepKind.RESTICKIFY,
+                                StepKind.RELAYOUT}),
+               optimizations=~Optimization.NONE, cost_model=SpyreCostModel())
+
+# Illustration only: a card whose matmul may split an encoded K and that can transpose.
+OTHER = replace(
+    SPYRE,
+    name="other",
+    ops=SPYRE_OPS.with_kind(
+        OpKind.MATMUL,
+        restrictions=SPYRE_OPS.ops[OpKind.MATMUL].restrictions
+        & ~Restriction.ENCODED_K_UNSPLIT),
+    steps=SPYRE.steps | {StepKind.TRANSPOSE},
+)
+```
+
+- **Chosen from config.** `config.target` names an entry in `TARGETS`, so the target is
+  in the FX graph cache key and never comes from the environment at solve time.
+- **Read only through the graph.** `build_graph(ir, target)` makes every node through
+  `target.ops` and stores `graph.target`. The encoder, the cost model and
+  `check_decisions` read sizes, rules, steps and optimizations from `graph.target`, so
+  none of them takes a target argument and the solve and the check cannot see different
+  cards.
+- **A new card is one `Target` value**, plus a cost model if its numbers differ.
+- **Steps stay a table.** If a card's step footprints or constants differ, a step
+  factory in `Target` follows the same pattern. It is not built until a card needs it.
+
+#### Steps
+
+A data edge carries an ordered list of steps that turn the producer's layout into the
+one the consumer reads. Each step has its own footprint, residency and offset, so
+placement treats it like a node. A step is one dataclass; what differs between kinds is
+a row in `STEP_KINDS`, and `apply(step, layout)` dispatches on the kind.
 
 ```mermaid
 classDiagram
     direction LR
 
-    class OpNode {
-        <<abstract>>
-        +restrictions: Restriction$
-    }
-    class PointwiseNode {
-        restrictions = WHOLE_STICKS | POINTWISE_STICKS
-    }
-    class MatmulNode {
-        restrictions = WHOLE_STICKS | MATMUL_STICKS | PADDED_REDUCTION_UNSPLIT | ENCODED_K_UNSPLIT
-    }
-    class ReductionNode {
-        restrictions = WHOLE_STICKS | PADDED_REDUCTION_UNSPLIT
-    }
-    class IndirectNode {
-        restrictions = WHOLE_STICKS | INDIRECT_ACCESS
-    }
-    class InputNode {
-        restrictions = NONE
-    }
-    class Restriction {
-        <<Flag>>
-        NONE
-        WHOLE_STICKS
-        PADDED_REDUCTION_UNSPLIT
-        MATMUL_STICKS
-        POINTWISE_STICKS
-        INDIRECT_ACCESS
-        ENCODED_K_UNSPLIT
-    }
-    class PortFact
-
-    OpNode <|-- PointwiseNode
-    OpNode <|-- MatmulNode
-    OpNode <|-- ReductionNode
-    OpNode <|-- IndirectNode
-    OpNode <|-- InputNode
-    OpNode ..> Restriction : frozen per type
-    Restriction ..> PortFact : ENCODED_K_UNSPLIT requires a fact
-```
-
-#### Transforms
-
-A data edge carries an ordered list of steps that turn the producer's layout into the
-one the consumer reads. Each step has its own footprint, residency and offset, so
-placement treats it like a node.
-
-```mermaid
-classDiagram
-    direction TB
-
-    class Transform {
-        <<abstract>>
+    class Step {
+        <<dataclass>>
+        +kind: StepKind
         +resident: bool
         +offset: int
         +footprint: int
         +pinned: bool
-        +ORDER: int$
-        +forced: bool$
-        +in_lx: bool$
-        +apply(layout) FixedTiledLayout
-    }
-    class CopyOut {
-        ORDER = 0, forced, in HBM
-    }
-    class Restickify {
-        +to_stick: int
-        ORDER = 1, forced
-    }
-    class Relayout {
+        +to_stick: int | None
         +to_view
-        +reduction_split: int
-        ORDER = 2, chosen
+        +reduction_split: int | None
     }
-    class Transpose {
-        <<out of scope>>
-        +perm: tuple~int~
-        chosen
+    class StepKind {
+        <<enum>>
+        COPY_OUT
+        RESTICKIFY
+        RELAYOUT
+        TRANSPOSE
     }
     class DataEdge
 
-    DataEdge o-- Transform : steps
-    Transform <|-- CopyOut
-    Transform <|-- Restickify
-    Transform <|-- Relayout
-    Transform <|-- Transpose
+    DataEdge o-- Step : steps
+    Step --> StepKind : kind
 ```
 
-`Transpose` is in the diagram only to show where it would go: a step that permutes the
-device dims of a resident tile, priced like a relayout. It is not built in this plan
-(see "Future work"), and its `ORDER` among the other steps is left for its own design.
+| `StepKind` | `ORDER` | chosen or forced | where it lives | fields it uses |
+|---|---|---|---|---|
+| `COPY_OUT` | 0 | forced at a cut | HBM | none |
+| `RESTICKIFY` | 1 | forced where the read stick differs | LX or HBM | `to_stick` |
+| `RELAYOUT` | 2 | chosen | LX or HBM | `to_view`, `reduction_split` |
+| `TRANSPOSE` | out of scope | chosen | LX | a permutation |
+
+`TRANSPOSE` is listed only to show where it would go: a step that permutes the device
+dims of a resident tile, priced like a relayout. It is not built in this plan (see
+"Future work"), and its `ORDER` among the other steps is left for its own design. A
+target offers only the step kinds in `target.steps`.
 
 #### Families
 
-One factory per solver family creates that family's encoder and owns its private
-backend, and each encoder builds its family's own model. OR-Tools builds a CP model.
-SA builds an `AnnealModel`, a port of today's `SaCoOptimizingSolver` state, because an
-annealer moves through divisions and a placement order rather than through CP
-variables. `CpmpyFactory` and its encoder are future work, not part of this plan.
+A family is one object that encodes, solves and reads back. There is no separate
+factory, encoder, backend or model hierarchy. Each family encodes into its own native
+model, wrapped in an `Encoding` record that holds what every family records. OR-Tools
+builds a CP-SAT `CpModel`. SA builds an `AnnealModel`, a port of today's
+`SaCoOptimizingSolver` state, because an annealer moves through divisions and a placement
+order rather than through CP variables. `CpmpyFamily` is future work, not part of this
+plan.
 
 ```mermaid
 classDiagram
     direction TB
 
-    class ModelAbstractFactory {
-        <<abstract>>
-        +encoder(cost_model) Encoder
-        +solve(model, settings) Solution
-    }
-    class OrToolsFactory {
-        +placement: no_overlap | pack
-    }
-    class CpmpyFactory {
-        <<future work>>
-    }
-    class SAFactory {
-        +seed: int
-    }
-    class Backend {
-        <<abstract>>
-        +solve(model, settings) Solution
-    }
-    class Encoder {
-        <<abstract>>
-        +encode(graph, restrictions) Model
+    class Family {
+        <<protocol>>
+        +ENCODES: Restriction$
+        +RULES: Rule$
+        +STEPS: frozenset~StepKind~$
+        +OPTIMIZATIONS: Optimization$
+        +encode(graph) Encoding
+        +solve(encoding, settings) Solution
         +read_back(solution, graph)
     }
-    class OrToolsEncoder {
-        +ENCODES: Restriction
-        +coarse_tiling: bool
-        +cost_model: CostModel
+    class OrToolsFamily {
+        +placement: no_overlap | pack
         +post(subject, rule, expr, when)
         +symbol(name, variable)
     }
-    class CpmpyEncoder {
-        <<future work>>
-    }
-    class SAEncoder {
-        +ENCODES: Restriction
-        +cost_model: CostModel
+    class SAFamily {
+        +seed: int
         +score(state) int
     }
-    class Model {
-        <<abstract>>
+    class CpmpyFamily {
+        <<future work>>
+    }
+    class Encoding {
+        <<dataclass>>
+        +model: CpModel | AnnealModel
         +provenance: list
         +pruned: list
         +symbols: dict
         +boxes: list~PlacementBox~
         +capacity: int
     }
-    class CpModel {
-        +proto: CpModelProto
-    }
     class AnnealModel {
+        <<dataclass>>
         +domains: dict~OpNode, DivisionSource~
         +relations: dict~DataEdge, EdgeRelation~
         +order: list~PlacementBox~
     }
-    class CostModel
     class SpyreOptimizationGraph
 
-    ModelAbstractFactory <|-- OrToolsFactory
-    ModelAbstractFactory <|-- CpmpyFactory
-    ModelAbstractFactory <|-- SAFactory
-    ModelAbstractFactory ..> Encoder : creates
-    ModelAbstractFactory *-- Backend : private
-    Encoder <|-- OrToolsEncoder
-    Encoder <|-- CpmpyEncoder
-    Encoder <|-- SAEncoder
-    Encoder ..> CostModel : consumes objective
-    Encoder ..> Model : returns
-    Model <|-- CpModel
-    Model <|-- AnnealModel
-    Encoder ..> SpyreOptimizationGraph : read_back decodes a plan
-    Backend ..> Model : solves and places
+    Family <|.. OrToolsFamily
+    Family <|.. SAFamily
+    Family <|.. CpmpyFamily
+    Family ..> Encoding : encode returns
+    Encoding *-- AnnealModel : SA only
+    Family ..> SpyreOptimizationGraph : read_back decodes a plan
 ```
 
 ### `optimize`
 
 ```mermaid
 sequenceDiagram
-    participant O as SpyreOptimizer
+    participant P as plan_allocation
     participant G as SpyreOptimizationGraph
-    participant F as ModelAbstractFactory
-    participant E as Encoder
+    participant F as Family
     participant C as CostModel
-    participant B as Backend (private)
     participant IR as GraphLowering
 
-    O->>G: build_graph(ir): nodes by op kind, edges, pins
-    O->>F: encoder(cost_model), family from config
-    F-->>O: encoder
-    O->>E: encode(graph, restrictions)
-    E->>E: op level: table, residency rules, sticks, node-type flags
-    E->>E: edge and op-op level: restickify, relayout, copy-out, cuts, in-place overwrite
-    E->>E: graph level: record the boxes to place
-    E->>C: objective(graph)
-    C-->>E: sympy expression over named symbols
-    E->>E: encode the objective by symbol name
-    E-->>O: model
-    O->>F: solve(model, settings)
-    F->>B: solve and place (natively or by packing)
-    B-->>F: solution: status, objective, offsets
-    F-->>O: solution
+    P->>G: build_graph(ir, target): nodes through target.ops, edges, pins
+    P->>F: encode(graph), family from config
+    F->>F: op level: table, residency rules, sticks, each node's flags
+    F->>F: edge and op-op level: restickify, relayout, copy-out, cuts, in-place overwrite
+    F->>F: graph level: record the boxes to place
+    F->>C: graph.target.cost_model.objective(graph)
+    C-->>F: sympy expression over named symbols
+    F->>F: encode the objective by symbol name
+    F-->>P: encoding
+    P->>F: solve(encoding, settings)
+    F->>F: solve and place (natively or by packing)
+    F-->>P: solution: status, objective, offsets
     alt proven infeasible
-        O->>O: warn naming the user hints, return the graph unchanged
+        P->>P: warn naming the user hints, return the graph unchanged
     else out of time with no plan
-        O->>O: encode and solve again with the fallback family (SA)
-        O-->>O: solution
+        P->>P: encode and solve again with the fallback family (SA)
     end
-    O->>E: read_back(solution, graph)
-    E->>G: decode splits, layouts, residency, offsets, steps, in-place overwrite
-    O->>O: check_decisions(graph): every rule, no solver
-    O->>IR: commit: insert steps in order, divisions, offsets
+    P->>F: read_back(solution, graph)
+    F->>G: decode splits, layouts, residency, offsets, steps, cuts, in-place overwrite
+    P->>P: check_decisions(graph): every rule, no solver
+    P->>IR: commit(graph): insert steps in order, divisions, offsets
 ```
 
 ### Restrictions
 
-A `Restriction` flag names what is special about an op type's decisions:
+Four flag sets name the rules and choices. A `Restriction` names what is special about an
+op kind, a `PortFact` what is special about one operand, a `Rule` what is special about
+a card, and an `Optimization` a decision axis the solve may use:
 
 ```python
 class Restriction(Flag):
@@ -537,58 +497,82 @@ class PortFact(Flag):
     OVERLAPPING_READ = auto()    # the read overlaps itself, as in x.unfold
     DIRECT_READ_SOURCE = auto()  # a staged copy whose read may later go straight to a graph input
 
-class OpNode:
-    restrictions: ClassVar[Restriction] = Restriction.WHOLE_STICKS
+class Rule(Flag):
+    NONE = 0
+    ONE_REDUCTION_SPLIT = auto()        # at most one reduction axis is split
+    TILES_OFF_STICK = auto()            # tiles are on output axes, never the stick dim
+    RESIDENT_TILE_UNREDUCED = auto()    # a copied-out tile that stays resident has no
+                                        # reduction split
+    COPY_OUT_IN_HBM = auto()            # a copy-out lives in HBM
 
-class MatmulNode(OpNode):
-    PORTS = ("x", "y")
-    k: Axis   # contraction axis, read by MATMUL_STICKS
-    n: Axis   # output-column axis, read by MATMUL_STICKS
-    restrictions = (OpNode.restrictions | Restriction.MATMUL_STICKS
-                    | Restriction.PADDED_REDUCTION_UNSPLIT | Restriction.ENCODED_K_UNSPLIT)
+class Optimization(Flag):
+    NONE = 0
+    CORE_SPLIT = auto()      # work division across cores
+    LX_RESIDENCY = auto()    # keeping a buffer in LX
+    IN_PLACE = auto()        # in-place overwrite
+    PREFETCH = auto()        # LX prefetch of a graph input
+    COARSE_TILING = auto()   # coarse tiles and their nests
 ```
 
-- **Flags are frozen per node type.** Setting `restrictions` on an instance raises. A
-  test can override a type's flags through a mapping passed to `encode`,
-  `check_decisions` and `optimize`, for example
-  `{ReductionNode: ReductionNode.restrictions & ~Restriction.PADDED_REDUCTION_UNSPLIT}`.
+Each op kind's config in `SPYRE_OPS`:
+
+| `OpKind` | ports | restrictions | runs |
+|---|---|---|---|
+| `POINTWISE` | `in0` .. `inN` | `WHOLE_STICKS \| POINTWISE_STICKS` | yes |
+| `MATMUL` | `x`, `y` | `WHOLE_STICKS \| MATMUL_STICKS \| PADDED_REDUCTION_UNSPLIT \| ENCODED_K_UNSPLIT` | yes |
+| `REDUCTION` | `in0` | `WHOLE_STICKS \| PADDED_REDUCTION_UNSPLIT` | yes |
+| `INDIRECT` | `table`, `index`, `values` | `WHOLE_STICKS \| INDIRECT_ACCESS` | yes |
+| `INPUT` | none | `NONE` | no |
+
+- **Flags are set per node by the factory.** The builder never assigns `restrictions`
+  after `make`, and it asserts that every node of one kind carries that kind's config,
+  so two matmuls in one graph cannot disagree. A test changes flags by building with a
+  derived target, for example
+  `replace(SPYRE, ops=SPYRE_OPS.with_kind(OpKind.REDUCTION, restrictions=...))`, so
+  `encode` and `check_decisions` take no override argument.
 - **A flag only names a rule.** Two functions turn a flag into data from the node's
-  facts and the attributes its subtype adds:
+  facts and its kind's fields:
   - `splits_while_stuck(node, flag)` gives split domains that apply while something is
     stuck;
   - `stick_tables(node, flag)` gives tables of legal sticks.
 
-  Each family's encoder encodes that data, and `check_decisions` evaluates it.
-- **Port facts trigger rules a node type cannot.** A `Restriction` names what is special
-  about an op kind; a `PortFact` names what is special about one operand. A rule keyed
-  only on a fact is an always-on rule over every port that carries it:
+  Each family's `encode` encodes that data, and `check_decisions` evaluates it.
+- **Port facts trigger rules an op kind cannot.** A rule keyed only on a fact is an
+  always-on rule over every port that carries it:
   - `QFP8WT`: the dims indexing the second stick coordinate and the batch dims stay
     unsplit;
   - `OVERLAPPING_READ`: the window variable splits so no core sweeps an overlap;
   - `DIRECT_READ_SOURCE`: the source's stick dim splits in whole sticks.
 
-  A node flag can also require a fact. `ENCODED_K_UNSPLIT` keeps a matmul's K unsplit
+  An op flag can also require a fact. `ENCODED_K_UNSPLIT` keeps a matmul's K unsplit
   only when one of its ports is `QFP8WT` or `STAGGERED_EA`.
-- **Coverage is checked.** `OrToolsEncoder.ENCODES` is itself a flag set, and
-  `coverage()` reports any flag on the graph's node types that a family cannot encode.
-- **A new flag needs three things:** its data, an encoding in each family, and a check.
+- **An optimization that is off gets no variables.** The encoder creates none for an
+  axis outside `graph.target.optimizations` (narrowed further by config, as coarse
+  tiling is today), and `check_decisions` rejects a plan that uses it anyway.
+- **Coverage is checked at config time.** `coverage(family, target)` reports every
+  restriction (across all op kinds), rule, step kind and optimization the target uses
+  that the family's `ENCODES`, `RULES`, `STEPS` or `OPTIMIZATIONS` lacks. Tests run over
+  every (family, target) pair, and a gap is an explicit skip.
+- **A new flag needs three things:** its data, an encoding in each family that serves a
+  card using it, and a check. Cards without the flag never see it.
 
-**Always-on rules** hold for every op, so they are not flags. The `Always` class names
-them; the encoder always applies them and `check_decisions` always checks them:
+**Always-on rules** hold on every card, so they are not flags. The `ALWAYS` list names
+the check functions; the encoder always applies them and `check_decisions` always checks
+them, with sizes read from `graph.target`:
 
 - the split divides the axis;
-- the core budget holds;
-- at most one reduction axis is split;
-- tiles are on output axes, never the stick dim;
-- a copied-out tile that stays resident has no reduction split;
+- the core budget (`target.cores`) holds;
 - the residency rules hold;
 - a restickify appears only where the read stick differs;
 - pinned steps stay;
-- a copy-out lives in HBM;
 - in-place conditions hold;
 - the rules each port fact names hold;
 - tiles line up inside a nest;
-- resident boxes fit LX and never overlap.
+- resident boxes fit LX (`target.lx_bytes`) and never overlap.
+
+The four `Rule` flags describe this hardware rather than arithmetic, so another card may
+drop them. Which rules belong in `Rule` and which in `ALWAYS` is provisional and is
+confirmed before Stage 3.
 
 Data edges carry no restrictions.
 
@@ -596,30 +580,35 @@ Data edges carry no restrictions.
 
 | topic | decision |
 |---|---|
-| Graph inputs | Leaf `InputNode`s with downstream edges only. How an input arrives (its stick) is a pin. |
-| Ports | Every operand a node reads is a named `InPort` and its output an `OutPort`, with names declared per node type. Data edges run from an out port to an in port, and rules and pins name ports, never operand indices. |
-| Port facts | A `PortFact` set on each port, derived once by the builder. Out-port facts come from the layout's element arrangement. In-port facts come from the edge's read layout, so a step that changes the layout changes them, and from the read itself (overlap, direct-read provenance). Rules keyed on a tensor property live here, not on node types. |
+| Targets | One frozen `Target` per accelerator card: op factory, sizes, rules, steps, optimizations, cost model. Chosen from config, so it is in the FX graph cache key. A card that shares rules with another is derived from it with `dataclasses.replace` and flag arithmetic. Different cards in one program are future work. |
+| Node kinds | One `OpNode` dataclass for every kind. The kind is an `OpKind` value, and the target's `OpFactory` sets ports and flags from the kind's `OpConfig` at build, so a card's differences live in configuration, not in node classes. |
+| Class count | Plain data is a dataclass, a kind that differs only in constants is an enum value with a table row, and only the families carry behaviour. |
+| Graph inputs | `INPUT` nodes with downstream edges only. How an input arrives (its stick) is a pin. |
+| Ports | Every operand a node reads is a named `InPort` and its output an `OutPort`, both dataclasses, with names declared per op kind. Data edges run from an out port to an in port, and rules and pins name ports, never operand indices. |
+| Port facts | A `PortFact` set on each port, derived once by the builder and masked by the op config. Out-port facts come from the layout's element arrangement. In-port facts come from the edge's read layout, so a step that changes the layout changes them, and from the read itself (overlap, direct-read provenance). Rules keyed on a tensor property live here, not on op kinds. |
 | Layout | One `FixedTiledLayout` per node, on its out port, carrying its `SpyreTensorLayout`. An in port holds no layout of its own: what a consumer needs is a restriction over its port names, and a mismatch is a step on the edge. |
-| Memory | No `Buffer` class. Nodes and transform steps carry their own footprint, residency and offset, and placement works over both. |
-| Who applies rules | The family's encoder, at op, edge, op-op and graph level. There is no separate lookup or strategy object. |
+| Memory | No `Buffer` class. Nodes and steps carry their own footprint, residency and offset, and placement works over both. |
+| Who applies rules | The family's `encode`, at op, edge, op-op and graph level. There is no separate lookup or strategy object. |
 | Residency rules | Always on, applied while the table is built. A division is banned together with residency rather than removed. |
 | Work division | Enumerated eagerly, as today, and pruned by the rules that hold unconditionally. Conditional rules are posted under their stick literal. |
+| Op order | The node list is in op order; there are no execution edges. `graph.cuts` holds the positions where the solve cut a nest. |
 | Cuts | Derived wherever adjacent ops' tiles don't match. Two ops share a nest only if every data edge between them lines up tile by tile. A nest is the run of ops between two cuts, not an object. |
 | Copy-out | Forced when a cut lies between a data edge's ends. Its buffer lives in HBM, filled tile by tile, and is never placed in LX. There is one per producer, shared by every reader outside the nest, and its traffic is priced by the cost model. |
-| Restickify | A transform, forced where the read stick differs, so it needs no elision. A restickify inserted before the graph is built is a pinned step. |
+| Restickify | A step, forced where the read stick differs, so it needs no elision. A restickify inserted before the graph is built is a pinned step. |
 | Relayout | A chosen step, keyed by the producer's reduction split as well as the two layouts, so a completed-reduction route can read only the last core of each K group. Only from a resident source: a spilled producer reloads from HBM in the consumer's configuration. Inside a tile it is priced per tile times the trip count. Never across a cut. |
 | In-place overwrite | A variable on the edge: the consumer's output overwrites the producer's storage in LX. Allowed only when the read pattern is safe, with adjacent lifetimes, both resident, same layout and footprint, and at most one per op. The pair shares one offset. Safety is a property of the memory read pattern, not of the op kind. The first implementation keeps today's eligibility (`get_op_pointwise_inputs`, a read at the producer's index) so plans stay at parity, and "Future work" widens it. |
 | LX prefetch | Loading a graph input into LX once, ahead of its readers, so each reader avoids its own HBM read. The code calls this an input clone. Whether and where to prefetch is an optimization axis, and where that is decided is an implementation detail: the solve or a pre-solve pass. The first implementation decides it as today: `_eligible_clone_inputs` names the inputs read more than once that fit LX, and the solve chooses their residency and view. Output clones copy a value back to HBM, so they are not prefetches and keep their name. |
-| Objective | A sympy expression from the cost model. The encoder consumes it and encodes it into its own variables by symbol name, and an unknown name fails. More cores only break ties. |
-| Placement | A backend detail. CP-SAT places natively (offsets under a 2-D no-overlap) or by packing (a cumulative under a roof, then a first-fit packer; on overflow the roof comes down and the model is solved again). Annealing and MIP solvers pack. |
-| Families | One object encodes and solves, and its backend is private. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools and SA are built here, each encoding into its own model; CPMpy is future work. |
+| Optimizations | `target.optimizations` names the decision axes the solve may use. An axis that is off gets no variables, and `check_decisions` rejects a plan that uses it. |
+| Objective | A sympy expression from the target's cost model. The family's `encode` consumes it and encodes it into its own variables by symbol name, and an unknown name fails. More cores only break ties. |
+| Placement | A family detail. CP-SAT places natively (offsets under a 2-D no-overlap) or by packing (a cumulative under a roof, then a first-fit packer; on overflow the roof comes down and the model is solved again). Annealing and MIP solvers pack. |
+| Families | One object per family encodes, solves and reads back; there is no factory, encoder, backend or model hierarchy. Chosen from config, so the choice is in the FX graph cache key, never from the environment. OR-Tools and SA are built here, each encoding into its own native model inside an `Encoding` record; CPMpy is future work. |
 | Pins | Constraints that narrow the solve, never decisions, never dropped. They come from hints, graph-input arrival, the restickify pre-pass, hazards, and greedy pins the encoder may add to cut search. Internal pins must never be infeasible. |
 | Failure | A model proven infeasible is returned infeasible, with nothing decoded or committed and a warning naming the user hints. A solve out of time with no plan is retried with the fallback family (SA by default), which encodes the same graph into its own model. A failed check raises `RuleViolation`, because it means a bug. |
 | Decisions | They live in the solution. `read_back` decodes them onto the graph only from a plan, and commit lowers from the graph. |
 | Determinism | Opt-in. `SolveSettings(deterministic=True)` budgets by deterministic time with a fixed seed and interleaved search. Otherwise speed wins. |
 | Loops | Not modelled. User-written loops are opaque hazards, pinned and never re-tiled. Drains stay with whatever inserts them. |
 | After commit | `LxContextSwitchingPass` stays a separate pass. |
-| Out of the first implementation | Lazy work division, multi-level tiles, and everything under "Future work": the CPMpy family, explanations, SA over CPMpy, axis rotations (with the `Transpose` step) and stick layout optimization. |
+| Out of the first implementation | Lazy work division, multi-level tiles, a second card's `Target`, and everything under "Future work": the CPMpy family, explanations, SA over CPMpy, axis rotations (with the `TRANSPOSE` step), stick layout optimization and different cards in one program. |
 
 ## Stages
 
@@ -645,23 +634,25 @@ and either justified or fixed.
 - No production code changes in this stage.
 
 **Stage 1. Graph types.**
-- Add `SpyreOptimizationGraph`, `Port`, `InPort`, `OutPort`, `PortFact`, `OpNode` and its subtypes
-  with their `PORTS` (`PointwiseNode`, `MatmulNode` with `k` and `n`, `ReductionNode`,
-  `IndirectNode` with `scatter`, `InputNode`), `DataEdge`, `ExecutionEdge`, `Pin`,
-  `Transform`, `CopyOut`, `Restickify`, `Relayout`, `WorkSplit` and `Axis`. Layouts are torch-spyre's own `FixedTiledLayout` and
-  `SpyreTensorLayout`, not a new type.
+- Add the dataclasses `SpyreOptimizationGraph`, `OpNode`, `InPort`, `OutPort`,
+  `DataEdge`, `Pin`, `Step`, `WorkSplit` and `Axis`, the enums `OpKind` and `StepKind`
+  with the `STEP_KINDS` table, and `PortFact`. Layouts are torch-spyre's own
+  `FixedTiledLayout` and `SpyreTensorLayout`, not a new type.
+- Add `Target`, `OpFactory` and `OpConfig`, and the `SPYRE` target with `SPYRE_OPS` for
+  every op kind. `config.target` selects it and defaults to `SPYRE`.
 - The graph layer imports no solver.
-- Unit tests cover each class: flags frozen per type, overrides, ports by name, port facts, lifetimes,
-  an edge's read layout after its steps, and pins by source.
+- Unit tests cover: a node's flags and ports come from its kind's config, a derived
+  target changes only what it names, ports by name, port facts masked by the config,
+  lifetimes, an edge's read layout after its steps, and pins by source.
 
 **Stage 2. Builder.**
-- `build_graph` makes one node per op, choosing the subtype from the op kind with the
-  same predicates codegen uses.
-- It binds each operand to the node type's in port, works out each port's axis-to-dim
-  map once from the read's index expression, connects data edges from out port to in
-  port, and builds execution edges from op order.
-- It derives each port's facts: `QFP8WT` and `STAGGERED_EA` from the layout's element
-  arrangement, `OVERLAPPING_READ` from the read's coordinates
+- `build_graph(ir, target)` makes one node per op through `target.ops`, choosing the
+  `OpKind` with the same predicates codegen uses, keeps the nodes in op order, and stores
+  `graph.target`. It asserts that every node of one kind carries that kind's config.
+- It binds each operand to its kind's in port, works out each port's axis-to-dim map once
+  from the read's index expression, and connects data edges from out port to in port.
+- It derives each port's facts, masked by the op config: `QFP8WT` and `STAGGERED_EA`
+  from the layout's element arrangement, `OVERLAPPING_READ` from the read's coordinates
   (`overlapping_coordinate_extents`), and `DIRECT_READ_SOURCE` from a staged copy's
   saved direct-read record.
 - It adds pins for:
@@ -676,12 +667,16 @@ and either justified or fixed.
 - Build from the allocator's full record list, never from a solver's filtered view.
 
 **Stage 3. Restrictions and the check.**
-- Add `Restriction`, `Always`, the residency rules, `splits_while_stuck`,
-  `stick_tables`, `check_decisions` and `coverage`.
+- Add `Restriction`, `Rule`, `Optimization`, `ALWAYS`, the residency rules,
+  `splits_while_stuck`, `stick_tables`, `check_decisions(graph)` and
+  `coverage(family, target)`.
+- Confirm which of today's always-on rules are card properties (`Rule`) and which are
+  arithmetic (`ALWAYS`).
 - They take over these rules from today's code:
   - `work_division_constraints.py`: `coordinate_mask_blocked_vars` becomes
     `PADDED_REDUCTION_UNSPLIT`, and each other op-specific constraint function becomes
-    a flag on the node types it applies to, with its data taken from the node's facts.
+    a flag in the configs of the op kinds it applies to, with its data taken from the
+    node's facts.
     Examples are the qfp8wt K split domain, `plain_reduction_k_split_domains` and
     `reduction_window_blocked_vars`;
   - `indirect_access_split_domains` (`indirect_forbidden_split_syms`) becomes
@@ -697,7 +692,7 @@ and either justified or fixed.
   - `_multi_arg_pointwise_layouts` and `_check_stick_all_same` become
     `POINTWISE_STICKS`;
   - `WorkDivisionContext.is_legal`, `ResidencyChecks` and
-    `check_in_place_parent_is_read` become always-on rules.
+    `check_in_place_parent_is_read` become always-on rules or `Rule` flags.
 - `check_decisions` runs on every plan today's solve commits. It reports but never
   fails a compile.
 - **Phase 1 exit:** across the unit and device suites, `check_decisions` reports nothing,
@@ -706,7 +701,7 @@ and either justified or fixed.
 ### Phase 2: the OR-Tools and SA families, behind config
 
 **Stage 4. Cost model.**
-- `CostModel.objective(graph)` ports today's objective:
+- `SpyreCostModel.objective(graph)`, held by the `SPYRE` target, ports today's objective:
   - `spill_cost`, with graph inputs and outputs discounted;
   - `_cut_traffic_terms` for copy-outs;
   - the co-optimizing cost expression's per-bundle terms and relayout charges;
@@ -714,18 +709,18 @@ and either justified or fixed.
 - `Sym` names every symbol, and `cpsat_expr_printer` encodes the expression by name.
 - Proven by: on the Stage 0 corpus, the objective equals today's, solve for solve.
 
-**Stage 5. `OrToolsEncoder`, op level.**
+**Stage 5. `OrToolsFamily.encode`, op level.**
 - The encoder builds today's work-division table (`enumerate_work_division_candidates`),
   with coarse tilings in the same table when enabled.
 - Residency rules are applied while the table is built.
 - Sticks are variables, or constants where pinned.
-- Each node type's flags are posted: conditional splits under their stick literal, and
+- Each node's flags are posted: conditional splits under their stick literal, and
   stick tables as table constraints.
 - Every constraint is tagged with its rule in the model's provenance, and the table
   entries each rule pruned are recorded.
 - Proven by: an empty proto diff against today's model wherever the rules agree.
 
-**Stage 6. `OrToolsEncoder`, edge and op-op level.**
+**Stage 6. `OrToolsFamily.encode`, edge and op-op level.**
 - **Restickify** is forced where the read stick differs, or pinned.
 - **Cross-frame hazard (an always-on rule).** A restickify may not read a core-sliced
   resident source unless a relayout comes first. Today's `_restickify_barrier` enforces
@@ -743,16 +738,17 @@ and either justified or fixed.
 - **LX prefetch reads** are constraints between the prefetched input's view and the consumer's.
 
 **Stage 7. Families and placement.**
-- Add `Model`, `CpModel`, `ModelAbstractFactory` and `OrToolsFactory`, registered in
-  `FACTORIES` and chosen by a `config.layout_solver` value.
-- The private `CpSatBackend` places in one of two modes, set by a config option:
+- Add the `Family` protocol, `Encoding` and `OrToolsFamily`, registered in `FAMILIES`
+  and chosen by a `config.layout_solver` value.
+- `OrToolsFamily.solve` places in one of two modes, set by its `placement` field from a
+  config option:
   natively, under a 2-D no-overlap, or by packing (a cumulative under a roof, then
   first-fit in several orders, lowering the roof on overflow).
   - An in-place pair packs as one box.
 - `SolveSettings` carries the time limit, workers and opt-in determinism.
 
-**Stage 8. `SAFactory`, today's SA co-optimizer as a family.**
-- `SAEncoder` builds an `AnnealModel`, not a CP model. It ports what
+**Stage 8. `SAFamily`, today's SA co-optimizer as a family.**
+- `SAFamily.encode` builds an `AnnealModel`, not a CP model. It ports what
   `SaCoOptimizingSolver` builds today:
   - per node, a division source over the same work-division table as Stage 5
     (`_MenuDivisions`), or drawn tilings when coarse tiling is on
@@ -764,20 +760,21 @@ and either justified or fixed.
 - The rules come from the same data as the OR-Tools encoder (`splits_while_stuck`,
   `stick_tables`, the always-on rules). Unconditional rules prune the domains and edge
   rules live in the relations, so every state the annealer visits is legal; nothing is
-  priced as a penalty. `ENCODES` and `coverage()` work as for OR-Tools.
+  priced as a penalty. `ENCODES`, `RULES`, `STEPS`, `OPTIMIZATIONS` and `coverage` work
+  as for OR-Tools.
 - `score` compiles the cost model's sympy objective once, by symbol name, into the
   integer fixed-point evaluator `_build_score_fn` makes today. An unknown name fails,
   as in the OR-Tools encoder.
-- The private `AnnealBackend` keeps today's moves (reorder, division flip, region
+- `SAFamily.solve` keeps today's moves (reorder, division flip, region
   recolor), the Metropolis test, best-seen from the seed state, and a seeded `Random`,
   so a run is reproducible.
-- Registered in `FACTORIES` under its own `config.layout_solver` value, and the
+- Registered in `FAMILIES` under its own `config.layout_solver` value, and the
   default `fallback` family.
 - Proven by: on the Stage 0 corpus with the same seed, the plans equal today's
   `SaCoOptimizingSolver` plans wherever the rules agree, and `check_decisions` passes
   on every one.
 
-**Stage 9. `SpyreOptimizer`.**
+**Stage 9. `plan_allocation` and `optimize`.**
 - `optimize` runs encode → solve, then `read_back` → `check_decisions` → commit.
 - **A model proven infeasible** returns with a warning naming the user hints, and
   nothing is decoded or committed.
@@ -795,7 +792,7 @@ and either justified or fixed.
 ### Phase 3: commit, sticks in the solve, switch-over
 
 **Stage 10. Commit.**
-- `SpyreOptimizer.commit` inserts each edge's steps in canonical order (pinned steps
+- `commit(graph)` inserts each edge's steps in canonical order (pinned steps
   already exist), then commits divisions and offsets through `GraphEditor`. This
   replaces `_push_allocation`.
 - `LxContextSwitchingPass` runs after commit, unchanged.
@@ -821,8 +818,8 @@ and either justified or fixed.
   and correctness, then make the new optimizer the default.
 
 **Stage 13. Deletions.**
-- `ScratchpadAllocator` and `CoOptimizingAllocator`, whose role `SpyreOptimizer` takes
-  over. Joint division and placement is the only mode, and placement-only is the same
+- `ScratchpadAllocator` and `CoOptimizingAllocator`, whose role `plan_allocation`
+  takes over. Joint division and placement is the only mode, and placement-only is the same
   model with every division pinned.
 - `MemoryPlanSolver`, `CoreDivisionLayoutSolver` and `CpSatLayoutSolver`.
 - `GreedyLayoutSolver`, `FirstFitLayoutSolver`, `BestFitLayoutSolver` and
@@ -838,12 +835,12 @@ and either justified or fixed.
 
 ## Future work
 
-None of this is staged above. Each item builds on the graph, the flags and the families
-without changing them.
+None of this is staged above. Each item builds on the graph, the flags, the targets and
+the families without changing them.
 
-- **CPMpy family.** `CpmpyFactory` and `CpmpyEncoder` encode the same graph and flags
+- **CPMpy family.** `CpmpyFamily` encodes the same graph and flags
   into a CPMpy model, so any solver CPMpy drives (OR-Tools, Exact, Gurobi and others)
-  can solve it. `coverage()` names any flag the family cannot encode yet. If it matches
+  can solve it. `coverage` names any flag the family cannot encode yet. If it matches
   the OR-Tools family on the corpus, it may replace it.
 - **Explanations with `cpmpy.tools.explain`.** For a model proven infeasible, the
   encoder's provenance already tags each constraint with its rule and each pin with its
@@ -863,7 +860,7 @@ without changing them.
   rather than today's fixed-point score function.
 - **Axis rotations (`AxisRotation`).** Dim-order conversions for memory locality, where
   a consumer walks a buffer across its contiguous dim:
-  - a transpose step on the edge (the `Transpose` transform), which helps only that
+  - a transpose step on the edge (`StepKind.TRANSPOSE`), which helps only that
     consumer;
   - a rotated write on the producer, which changes the layout every consumer sees;
   - a rotated read on the consumer (reordered loops), which moves no data but feeds
@@ -902,6 +899,12 @@ without changing them.
   - **A constraint.** Set a bound and search for the minimum relaxation over some
     criterion. The code base does not use constraint relaxation today, so this is new
     work to build and tune.
+- **Different cards in one program.** Partition the FX graph by device before Build.
+  Each partition gets its own graph, target and solve, and a tensor that crosses cards
+  goes through HBM as an ordinary graph input and output of its partition. A solve that
+  spans cards, sharing LX or core decisions, would need a target per node, which the op
+  factory already allows, and transfer steps between cards. Not built until a workload
+  needs it.
 - **Soft checks after the scheduler and codegen.** The optimizer runs before both, so the
   final SuperDSC can drift from the plan. `SpyreOptimizationGraph` gives one representation
   of the plan that does not depend on the solving method, which is what such a check can
