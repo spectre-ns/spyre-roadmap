@@ -1,6 +1,6 @@
 # LX allocator, Stage 3: Restrictions and the check
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0, 1, 2. Needed by: Stage 4 (the Phase 1 exit only) and Stages 5 to 13.
 
 ## Goal
@@ -86,7 +86,7 @@ Things in the code that the rest of this plan depends on, several of them surpri
     the tensor has more than two host dims (`WDC:719-721`).
 11. **`ENCODED_K_UNSPLIT`'s source pins all of `reduction_vars`**, not only K
     (`WDC:781-783`).
-12. **`SPAN_CAP` differs between its two sources.** `_spans_within_cap` measures every
+12. **`span_cap` differs between its two sources.** `_spans_within_cap` measures every
     tensor (`WD:954-959`); `raise_if_per_core_overflow` skips indirectly accessed ones
     (`WD:560-562`). Indirect ops are pinned on the joint path, so `is_legal` never asks.
 13. **Restickify ops have their own division and buffer.** They appear in `mem_usage` like
@@ -125,8 +125,9 @@ the design recovers each of these from what is exposed, with no change to any so
 The three modules sit in `torch_spyre/_inductor/scratchpad/lx_allocator/`, outside `graph/`,
 so they may reach allocator helpers. `rules.py` holds rule data and imports only sympy, the
 enum module and `graph/` at module level. IR helpers are imported inside the functions that
-need them, as `ALLOC` does throughout. `check.py` holds the check. `plan_adapter.py` holds
-everything that touches today's buffers and is removed in Stage 13.
+need them, as `ALLOC` does throughout. `check.py` holds the check: the `ALWAYS` and
+`RULE_CHECKS` check functions, `optimizations_used`, the driver and `coverage`.
+`plan_adapter.py` holds everything that touches today's buffers and is removed in Stage 13.
 
 **Moved, not copied.** A rule's computation moves to `rules.py` as a pure function over a
 `Frame`, and the old function in `WDC` keeps its name and signature as a thin adapter from
@@ -145,40 +146,20 @@ a small host, a `ScratchpadAllocator` built with `GreedyLayoutSolver` that never
 
 ### 2. Vocabulary
 
-```python
-class Always(str, Enum):
-    # The parent plan's list.
-    SPLIT_DIVIDES = "split divides the axis"
-    CORE_BUDGET = "within the core budget"
-    ONE_REDUCTION_SPLIT = "at most one reduction axis split"
-    TILES = "tiles on output axes, never the stick dim"
-    CUT_TILE = "a copied-out tile that stays resident has no reduction split"
-    RESIDENCY = "the residency rules hold"
-    RESTICKIFY = "a restickify only where the read stick differs"
-    PINNED = "pinned steps stay"
-    COPY_OUT = "a copy-out lives in HBM"
-    IN_PLACE = "in-place conditions hold"
-    PORT_FACTS = "the rules each port fact names hold"
-    TILE_ALIGNED = "tiles line up inside a nest"
-    NO_OVERLAP = "resident boxes fit LX and never overlap"
-    # Added here: existing rules with no entry above (see Deviations).
-    SPAN_CAP = "per-core span within the read-distance limit"
-    SPAN_FLOOR = "split meets the committed span floor"
-    RESIDENT_READ = "a resident source is read under its own view, or through a copy"
-    RELAYOUT_SOURCE = "a resident relayout has a resident, priced source and a reader"
-    TILE_LOCAL = "a coarse-tile-local dim stays whole"
-    ALIGNED_OWNERSHIP = "a split keeps each core's share one contiguous block"
-    RESTICKIFY_PADDING = "an unaligned restickify stick dim stays on one core"
-    SPLIT_PINS = "a pinned division stays"
-    CROSS_FRAME = "a restickify reads a resident source under its own view"
-    TABLE_COLUMN = "a table column follows its selector"   # provenance tag, no check
+`Rule` and `Optimization` are Stage 1's flag sets, because `Target` holds them. This stage
+gives them their checks.
 
-RuleTag = Restriction | PortFact | Always
-CONSTRAINT_RULES: dict[str, RuleTag]   # keyed by constraint function name, the 16 of table A
+```python
+"""rules.py"""
+RuleTag = Restriction | PortFact | Rule | Optimization | str  # str: an ALWAYS check's name
+TABLE_COLUMN = "table_column"         # provenance only, for Stage 5's column ties; no check
+CONSTRAINT_RULES: dict[str, RuleTag]  # keyed by constraint function name, the 16 of table A
+
+def tag_name(tag: RuleTag) -> str: ...
 
 @dataclass(frozen=True)
 class SplitRule:
-    rule: RuleTag                 # provenance tag, what Encoder.post records
+    rule: RuleTag                 # provenance tag, what ortools_encode.post records
     axis: Axis
     factors: frozenset[int]       # legal factors; empty means no legal split
     port: Port | None = None      # None: holds whatever is stuck
@@ -217,6 +198,46 @@ def residency_bar(node: OpNode, graph: SpyreOptimizationGraph, split: WorkSplit 
                   *, decides_relayouts: bool = True) -> str | None: ...
 ```
 
+```python
+"""check.py"""
+Subject = OpNode | DataEdge | SpyreOptimizationGraph
+Verdict = Sequence[Violation] | Skipped | None   # None: not a subject this check judges
+Check = Callable[[SpyreOptimizationGraph, Subject], Verdict]
+
+ALWAYS: list[Check] = [
+    # The parent's list.
+    split_divides,              # the split divides the axis
+    core_budget,                # graph.target.cores holds
+    residency,                  # the residency rules hold
+    restickify_sticks_differ,   # a restickify only where the read stick differs
+    pinned_steps_stay,
+    in_place_conditions,
+    port_fact_rules,            # the rules each port fact names hold
+    tiles_line_up,              # tiles line up inside a nest
+    boxes_fit_lx,               # resident boxes fit graph.target.lx_bytes, never overlap
+    # Added here: existing rules with no parent entry (see Deviations).
+    node_config,                # a node's flags are its type's config in graph.target.ops
+    span_cap,                   # per-core span within the read-distance limit
+    span_floor,                 # split meets the committed span floor
+    resident_read,              # a resident source is read under its own view, or a step's
+    relayout_source,            # a resident relayout has a resident, priced source, a reader
+    tile_local,                 # a coarse-tile-local dim stays whole
+    aligned_ownership,          # a split keeps each core's share one contiguous block
+    restickify_padding,         # an unaligned restickify stick dim stays on one core
+    split_pins,                 # a pinned division stays
+    cross_frame,                # a restickify reads a resident source under its own view
+]
+
+RULE_CHECKS: Mapping[Rule, Check] = {   # run only for flags in graph.target.rules
+    Rule.ONE_REDUCTION_SPLIT: one_reduction_split,
+    Rule.TILES_OFF_STICK: tiles_off_stick,
+    Rule.RESIDENT_TILE_UNREDUCED: resident_tile_unreduced,
+    Rule.COPY_OUT_IN_HBM: copy_out_in_hbm,
+}
+
+def optimizations_used(subject: OpNode | DataEdge) -> Optimization: ...
+```
+
 `frame_of` returns `None` for a tiling `predict_frame` rejects
 (`torch_spyre/_inductor/wsr/tile_prediction.py:291`) and for a node with no iteration space
 (an `OpaqueNode`). It rebuilds what `work_division_context_for_op` builds, without running
@@ -225,18 +246,51 @@ the constraints, from `iteration_space_from_op`, `adjust_it_space_for_sticks` an
 adapters. A synthetic node with `op=None` uses `Axis` extents, divided by the tile count. A
 `WorkSplit` holds `TileLevel`s, so the check calls `frame_of(node, tile_spec_of(node, split))`.
 
-`Always` is a `str` enum so a member works as the `rule` string in `OrToolsEncoder.post` and
-in provenance. `Flag` iteration over a composite needs Python 3.11 (`pyproject.toml:42`).
+A tag names the rule a row, a constraint or a violation comes from. An always-on rule's tag
+is the `__name__` of its check in `ALWAYS`, so `rules.py` can tag rows without importing
+`check.py`. `tag_name(tag)` gives the string Stage 5's `post` records in provenance and
+`CheckReport` counts by: a flag member's `name`, or the `str` itself. `Flag` iteration over a
+composite needs Python 3.11 (`pyproject.toml:42`).
+
+**Off means rejected.** `optimizations_used` gives the decision axes one subject's decisions
+use. The check reports each one missing from `graph.target.optimizations`, tagged with that
+`Optimization` member:
+
+| `Optimization` | a subject uses it when |
+|---|---|
+| `CORE_SPLIT` | a node's `work_split` splits some axis by more than 1 |
+| `LX_RESIDENCY` | a running node, or a step on an edge, is resident |
+| `IN_PLACE` | an edge has `in_place` set |
+| `PREFETCH` | an `InputNode` is resident |
+| `COARSE_TILING` | a node's `work_split.tiling` is non-empty and the node has no `tiling` hazard pin, which marks an op tiled before the solve |
+
+**Which rules are `Rule` flags.** The parent leaves the line between `Rule` and `ALWAYS`
+provisional and asks this stage to confirm it. The test applied: a rule is a `Rule` flag when
+it states how this card and its backend realize a decision, so another card could drop it; it
+is in `ALWAYS` when it is arithmetic, or when breaking it gives wrong data on any card.
+
+| rule | source | why | verdict |
+|---|---|---|---|
+| `Rule.ONE_REDUCTION_SPLIT` | `_one_reduction_split_at_most` `WD:961` | nothing in the arithmetic forbids two split reduction axes; the limit is how the backend combines partial sums | `Rule`, confirmed |
+| `Rule.TILES_OFF_STICK` | `_tiling_candidates` `ALLOC:3960` | its docstring: reduction tiling goes through the accumulator combine path, the stick dim is never emitted, and a restickify has no correct tiling after stickification | `Rule`, confirmed |
+| `Rule.RESIDENT_TILE_UNREDUCED` | `_add_partial_reduction_cut_guard` `ILP:1030` | a split reduction is combined core to core and the finished slice stays on one core of each group, which the per-tile copy cannot read | `Rule`, confirmed; this is the parent's Stage 6 "partial-reduction cut guard" (Deviations) |
+| `Rule.COPY_OUT_IN_HBM` | the docstring at `ILP:932-934` | the copy drains each tile into a full-sized HBM buffer; a card with room could keep it in LX | `Rule`, confirmed |
+| `span_cap` | `WD:954` | the read-distance limit is a hardware number, but every card has one | `ALWAYS`; it reads today's `MAX_SPAN_BYTES` until a second card needs the limit on `Target` |
+| `residency` | table C | several of the registry's rules describe this backend (extern, indirect), but its order is a contract (`RR:83`) | `ALWAYS`, one check; splitting a rule out waits for a card that differs |
+| `resident_read`, `cross_frame`, `tiles_line_up`, `in_place_conditions`, `boxes_fit_lx` | sections 4, 5 | a read or a placement that breaks them gives wrong data on any card | `ALWAYS` |
+| `split_divides`, `core_budget`, `span_floor`, `aligned_ownership`, `restickify_padding`, `tile_local`, `split_pins`, `node_config` | tables A, B, F | arithmetic over the frame, the target's sizes, or the pins | `ALWAYS` |
+
+No rule moves between the two lists, so the parent's provisional split stands.
 
 ### 3. The two data shapes
 
-Both encoder families and the check read exactly these. A row names a port and an axis,
-never a menu position, so a later non-enumerating encoder can post it as a constraint.
+Both families and the check read exactly these. A row names a port and an axis, never a
+menu position, so a later non-enumerating family can post it as a constraint.
 
 **`splits_while_stuck(node, flag, tiling)`** returns `SplitRule`s. A row with `port=None`
 holds unconditionally. A row with a port holds only while that port is stuck on `dim`, one
-of `port.dims_of(axis)`. While sticks are pinned, `is_stuck(rule)` answers that with a
-constant. From Stage 11 an encoder replaces it with a literal.
+of `dims_of(port, axis)`. While sticks are pinned, `is_stuck(rule)` answers that with a
+constant. From Stage 11 a family's `encode` replaces it with a literal.
 
 ```python
 for rule in splits_while_stuck(node, flag, tiling):
@@ -246,31 +300,34 @@ for rule in splits_while_stuck(node, flag, tiling):
 
 | flag | rows | tricky case |
 |---|---|---|
-| `WHOLE_STICKS` | One per port, axis and `dim` in `port.dims_of(axis)`: `(port, dim, axis, divisors(ceil(extent / eps)))` | `eps` is the largest `elems_per_stick` over this port and every port currently stuck on the axis (surprise 4). A port whose `device_coords[-1]` has other than one free symbol is not stuck on anything, as in `WD:464`. QFP8WT sticks on both of `device_coords[-2:]` (`WD:443-461`). |
+| `WHOLE_STICKS` | One per port, axis and `dim` in `dims_of(port, axis)`: `(port, dim, axis, divisors(ceil(extent / eps)))` | `eps` is the largest `elems_per_stick` over this port and every port currently stuck on the axis (surprise 4). A port whose `device_coords[-1]` has other than one free symbol is not stuck on anything, as in `WD:464`. QFP8WT sticks on both of `device_coords[-2:]` (`WD:443-461`). |
 | `PADDED_REDUCTION_UNSPLIT` | One per reduction axis and port reading it, where `extent % port_eps != 0`: `(port, dim, axis, {1})` | Per-port is equivalent to the old max-over-tensors test because stick sizes are powers of two. Extents come from `frame.extents`, never `frame.sticks`, as the docstring at `WDC:352-358` requires. |
 | `ENCODED_K_UNSPLIT` | `(None, None, a, {1})` for each `a` in `frame.reduction_axes`, only when some port has `QFP8WT` or `STAGGERED_EA` | All reduction axes, not only `node.k` (surprise 11). |
 | `INDIRECT_ACCESS` | `(None, None, a, {1})` for each shared data axis of port `table`; `(index, dim, entry, {1})` for a partial last index stick | Coordinates of `table` carry `IndirectAccess`; the mixed-coordinate case `d0 + 128*IndirectAccess(idx)` still reports `d0` (`PU:1779-1794`). Partial uses the index's logical range. No padding exception (surprise 8). |
 | new flags | `(None, None, a, factors)` | See table A. |
 
 `MATMUL_STICKS` and `POINTWISE_STICKS` return no split rows. Any flag on a node type it
-does not fit returns `[]` rather than raising, so an override can add one freely.
+does not fit returns `[]` rather than raising, so a derived target can add one to any type's
+config freely.
 
-`fact_splits` and `always_splits` return the same rows, tagged with the `PortFact` or
-`Always` member. Rows are per frame, so an encoder calls these once per tiling in its table.
+`fact_splits` and `always_splits` return the same rows, tagged with the `PortFact` member or
+the name of the `ALWAYS` check that judges them. Rows are per frame, so a family's `encode`
+calls these once per tiling in its table.
 
 **`stick_tables(node, flag)`** returns `StickTable`s. A row is one legal assignment of
 stick dims to the table's ports. `stuck_dims(port)` wraps Stage 1's `stick_dims`, the only
-layout reader: `frozenset(stick_dims(port.current_layout()) or (SPARSE_STICK,))`, two dims
+layout reader: `frozenset(stick_dims(current_layout(port)) or (SPARSE_STICK,))`, two dims
 for QFP8WT, and empty for a port with no layout. On a self-matmul `x` and `y` share one edge.
 
 | flag | tables |
 |---|---|
 | `MATMUL_STICKS` | Three one-column tables: `x` on `k`, `y` on `n`, out on `n`. If `n` is `None` (N = 1): `y` on `SPARSE_STICK`, out on its last host dim (`PL:1539-1555`). If `k` is `None` (K = 1) there is no `x` table, as `OSV:869-872` skips it. A QFP8WT `y` passes because `stuck_dims` holds two dims. |
-| `POINTWISE_STICKS` | One table over `(out, in0 .. inN)`. For each output dim `o` with axis `a`, the row set is the product over in ports of `port.dims_of(a)`, plus `broadcast_dims(port)`, plus `SPARSE_STICK`. For `IndirectNode` the index ports are left out. A `RestickifyNode` has no such flag: `_check_stick_restickify` wants the opposite. |
+| `POINTWISE_STICKS` | One table over `(out, in0 .. inN)`. For each output dim `o` with axis `a`, the row set is the product over in ports of `dims_of(port, a)`, plus `broadcast_dims(port)`, plus `SPARSE_STICK`. For `IndirectNode` the index ports are left out. A `RestickifyNode` has no such flag: `_check_stick_restickify` wants the opposite. |
 
 A fused dim, where two axes map to one host dim, makes the table slightly looser than
 `_check_stick_all_same`, which compares `min(free_symbols)` of each stick coordinate, so the
-check also compares that symbol across the table's ports. The encoder posts only the table.
+check also compares that symbol across the table's ports. A family's `encode` posts only the
+table.
 
 ### 4. Inventory
 
@@ -286,17 +343,17 @@ stays as an adapter over it. **stays** means the old code remains and is called.
 | `coordinate_mask_blocked_vars` `WDC:351` | `PADDED_REDUCTION_UNSPLIT` | Matmul, Reduction | frame | moves |
 | `conv_spatial_blocked_vars` `WDC:368` | new flag `CONV_SPATIAL_UNSPLIT` | Reduction | `node.conv_params`, config read by builder, last two write ranges | moves |
 | `reduction_window_blocked_vars` `WDC:400` | new flag `WINDOW_UNSPLIT` | Reduction | `node.reduction_type`, `node.conv_params`; depthwise uses write symbols | moves |
-| `coarse_tile_local_dim_split_domains` `WDC:496`, `_hinted_work_div_syms` `WDC:468` | `Always.TILE_LOCAL`, every op | all running | `node.tile_local_axes` | stays; reads `loop_info`, hints, raw positions |
+| `coarse_tile_local_dim_split_domains` `WDC:496`, `_hinted_work_div_syms` `WDC:468` | `tile_local`, every op | all running | `node.tile_local_axes` | stays; reads `loop_info`, hints, raw positions |
 | `direct_read_source_stick_split_domains` `WDC:237` | `PortFact.DIRECT_READ_SOURCE` | fact | `InPort.direct_read: DirectReadStick(axis, eps)` | domain arithmetic moves; loop-trip gate and recovery stay in builder |
 | `_direct_read_source_dep` `WDC:192` | builder | | | stays |
-| `aligned_ownership_split_domains` `WDC:299` | `Always.ALIGNED_OWNERSHIP`, every op | all running | frame | stays; reads `align_tensors_pure`, called per frame |
-| `restickify_padding_blocked_vars` `WDC:661` | `Always.RESTICKIFY_PADDING` | `RestickifyNode` | frame | moves |
+| `aligned_ownership_split_domains` `WDC:299` | `aligned_ownership`, every op | all running | frame | stays; reads `align_tensors_pure`, called per frame |
+| `restickify_padding_blocked_vars` `WDC:661` | `restickify_padding` | `RestickifyNode` | frame | moves |
 | `_has_ea_tensor`, `has_qfp8wt_tensor`, `has_staggered_ea_tensor` `WDC:683-705` | `port.facts` | | | stays; `WD:2779` imports `has_qfp8wt_tensor` |
 | `_qfp8wt_unsplittable_coords` `WDC:708` | `QFP8WT` rule body | | | moves |
 | `qfp8wt_split_domains` `WDC:724` | `PortFact.QFP8WT` | out port, and in port with `operand == 1` | port coords | moves; scope kept (surprise 10) |
 | `qfp8wt_matmul_k_split_domains` `WDC:756` | `ENCODED_K_UNSPLIT` | Matmul | `port.facts` | moves |
-| `_topk_output_k_var` `WDC:786`, `topk_split_domains` `WDC:801` | new flag `TOPK_SPLITS` | Reduction | `node.reduction_type`, `graph.max_cores` | moves |
-| `_keep_by_index_axes` `WDC:836`, `keep_by_index_k_split_constraint` `WDC:871`, `_keep_by_index_search_axis` `WDC:893`, `keep_by_index_pinned_search_space_vars` `WDC:926`, `keep_by_index_search_adjacent_blocked_vars` `WDC:938` | new flag `KEEP_BY_INDEX_SPLITS`, one flag for the three rules | Reduction | `in0`, `node.in_ports.get("in1")`, `graph.max_cores` | moves |
+| `_topk_output_k_var` `WDC:786`, `topk_split_domains` `WDC:801` | new flag `TOPK_SPLITS` | Reduction | `node.reduction_type`, `graph.target.cores` | moves |
+| `_keep_by_index_axes` `WDC:836`, `keep_by_index_k_split_constraint` `WDC:871`, `_keep_by_index_search_axis` `WDC:893`, `keep_by_index_pinned_search_space_vars` `WDC:926`, `keep_by_index_search_adjacent_blocked_vars` `WDC:938` | new flag `KEEP_BY_INDEX_SPLITS`, one flag for the three rules | Reduction | `in0`, `node.in_ports.get("in1")`, `graph.target.cores` | moves |
 | `plain_reduction_k_split_domains` `WDC:1008` | new flag `PLAIN_REDUCTION_UNSPLIT` | Reduction | `node.reduction_type`, frame | moves |
 | `indirect_access_split_domains` `WDC:1035`, `indirect_forbidden_split_syms` `PU:1812` | `INDIRECT_ACCESS` | Indirect | ports `table`, `index` | moves; `PU` keeps its name, `indirect_store_entry_syms` calls it |
 | `_ordered_affine_coordinate_terms` `WDC:1050`, `overlapping_coordinate_extents` `WDC:1072`, `_moves_coordinate` `WDC:1105`, `overlapping_window_split_domains` `WDC:1112` | `PortFact.OVERLAPPING_READ` | in ports | `port.device_coords`, `stride_map` | moves; old names re-exported |
@@ -305,17 +362,17 @@ stays as an adapter over it. **stays** means the old code remains and is called.
 
 | clause | new home | note |
 |---|---|---|
-| `_factors_in_domain` `WD:939` | `Always.SPLIT_DIVIDES` | Uses `frame.basis(axis)`: sticks, granularity or elements, as `factor_domain` does. An axis not in the frame fails. |
-| `_within_core_budget` `WD:951` | `Always.CORE_BUDGET` | `graph.max_cores`, also `ALLOC:3811`. |
-| `_one_reduction_split_at_most` `WD:961` | `Always.ONE_REDUCTION_SPLIT` | Over `frame.reduction_axes`, not `Axis.reduction`. |
-| `_spans_within_cap` `WD:954` | `Always.SPAN_CAP`, no parent entry | Calls `get_per_core_span` (stays) per port, skipping indirect tensors as `WD:561`. |
-| `_in_split_domains` `WD:964` | the flags, port facts and `always_splits` of table A | |
-| `meets_span_floors` `WD:930` | `Always.SPAN_FLOOR`, no parent entry | `node.span_floors`, from `_span_min_splits` (`WD:201`). |
+| `_factors_in_domain` `WD:939` | `split_divides` | Uses `frame.basis(axis)`: sticks, granularity or elements, as `factor_domain` does. An axis not in the frame fails. |
+| `_within_core_budget` `WD:951` | `core_budget` | `graph.target.cores`, also `ALLOC:3811`. |
+| `_one_reduction_split_at_most` `WD:961` | `Rule.ONE_REDUCTION_SPLIT` | Over `frame.reduction_axes`, not `Axis.reduction`. Checked when the flag is in `graph.target.rules`. |
+| `_spans_within_cap` `WD:954` | `span_cap`, no parent entry | Calls `get_per_core_span` (stays) per port, skipping indirect tensors as `WD:561`. |
+| `_in_split_domains` `WD:964` | the node's flags, port facts and `always_splits` of table A | |
+| `meets_span_floors` `WD:930` | `span_floor`, no parent entry | `node.span_floors`, from `_span_min_splits` (`WD:201`). |
 
 All old methods stay until Stage 13 at least; `WorkDivisionContext` serves
 `enumerate_work_division_candidates`, which Stage 5 keeps calling.
 
-**C. `residency_rules.py` and `ResidencyChecks`.** All map to `Always.RESIDENCY`. The
+**C. `residency_rules.py` and `ResidencyChecks`.** All map to `residency`. The
 registry stays exactly where it is. It is already solver-free, and its order is a contract
 (`RR:83`). `residency_reason` runs today's checks through `node.op`, `graph.ir`,
 `graph.divisions_committed`, `graph.drain_plans` and `graph.lx_relayout_plans`, with the
@@ -331,7 +388,7 @@ passes `decides_relayouts=True, tileable=table.tileable`; Stage 8 passes
 | `sized`, `empty` | rule | no | same |
 | `mutation`, with exception `loop_carry` | rule | only `division_is_fixed` gates the exception (`ALLOC:832`) | same, from `graph.divisions_committed` |
 | `advancing` | rule | no | same |
-| `restickify` | rule | placement path only (`ALLOC:848`) | same; on the joint path `CROSS_FRAME` covers it. |
+| `restickify` | rule | placement path only (`ALLOC:848`) | same; on the joint path `cross_frame` covers it. |
 | `extern`, `multi_output_extern`, `indirect` | rule | no | same |
 | `reinterpret_output`, `mutated_output` with exception `drain` | rule | no | same, from `graph.drain_plans` |
 | `partial_read` with `prefix_gather`, `local_subrange` | rule | `prefix_gather` differs by mode (`ALLOC:903-913`) | same |
@@ -343,15 +400,16 @@ Rules outside the registry with the same effect, none named in the parent:
 `_input_residency_reason` (`ALLOC:1303`), a second unregistered list for graph inputs;
 "loop carry update ownership unavailable" (`ALLOC:4214`). `residency_reason` applies both.
 `TRANSFER_CERTIFICATES` (`RR:343`) "never dispatch admission" and need no mapping. The
-capacity clause of `excluded()` (`PS:1108`) is `NO_OVERLAP`'s bound.
+capacity clause of `excluded()` (`PS:1108`) is `boxes_fit_lx`'s bound.
 
 **D. `check_in_place_parent_is_read` and the in-place conditions.** All map to
-`Always.IN_PLACE`. The sources stay. `IN_PLACE` and `TILE_ALIGNED` state the physical rule,
-deliberately the union of what both solvers guarantee: child footprint at most the parent's,
-no in-place across a dead tile, and tile alignment by `TileReads.aligned`. The SA packer
-relies on the first (`torch_spyre/csrc/perm_layout_native.cpp:547`). OR-Tools stays stricter
-by encoding: equal footprints (`ILP:604`), and a match pair inside a nest even for a spilled
-buffer (`ILP:998-1000`).
+`in_place_conditions`. The sources stay. `in_place_conditions` and `tiles_line_up` state the
+physical rule, deliberately the union of what both solvers guarantee: child footprint at
+most the parent's, no in-place across a dead tile, and tile alignment by
+`TileReads.aligned`. The SA packer relies on the first
+(`torch_spyre/csrc/perm_layout_native.cpp:547`). OR-Tools stays stricter by encoding: equal
+footprints (`ILP:604`), and a match pair inside a nest even for a spilled buffer
+(`ILP:998-1000`).
 
 | source | what the check evaluates |
 |---|---|
@@ -359,8 +417,8 @@ buffer (`ILP:998-1000`).
 | `_check_in_place_relationships` `PS:938` | Parent's last tick equals child's first tick, widened by overrides. |
 | `_inplace_edge_ok` `ALLOC:1678` | `same_index_read(port)`, equal `device_layout`, child footprint at most the parent's. |
 | `_op_inputs_good_for_lx_inplace` `ALLOC:1426` | `DataEdge.in_place_candidate`, since it reads `origin_node`. |
-| `_add_inplace_relaxation` `ILP:1608` | Both resident, equal offset, at most one in and one out per node, no in-place across a dead tile: no `CopyOut` on the edge (`ILP:1647-1648`). |
-| `constrain_merge` `ILP:599` | `RESIDENT_READ` on the edge. |
+| `_add_inplace_relaxation` `ILP:1608` | Both resident, equal offset, at most one in and one out per node, no in-place across a dead tile: no `COPY_OUT` step on the edge (`ILP:1647-1648`). |
+| `constrain_merge` `ILP:599` | `resident_read` on the edge. |
 
 An input is a legal in-place parent (#3212, `ALLOC:1631`). Eligibility stays today's rule for
 parity. The read-pattern rule is the parent's Future work and is not built in these stages.
@@ -381,33 +439,36 @@ parity. The read-pattern rule is the parent's Future work and is not built in th
 | Phase 4, in-place promotion `PL:2052` | no rule: a tie preference |
 | `_check_stick_all_same` `OSV:675` | `POINTWISE_STICKS` on Pointwise, Reduction and Indirect nodes |
 
-**F. Every `Always` entry and its source.**
+**F. Every `ALWAYS` check and `Rule` flag, and its source.** A `Rule` row is evaluated only
+when the flag is in `graph.target.rules`; otherwise it counts in `skipped`.
 
-| `Always` | existing source | Phase 1 evaluation |
+| check or flag | existing source | Phase 1 evaluation |
 |---|---|---|
-| `SPLIT_DIVIDES` | `WD:939` | table B |
-| `CORE_BUDGET` | `WD:951`, `ALLOC:3811` | table B |
-| `ONE_REDUCTION_SPLIT` | `WD:961` | table B |
-| `TILES` | `ALLOC:3960` (`is_clean`), `enumerate_tile_options`, `predict_frame` | Each axis of a solve-chosen tiling is non-reduction, not on the stick dim, and `frame_of` is not `None`. Ops already carrying `loop_info` are left alone. A `RestickifyNode` or a `prescribed_regions` op gets no solve-chosen tiling (`ALLOC:4004-4009`), the parent's Loops row. |
-| `CUT_TILE` | `ILP:1030` | Tiled, resident, some reader or `graph_output` outside the nest, and a non-empty `reduction_splits`. |
-| `RESIDENCY` | table C | `node.resident and residency_bar(node, graph, node.work_split) is not None` |
-| `RESTICKIFY` | `OSV:705`, `is_restickify_coords` `PU:771` | At most one `Restickify` per edge; the stick symbols of `realized_by`'s `in0` and out differ. Compares axes, not dims, because the output buffer can permute. |
-| `PINNED` | **none**: today's pre-pass restickify is an op | Every `restickify` pin has a matching step. Vacuous on the adapter, live from Stage 9. |
-| `COPY_OUT` | **none executable**: the docstring at `ILP:932-934` and the structure of `apply_tilings` | No `CopyOut` step is resident. Vacuous on the adapter, live from Stage 9. |
-| `IN_PLACE` | table D | as table D |
-| `PORT_FACTS` | table A | `fact_splits` rows |
-| `TILE_ALIGNED` | `tile_misread` `CT:522`, `derive_tiling_groups` `CT:423` | `TileReads(graph.ir, src.op, dst.op).aligned(...)` over `tile_spec_of` on each edge inside a nest; per-axis fallback when `graph.ir` is `None`. |
-| `NO_OVERLAP` | `ILP:1666`, `ILP:1662` | section 5 |
-| `SPAN_CAP`, `SPAN_FLOOR` | table B | table B, on every running op, pinned or not. The limit is a hardware one. |
-| `RESIDENT_READ` | `constrain_residency` `ILP:534`, `ResidencyEdge.match_pairs` `WD:1677` | section 5 |
-| `RELAYOUT_SOURCE` | `_constrain_relayout_copies` `ILP:1579` | A resident step has a resident source and at least one reader; no edge carries both `CopyOut` and `Relayout`; a resident source with a reduction split has every reader served. |
-| `CROSS_FRAME` | `_restickify_barrier` `ALLOC:1434`, placement path; `ILP:534` on the joint path | section 5 |
-| `TILE_LOCAL`, `ALIGNED_OWNERSHIP`, `RESTICKIFY_PADDING` | table A | `always_splits` rows |
-| `SPLIT_PINS` | `_division_map` `ALLOC:3739-3770` | Every `split` pin with empty `seeds` has `pin.value.split == node.work_split`. A pin with `seeds` is not compared, because the table may hold the seed-aligned division (`ALLOC:3773`); the flag and `SPLIT_DIVIDES` rows judge it. |
+| `split_divides` | `WD:939` | table B |
+| `core_budget` | `WD:951`, `ALLOC:3811` | table B |
+| `Rule.ONE_REDUCTION_SPLIT` | `WD:961` | table B |
+| `Rule.TILES_OFF_STICK` | `ALLOC:3960` (`is_clean`), `enumerate_tile_options`, `predict_frame` | Each axis of a solve-chosen tiling is non-reduction, not on the stick dim, and `frame_of` is not `None`. Ops already carrying `loop_info` are left alone. A `RestickifyNode` or a `prescribed_regions` op gets no solve-chosen tiling (`ALLOC:4004-4009`), the parent's Loops row. |
+| `Rule.RESIDENT_TILE_UNREDUCED` | `ILP:1030` | Tiled, resident, some reader or `graph_output` outside the nest, and a non-empty `reduction_splits`. |
+| `residency` | table C | `node.resident and residency_bar(node, graph, node.work_split) is not None` |
+| `restickify_sticks_differ` | `OSV:705`, `is_restickify_coords` `PU:771` | At most one `RESTICKIFY` step per edge; the stick symbols of `realized_by`'s `in0` and out differ. Compares axes, not dims, because the output buffer can permute. |
+| `pinned_steps_stay` | **none**: today's pre-pass restickify is an op | Every `restickify` pin has a matching step. Vacuous on the adapter, live from Stage 9. |
+| `Rule.COPY_OUT_IN_HBM` | **none executable**: the docstring at `ILP:932-934` and the structure of `apply_tilings` | No `COPY_OUT` step is resident. Vacuous on the adapter, live from Stage 9. |
+| `in_place_conditions` | table D | as table D |
+| `port_fact_rules` | table A | `fact_splits` rows |
+| `tiles_line_up` | `tile_misread` `CT:522`, `derive_tiling_groups` `CT:423` | `TileReads(graph.ir, src.op, dst.op).aligned(...)` over `tile_spec_of` on each edge inside a nest; per-axis fallback when `graph.ir` is `None`. |
+| `boxes_fit_lx` | `ILP:1666`, `ILP:1662` | section 5 |
+| `span_cap`, `span_floor` | table B | table B, on every running op, pinned or not. The limit is a hardware one. |
+| `resident_read` | `constrain_residency` `ILP:534`, `ResidencyEdge.match_pairs` `WD:1677` | section 5 |
+| `relayout_source` | `_constrain_relayout_copies` `ILP:1579` | A resident step has a resident source and at least one reader; no edge carries both a `COPY_OUT` and a `RELAYOUT` step; a resident source with a reduction split has every reader served. |
+| `cross_frame` | `_restickify_barrier` `ALLOC:1434`, placement path; `ILP:534` on the joint path | section 5 |
+| `tile_local`, `aligned_ownership`, `restickify_padding` | table A | `always_splits` rows |
+| `split_pins` | `_division_map` `ALLOC:3739-3770` | Every `split` pin with empty `seeds` has `pin.value.split == node.work_split`. A pin with `seeds` is not compared, because the table may hold the seed-aligned division (`ALLOC:3773`); the flag and `split_divides` rows judge it. |
+| `node_config` | **none**: Stage 2's build assertion, repeated | Every node's `restrictions` equals `graph.target.ops.ops[type(node)].restrictions`. |
+| `Optimization` members | **none**: today every axis is on, coarse tiling under `auto_coarse_tiling` | `optimizations_used`, section 2. On `SPYRE` only `COARSE_TILING` can be off. |
 | `TABLE_COLUMN` | **none**: a provenance tag for Stage 5's column ties | No check. |
 
 Other existing gates that need no new entry: `_read_across_a_tiling_boundary` (`SA:1194`)
-is stricter than `RESIDENT_READ`, because `match_pairs` admits a tiled consumer whose
+is stricter than `resident_read`, because `match_pairs` admits a tiled consumer whose
 read does not advance (`WD:1710`). The check enforces the weaker rule both engines share.
 
 ### 5. `check_decisions`
@@ -418,6 +479,10 @@ class Violation:
     rule: RuleTag
     subject: str          # node, edge "src->dst.port", or "graph"
     detail: str
+
+@dataclass(frozen=True)
+class Skipped:
+    reason: str
 
 @dataclass
 class CheckReport:
@@ -430,12 +495,20 @@ class RuleViolation(Exception):
     def __init__(self, violations: Sequence[Violation]) -> None: ...
     violations: tuple[Violation, ...]
 
-def check_report(graph: SpyreOptimizationGraph,
-                 overrides: RestrictionOverrides | None = None) -> CheckReport: ...
-def check_decisions(graph: SpyreOptimizationGraph,
-                    overrides: RestrictionOverrides | None = None) -> list[Violation]: ...
-def coverage(graph: SpyreOptimizationGraph, encoder: HasEncodes,
-             overrides: RestrictionOverrides | None = None) -> list[str]: ...
+class FamilyCapabilities(Protocol):
+    ENCODES: ClassVar[Restriction]
+    RULES: ClassVar[Rule]
+    STEPS: ClassVar[frozenset[StepKind]]
+    OPTIMIZATIONS: ClassVar[Optimization]
+
+def check_report(graph: SpyreOptimizationGraph) -> CheckReport: ...
+def check_decisions(graph: SpyreOptimizationGraph) -> list[Violation]: ...
+@dataclass(frozen=True)
+class Coverage:
+    gaps: list[str]       # used by the target, not encodable: the family cannot plan here
+    unused: list[str]     # offered by the target, never used by the family: not a gap
+
+def coverage(family: FamilyCapabilities, target: Target) -> Coverage: ...
 def nests(graph: SpyreOptimizationGraph) -> dict[OpNode, int]: ...   # the id steps at every cut
 def live_boxes(graph: SpyreOptimizationGraph) -> list[LiveBox]: ...
 def no_overlap(graph: SpyreOptimizationGraph) -> list[Violation]: ...
@@ -461,22 +534,33 @@ class NodeDecision:
 def decisions(graph: SpyreOptimizationGraph) -> dict[str, NodeDecision]: ...
 ```
 
-`check_decisions` is `check_report(...).violations`. Each rule on each subject runs under
-its own `try`: a rule that raises lands in `errors` and the others still run. A caller that
-must fail on an unjudged rule reads `errors` from `check_report`, as Stage 9 does.
+`check_decisions(graph)` is `check_report(graph).violations`. Neither takes a target or an
+override: every size, flag set and rule switch comes from `graph.target`, so the check and
+the solve judge the same card. Each check on each subject runs under its own `try`: a check
+that raises lands in `errors` and the others still run. A caller that must fail on an
+unjudged rule reads `errors` from `check_report`, as Stage 9 does.
 
-The order per node, for `node.runs`: frame the node, evaluate `SPLIT_DIVIDES`, `CORE_BUDGET`,
-`ONE_REDUCTION_SPLIT`, `SPAN_*`, `TILES`, `CUT_TILE`, each flag from `restrictions_for(node,
-overrides)`, then `fact_splits` and `always_splits`. A row is evaluated as `split.get(axis,
-1) in factors` when `port is None or is_stuck(row)`. For every node, including inputs:
-`RESIDENCY`, then the edge rules on `node.out.edges`:
-`RESTICKIFY`, `PINNED`, `COPY_OUT`, `IN_PLACE`, `RELAYOUT_SOURCE`, `RESIDENT_READ`,
-`CROSS_FRAME`, `TILE_ALIGNED`. Last, once for the graph, `NO_OVERLAP`. A `RestickifyNode` is
-judged as a node, by its frozen flags plus `RESTICKIFY_PADDING`. A node with no frame counts
-in `skipped` rather than passing silently.
+`check_report` visits each node in `graph.nodes` order, then the edges on `node.out.edges`,
+then the graph once. On each subject it runs, in order:
 
-**`RESIDENT_READ`.** For a data edge from a resident source to a reader, with no
-`CopyOut` or `Relayout` step:
+1. `optimizations_used(subject)`, reporting each member outside
+   `graph.target.optimizations`;
+2. every check in `ALWAYS`, in list order;
+3. `RULE_CHECKS[flag]` for each flag in `graph.target.rules`, tagged with the flag. A
+   `Rule` member the target leaves out counts in `skipped` as `"<flag>: off on <name>"`;
+4. on a running node, each flag in `node.restrictions` through `splits_while_stuck` and
+   `stick_tables`. A row is evaluated as `split.get(axis, 1) in factors` when
+   `port is None or is_stuck(row)`. `port_fact_rules` and the row-backed checks
+   (`tile_local`, `aligned_ownership`, `restickify_padding`) read `fact_splits` and
+   `always_splits` the same way.
+
+A check returns `None` for a subject it does not judge, so `evaluated` counts only real
+judgements. A check that cannot judge, a node with no frame for example, returns `Skipped`
+and counts in `skipped` rather than passing silently. A `RestickifyNode` is judged as a
+node, by its config's flags plus `restickify_padding`.
+
+**`resident_read`.** For a data edge from a resident source to a reader, with no
+`COPY_OUT` or `RELAYOUT` step:
 
 - On the joint path, the pair must satisfy `match_pairs([src_division], [dst_division])`,
   with each division from `division_from_work_split`, on an edge from
@@ -491,16 +575,16 @@ in `skipped` rather than passing silently.
   residency rule is the same judge and already ran.
 - With `graph.ir` `None`, on a synthetic graph, it compares axis splits through `axis_map`.
 
-**`CROSS_FRAME`.** This is `RESIDENT_READ` on an edge whose reader is a `RestickifyNode`, on
+**`cross_frame`.** This is `resident_read` on an edge whose reader is a `RestickifyNode`, on
 the joint path, reported by name so the hazard is visible. A resident source passes if its
-write view is `same_partition` with the restickify's read view, or if a `Relayout` that
-precedes the `Restickify` in `transforms` has that `to_view`. List order is physical, and
-that route is legal.
+write view is `same_partition` with the restickify's read view, or if a `RELAYOUT` step
+that precedes the `RESTICKIFY` step in `edge.steps` has that `to_view`. List order is
+physical, and that route is legal.
 
-**`NO_OVERLAP`.** `live_boxes` gives one box per resident node and resident `Relayout`.
-A box's `size` is `node.footprint(split.splits, split.tiling, graph.alignment)`, for a
-resident input `ceil_div(node.size, graph.alignment * node.prefetch_view.split_product)`, and
-`step.footprint` for a `Relayout`. Boxes are
+**`boxes_fit_lx`.** `live_boxes` gives one box per resident node and resident `RELAYOUT`
+step. A box's `size` is `node.footprint(split.splits, split.tiling, graph.target.alignment)`,
+in alignment units, for a resident input `ceil_div(node.size, graph.target.alignment *
+node.prefetch_view.split_product)`, and `step.footprint` for a `RELAYOUT` step. Boxes are
 in `_Slots` time (op `t` writes at `2t`, `ILP:229`). A box's span is the **lower bound the
 decisions imply**, the same bounds `_add_lifetime_ends` posts (`ILP:1205`), derived
 without the solver:
@@ -509,20 +593,28 @@ without the solver:
 |---|---|
 | untiled, no tiled reader | `[2*start, 2*end - 1)` from `graph.lifetime(node)` |
 | untiled, read by a tiled node | end raised to that reader's nest end; an input's start lowered to its nest start |
-| tiled | `[2w, e)`, `e` the maximum of `2w + 1`, `2w + 2` if cut, and `2r + 1` for each reader `r` with no `CopyOut` |
-| reads through a `Relayout` | do not extend the source: they count as a read at the transfer |
-| `Relayout` step, shared by its edges | `[2*start, 2*end - 1)` from `graph.lifetime(step)` |
+| tiled | `[2w, e)`, `e` the maximum of `2w + 1`, `2w + 2` if `w in graph.cuts`, and `2r + 1` for each reader `r` with no `COPY_OUT` step |
+| reads through a `RELAYOUT` step | do not extend the source: they count as a read at the transfer |
+| `RELAYOUT` step, shared by its edges | `[2*start, 2*end - 1)` from `graph.lifetime(step)` |
 | in-place child | start plus one slot (`ILP:1714-1722`); parent's end is `2*child + 1` |
 
 A shorter box can only miss an overlap, never invent one, so this cannot produce a false
 report. It also avoids `slot_span`, which would make the check trust the values it judges.
-The bound is: every box inside `[0, capacity / alignment]`, and no two boxes intersect in
-time and space. Boxes that merely touch are fine, as in the 2-D no-overlap. An in-place pair
-needs no special case because the child gives up the shared slot.
+The bound is: every box inside `[0, graph.target.lx_bytes / graph.target.alignment]`, and no
+two boxes intersect in time and space. Boxes that merely touch are fine, as in the 2-D
+no-overlap. An in-place pair needs no special case because the child gives up the shared
+slot.
 
-**`coverage`** is the union of `restrictions_for(node, overrides)` over nodes, minus
-`encoder.ENCODES`, one line per missing flag. `HasEncodes` is a `Protocol` with `ENCODES:
-Restriction`, so this stage needs no encoder.
+**`coverage(family, target)`** runs at config time, so it reads the target, not a graph. A
+gap is something the target requires that the family cannot honour, one line in `gaps` per
+member: each `Restriction` in the OR of `target.ops.ops[t].restrictions` over every node
+type in `target.ops`, missing from `ENCODES`; each flag in `target.rules` missing from
+`RULES`; each kind in `target.steps` with `STEP_KINDS[kind].forced`, missing from `STEPS`.
+A chosen step kind (`RELAYOUT`) or an `Optimization` the family lacks is not a gap: the
+family never uses it, and the plan is still legal. Each goes in `unused`, so a report can
+say what a family leaves on the table. Stage 7's `Family` protocol satisfies
+`FamilyCapabilities`, so this stage needs no family. Stages 7 and 8 run it over every
+(family, target) pair, and a non-empty `gaps` is an explicit skip.
 
 ### 6. The adapter
 
@@ -533,8 +625,7 @@ def decode_todays_plan(graph: SpyreOptimizationGraph,
 
 def check_todays_plan(ir: GraphLowering, allocator: ScratchpadAllocator,
                       allocation: Sequence[LifetimeBoundBuffer],
-                      accepted_relayouts: Sequence[LXRelayoutPlan],
-                      overrides: RestrictionOverrides | None = None) -> PlanCheck: ...
+                      accepted_relayouts: Sequence[LXRelayoutPlan]) -> PlanCheck: ...
 
 @dataclass(frozen=True)
 class Mismatch:
@@ -550,15 +641,17 @@ class PlanCheck:
     seconds: float
 ```
 
-`check_todays_plan` calls `build_graph(ir, capacity=allocator.size, divisions_committed=d,
-drain_plans=allocator._validated_drain_plans, lx_relayout_plans=plans)`. `d` is true for a
-plain `ScratchpadAllocator`, and `plans` are the ones the allocation started from, recorded
-by one new line in `_prepare_buffers` (`ALLOC:1086`). `decode_todays_plan` writes decisions
-onto that graph and never touches a buffer or an op. In order:
+`check_todays_plan` calls `build_graph(ir, target, divisions_committed=d,
+drain_plans=allocator._validated_drain_plans, lx_relayout_plans=plans)` with `target =
+replace(select_target(config), lx_bytes=allocator.size)`, so the check judges the capacity
+the allocator planned against. `d` is true for a plain `ScratchpadAllocator`, and `plans`
+are the ones the allocation started from, recorded by one new line in `_prepare_buffers`
+(`ALLOC:1086`). `decode_todays_plan` writes decisions onto that graph and never touches a
+buffer or an op. In order:
 
 1. **Nodes.** For each buffer that is not a `__spyre_lx_relayout__:` name, take
    `graph.node(b.name)`; a restickify op is a node like any other, and its step gets
-   nothing. Set `resident = b.address is not None`, `offset = b.address // graph.alignment`
+   nothing. Set `resident = b.address is not None`, `offset = b.address // graph.target.alignment`
    and `spill_reason = b.spill_reason`. Set `work_split` with `work_split_from_division(node,
    core_divisions[chosen_division])` when the buffer has one, else from the op's committed
    ownership as `_fixed_core_division` reads it. An op with no buffer stays non-resident
@@ -573,25 +666,26 @@ onto that graph and never touches a buffer or an op. In order:
    or here, not in the plan. The feasibility report found multi-output ops and the `-1` size
    sentinel as the likely sources, so a sentinel buffer is compared as "unsized".
 3. **Nests and cuts.** `choices = chosen_tilings(ir, allocation)` and
-   `derive_tiling_groups(ir, choices)`, the same pair `apply_chosen_tilings` uses. Set
-   `ExecutionEdge.cut` wherever two adjacent ops are not in one group. One shared
-   `CopyOut` per tiled producer goes on each edge to a reader outside its group, through
-   `insert_step(0, step)` so it sits ahead of a pinned step, matching the parent's "one per
-   producer". `CopyOut.resident` is `False`.
-4. **Relayouts.** One shared `Relayout` per `LXRelayoutPlan`, on each edge from
+   `derive_tiling_groups(ir, choices)`, the same pair `apply_chosen_tilings` uses. Add the
+   tick of the earlier op to `graph.cuts` wherever two adjacent running ops are not in one
+   group. One shared `Step(kind=StepKind.COPY_OUT, resident=False)` per tiled producer goes
+   on each edge to a reader outside its group, through `insert_step(0, step)` so it sits
+   ahead of a pinned step, matching the parent's "one per producer".
+4. **Relayouts.** One shared `Step(kind=StepKind.RELAYOUT, ...)` per `LXRelayoutPlan`, on
+   each edge from
    `plan.source_name` to a name in `plan.consumer_names`, with `to_view =
    plan.destination_view`, `source_view`, `source_footprint_bytes`,
    `destination_footprint_bytes`, `resident = True`, and `offset` and `footprint` in
    alignment units. `reduction_split` is `plan.num_cores //
    len(plan.completed_producer_cores)` on a completed route
    (`torch_spyre/_inductor/scratchpad/lx_relayout.py:598`), else 1. On an edge with a pinned
-   `Restickify` it goes before the step, with `insert_step`, since it reads the producer;
+   `RESTICKIFY` step it goes before that step, with `insert_step`, since it reads the producer;
    otherwise `add_step`. `accepted_relayouts` has the same type on both paths.
 5. **In place.** Set `edge.in_place` when `src` is in `b.in_place_parents`, both are
-   resident at the same address, and the edge has no `CopyOut`. This is exact: without an
+   resident at the same address, and the edge has no `COPY_OUT` step. This is exact: without an
    in-place overwrite the two boxes would share the handoff tick, which the 2-D no-overlap forbids
    (`ILP:1682-1684`), except for a tiled producer that frees before a reader of its
-   copied-out buffer, which the `CopyOut` condition excludes. A parent listed with no edge
+   copied-out buffer, which the `COPY_OUT` condition excludes. A parent listed with no edge
    is a `Mismatch` of kind `no_edge`.
 
 Rules needing live views, tilings or spans reach them through `node.op`, `port.dep` and
@@ -637,15 +731,15 @@ def _check_plan(self, graph, allocation, accepted) -> "PlanCheck | None":
   `BaseException` passes through. An `Unsupported` from `_post_solve` fails as today.
 - **Late placements.** `_finish_plan_check` handles surprise 15. It sets `resident` and
   `offset` on any node that gained an address and runs `no_overlap(graph)` alone, which reads
-  no IR. It does not run `RESIDENCY`: a staged output is exempt from the bars by design. This
+  no IR. It does not run `residency`: a staged output is exempt from the bars by design. This
   also runs under `try` and writes the record. Stage 10 calls `no_overlap` for the same reason.
 - **Reporting.** A record per plan goes to `config.lx_check_file` through `emit_json_line`
   (`torch_spyre/_inductor/dump_common.py:42`), which never raises:
 
   ```json
   {"test": "<PYTEST_CURRENT_TEST>", "allocator": "...", "solver": "...",
-   "sencores": 32, "nodes": 41, "evaluated": {"WHOLE_STICKS": 83},
-   "skipped": {"RESIDENT_READ: loop carry": 2}, "violations": [],
+   "target": "spyre", "sencores": 32, "nodes": 41, "evaluated": {"WHOLE_STICKS": 83},
+   "skipped": {"resident_read: loop carry": 2}, "violations": [],
    "errors": [], "mismatches": [], "seconds": 0.0}
   ```
 
@@ -672,47 +766,65 @@ def _check_plan(self, graph, allocation, accepted) -> "PlanCheck | None":
   tiling, attached to this PR. Otherwise the default is `"0"` and a `tests/conftest.py`
   fixture turns it on for the suites. The cost is unmeasured until Stage 2 exists. Phase 1
   exit sets a budget from this figure, as a share of planning, for Stage 9's gate.
-- **Captures.** `PlanCheck` holds op references. It is dropped when `plan_allocation`
-  returns and is never pickled, so the FakeTensor caveat does not arise.
+- **Captures.** `PlanCheck` holds op references. It is dropped when
+  `ScratchpadAllocator.plan_allocation` returns and is never pickled, so the FakeTensor
+  caveat does not arise.
 
-### 8. Overrides
+### 8. Changing flags in tests
 
-The mapping is Stage 1's `RestrictionOverrides`, resolved by `restrictions_for(node,
-overrides)`. `splits_while_stuck` and `stick_tables` take a single flag and never see it, so
-the override works by choosing which flags are asked about. The production hook always passes
-`None`; only tests build one. An override never touches `Always`, residency or port-fact rules.
+The check reads every flag from `graph.target`, so a test changes flags by building with a
+derived target, never by passing anything to `check_decisions` or `coverage`:
+
+```python
+no_padded = replace(SPYRE, ops=SPYRE_OPS.with_type(
+    ReductionNode,
+    restrictions=SPYRE_OPS.ops[ReductionNode].restrictions
+    & ~Restriction.PADDED_REDUCTION_UNSPLIT))
+two_reductions = replace(SPYRE, rules=SPYRE.rules & ~Rule.ONE_REDUCTION_SPLIT)
+no_tiling = replace(SPYRE, optimizations=SPYRE.optimizations & ~Optimization.COARSE_TILING)
+```
+
+A node's flags live in its type's `OpConfig` in `SPYRE_OPS`, not on the node type, so
+`splits_while_stuck` and `stick_tables`, which take one flag, see a derived target only
+through which flags `node.restrictions` holds. The production hook always uses
+`select_target(config)`. A target can drop a `Rule` flag or an `Optimization`, but never an
+`ALWAYS` check, a residency rule or a port-fact rule.
 
 ### 9. Plans with no IR: `check_buffers`
 
 ```python
-def check_buffers(allocation: Sequence[LifetimeBoundBuffer], capacity: int,
-                  alignment: int = 128) -> list[Violation]: ...
+def check_buffers(allocation: Sequence[LifetimeBoundBuffer],
+                  target: Target) -> list[Violation]: ...
 ```
 
 Most unit suites call solvers directly on synthetic buffers: `test_scratchpad_solver`,
 `test_sa_cooptimizer`, `test_cooptimization_types`, `test_restickify_cost_model`,
 `test_perm_layout_solver`, `test_solver_relayout_decision`. They have no `GraphLowering`,
 so `build_graph` cannot run. The in-repo captures, Stage 0's `intree` tier, are the same.
-`check_buffers` evaluates the part of the check that needs only buffers: `NO_OVERLAP`,
-`RESIDENCY` from `b.residency_reason`, `IN_PLACE` structure, `CORE_BUDGET`,
-`ONE_REDUCTION_SPLIT` from `reduction_syms`, `RESIDENT_READ` as membership of the chosen
-pair in `cd_parent_matches` or a served `chosen_relayouts`, and `RELAYOUT_SOURCE`. It shares
+`target` gives the capacity, alignment, core budget and `Rule` flags; the fixture passes
+`replace(select_target(config), lx_bytes=solver_capacity)`. `check_buffers` evaluates the
+part of the check that needs only buffers: `boxes_fit_lx`, `residency` from
+`b.residency_reason`, `in_place_conditions` structure, `core_budget`,
+`Rule.ONE_REDUCTION_SPLIT` from `reduction_syms` when the flag is in `target.rules`,
+`resident_read` as membership of the chosen
+pair in `cd_parent_matches` or a served `chosen_relayouts`, and `relayout_source`. It shares
 `live_boxes`'s span logic through a small helper.
 
 An autouse fixture in `tests/inductor/conftest.py`, active only when `SPYRE_LX_CHECK_FILE` is
 set, wraps `plan_layout` and `plan_layout_and_core_divisions` on the concrete solvers and
-appends a record, skipping a solve reached through `plan_allocation`, which the hook checks.
+appends a record, skipping a solve reached through `ScratchpadAllocator.plan_allocation`,
+which the hook checks.
 
 ## Changes
 
 | file | change |
 |---|---|
-| `.../scratchpad/lx_allocator/rules.py` | Added: `Always`, `CONSTRAINT_RULES`, `SplitRule`, `StickTable`, `Frame`, `frame_of`, the data functions, the residency functions, moved rule bodies. |
-| `.../scratchpad/lx_allocator/check.py` | Added: `Violation`, `CheckReport`, `RuleViolation`, `NodeDecision`, `LiveBox`, `check_report`, `check_decisions`, `coverage`, `decisions`, `nests`, `live_boxes`, `no_overlap`. |
+| `.../scratchpad/lx_allocator/rules.py` | Added: `RuleTag`, `TABLE_COLUMN`, `tag_name`, `CONSTRAINT_RULES`, `SplitRule`, `StickTable`, `Frame`, `frame_of`, the data functions, the residency functions, moved rule bodies. |
+| `.../scratchpad/lx_allocator/check.py` | Added: `Violation`, `Skipped`, `Check`, `ALWAYS` and its checks, `RULE_CHECKS` and its checks, `optimizations_used`, `FamilyCapabilities`, `CheckReport`, `RuleViolation`, `NodeDecision`, `LiveBox`, `check_report`, `check_decisions`, `coverage`, `Coverage`, `decisions`, `nests`, `live_boxes`, `no_overlap`. |
 | `.../scratchpad/lx_allocator/plan_adapter.py` | Added: `decode_todays_plan`, `check_todays_plan`, `check_buffers`, `Mismatch`, `PlanCheck`. |
 | `torch_spyre/_inductor/work_division_constraints.py` | Moved rule bodies become adapters over `rules.py`. Names, signatures and behaviour unchanged. |
 | `torch_spyre/_inductor/pass_utils.py` | `_non_indirect_coord_syms` body moves to `rules.py`, name stays. |
-| `torch_spyre/_inductor/scratchpad/allocator.py` | `plan_allocation` gains two calls; `_check_plan`, `_finish_plan_check` added; `_prepare_buffers` records its plans. |
+| `torch_spyre/_inductor/scratchpad/allocator.py` | `ScratchpadAllocator.plan_allocation` gains two calls; `_check_plan`, `_finish_plan_check` added; `_prepare_buffers` records its plans. |
 | `torch_spyre/_inductor/config.py` | `lx_check_decisions`, `lx_check_file`, ignore prefix. |
 | `tests/inductor/conftest.py` | Autouse fixture for `check_buffers`. |
 | `tests/scripts/lx_check_summary.py` | Added: groups records by rule, op kind and solver; exits non-zero on an unlisted report. |
@@ -726,8 +838,9 @@ appends a record, skipping a solve reached through `plan_allocation`, which the 
 Ordered commits, each leaving the suite green:
 
 1. Config values, ignore prefix and the cache-key test.
-2. `rules.py` skeleton: `Always`, `SplitRule`, `StickTable`, `Frame`, `Frame.from_context`,
-   `frame_of`, with tests that a frame equals the context built from the same op.
+2. `rules.py` skeleton: `RuleTag`, `tag_name`, `SplitRule`, `StickTable`, `Frame`,
+   `Frame.from_context`, `frame_of`, with tests that a frame equals the context built from
+   the same op.
 3. Move `coordinate_mask`, `conv_spatial`, `reduction_window`, `restickify_padding` and
    the two reduction rules. `tests/inductor/test_work_division.py` is unchanged and is
    the behaviour pin.
@@ -735,9 +848,10 @@ Ordered commits, each leaving the suite green:
 5. Move `direct_read` arithmetic, indirect and overlap rules, with re-exports.
 6. `splits_while_stuck`, `fact_splits`, `always_splits` over synthetic nodes.
 7. `stuck_dims`, `is_stuck`, `stick_tables`.
-8. `residency_reason`, `untiled_bar`, `residency_bar`, `check.py` without views, one
-   violation test per rule.
-9. `RESIDENT_READ`, `CROSS_FRAME` and `TILE_ALIGNED` through the IR helpers, with the
+8. `residency_reason`, `untiled_bar`, `residency_bar`, `check.py` without views: `ALWAYS`,
+   `RULE_CHECKS`, `optimizations_used`, `coverage`, one violation test per check, `Rule`
+   flag and `Optimization`.
+9. `resident_read`, `cross_frame` and `tiles_line_up` through the IR helpers, with the
    synthetic fallback.
 10. `plan_adapter.py`: `decode_todays_plan`, `check_buffers`.
 11. The hook, with failure-isolation tests and the `_counted_compile` pin.
@@ -755,35 +869,36 @@ Consumes:
 | harness tiers | `intree`, `fake`, `zoo`, `unit-*`, `failure`, `FIXED_GRAPHS`, `corpus_coverage`; records proto, decisions, committed plan | 0 | parity gate |
 | `graph.flags.Restriction` | `NONE` and eleven members: the parent's six plus `WINDOW_UNSPLIT`, `CONV_SPATIAL_UNSPLIT`, `TOPK_SPLITS`, `KEEP_BY_INDEX_SPLITS`, `PLAIN_REDUCTION_UNSPLIT` | 1 | rule tags |
 | `graph.flags.PortFact` | `QFP8WT`, `STAGGERED_EA`, `OVERLAPPING_READ`, `DIRECT_READ_SOURCE` | 1 | fact rules |
-| per-type `restrictions` | the five on `ReductionNode`; `POINTWISE_STICKS` on `ReductionNode`, `IndirectNode`; `RestickifyNode.restrictions = OpNode.restrictions` | 1 | flags |
-| `restrictions_for`, `RestrictionOverrides` | `(node, overrides=None) -> Restriction`; `Mapping[type[OpNode], Restriction]` | 1 | overrides |
-| `OpNode` | `name, axes, size, op, tick, uses, read_count, graph_output, span_floors, tile_local_axes, work_split, resident, offset, spill_reason, in_ports: dict[str, InPort], out, port(name), runs, broadcast_dims(port), same_index_read(port), footprint(splits, tiling, alignment)` | 1, filled by 2; the adapter fills the decisions | rules, adapter, `NodeDecision` |
+| `graph.flags.Rule` | `NONE`, `ONE_REDUCTION_SPLIT`, `TILES_OFF_STICK`, `RESIDENT_TILE_UNREDUCED`, `COPY_OUT_IN_HBM` | 1 | `RULE_CHECKS`, `coverage` |
+| `graph.flags.Optimization` | `NONE`, `CORE_SPLIT`, `LX_RESIDENCY`, `IN_PLACE`, `PREFETCH`, `COARSE_TILING` | 1 | `optimizations_used`, `coverage` |
+| `Target`, `SPYRE`, `TARGETS` | `name, ops, cores, lx_bytes, alignment, stick_bytes, rules, steps, optimizations, cost_model`; frozen, derived with `dataclasses.replace` | 1 | sizes, rule switches, `coverage`, test targets |
+| `OpFactory`, `OpConfig`, `SPYRE_OPS` | `OpFactory.ops: Mapping[type[OpNode], OpConfig]`, `with_type(node_type, **changes)`; `OpConfig(restrictions, facts)`. `SPYRE_OPS` sets the five new flags in the `ReductionNode` config, `POINTWISE_STICKS` in the `ReductionNode` and `IndirectNode` configs, and `WHOLE_STICKS` alone in the `RestickifyNode` config | 1 | `node_config`, `coverage`, test targets |
+| `OpNode` | `restrictions: Restriction` (an instance field `make` sets); `name, axes, size, op, tick, uses, read_count, graph_output, span_floors, tile_local_axes, work_split, resident, offset, spill_reason, in_ports: dict[str, InPort], out, port(name), runs, broadcast_dims(port), same_index_read(port), footprint(splits, tiling, alignment)` (alignment units) | 1, filled by 2; the adapter fills the decisions | rules, adapter, `NodeDecision` |
 | `OpNode.padded_reductions()`, `.whole_stick_factors(axis)` | answer for the untiled frame only; not called here. One rule is held by a test, not a call | 1 | `test_node_methods_agree_with_rows` |
 | `RestickifyNode`, `OpaqueNode` | direct `OpNode` subclasses | 1 | node kinds |
-| `InputNode.prefetch_view` | `PerCoreView \| None`; `work_split` stays `None` on inputs | 1 | `RESIDENT_READ` |
-| `Port` | `name, node, axis_map, facts, dep: Dep \| None, coords, device_coords` under the read layout; `current_layout()`, `dims_of(axis)`, `stuck_axes()` | 1, filled by 2 | frames, views |
-| `InPort`, `OutPort` | `operand, index, edge, read_layout, direct_read: DirectReadStick \| None`; `layout, index, edges` | 1, filled by 2 | rules |
+| `InputNode.prefetch_view` | `PerCoreView \| None`; `work_split` stays `None` on inputs | 1 | `resident_read` |
+| `InPort`, `OutPort`, `Port` | both: `name, node, axis_map, facts, dep: Dep \| None, coords, device_coords` under the read layout; `InPort`: `operand, index, edge, read_layout, direct_read: DirectReadStick \| None`; `OutPort`: `layout, index, edges`; `Port = InPort \| OutPort` | 1, filled by 2 | rules, frames, views |
+| `current_layout`, `dims_of`, `stuck_axes` | `(port)`, `(port, axis)`, `(port)`, module functions in `nodes.py` | 1 | frames, views, `stuck_dims` |
 | `MatmulNode.k`, `.n`, `.reduction_type` | `Axis \| None`, `Axis \| None`, `str` | 1, filled by 2 | `MATMUL_STICKS` |
 | `ReductionNode.reduction_type`, `.conv_params` | `str`, `dict[str, Any] \| None` | 1, filled by 2 | new flags |
 | `IndirectNode.scatter` | `bool` | 1 | `INDIRECT_ACCESS` |
 | `Axis` | `Axis(symbol, extent, reduction=False, granularity=None, off_output_coords=False, symbolic=False)` | 1 | rules |
 | `WorkSplit` | `splits: Mapping[Axis, int], tiling: tuple[TileLevel, ...]`, `.reduction_splits` | 1 | decisions |
 | `work_split_from_division`, `division_from_work_split`, `tile_spec_of` | `(node, division) -> WorkSplit`, `(node, split) -> CoreDivision`, `(node, split) -> TileSpec`, in `division_convert.py` | 2 | adapter, frames, views |
-| `DataEdge` | `src, dst, in_place, transforms, mutation, in_place_candidate`; `read_layout()`, `add_step(step)`, `insert_step(index, step)` | 1, filled by 2 | rules |
-| `ExecutionEdge` | `before, after, cut`; true unless both ops share a non-empty nest | 1 | `nests` |
+| `DataEdge` | `src, dst, in_place, steps, mutation, in_place_candidate`; `read_layout()`, `add_step(step)`, `insert_step(index, step)` | 1, filled by 2 | rules |
 | `Pin`, `WorkSplitPin` | `Pin(target, what, value, source)`, `what="split"`, `WorkSplitPin(split, reason, seeds)` | 1, filled by 2 | pin rules |
-| `CopyOut`, `Restickify`, `Relayout` | `Restickify(to_stick, realized_by=None, target=None)`; `Relayout(to_view, reduction_split=1, source_view=None, source_footprint_bytes=0, destination_footprint_bytes=0)`; one instance may sit on several edges | 1 | adapter |
-| `stick_dims`, `SPARSE_STICK` | `(layout) -> tuple[int, ...]`; `-1` | 1 | `stuck_dims` |
-| `SpyreOptimizationGraph` | `capacity, alignment, max_cores, divisions_committed, ir, drain_plans, lx_relayout_plans, nodes, data_edges, execution_edges, pins; node(name), pins_on, step, read_ticks, lifetime` (`OpNode` and `Relayout`); offsets and footprints in alignment units | 1, filled by 2 | rules |
-| `build_graph` | `(ir, *, capacity=None, alignment=128, divisions_committed=False, drain_plans=None, lx_relayout_plans=())`; never writes the IR | 2 | adapter |
-| `carry_pairs` | `(graph) -> list[CarryPair(storage, reader, role)]` | 2 | `RESIDENT_READ` skip |
+| `Step`, `StepKind` | `Step(kind, resident, offset, footprint, pinned, edges, to_stick, realized_by, target, to_view, reduction_split, source_view, source_footprint_bytes, destination_footprint_bytes)`, `kw_only`, identity comparison; `StepKind.COPY_OUT`, `RESTICKIFY`, `RELAYOUT`; one instance may sit on several edges; `STEP_KINDS[kind].forced` | 1 | adapter, edge checks, `coverage` |
+| `stick_dims`, `SPARSE_STICK` | `(layout) -> tuple[int, ...]`; `-1`, in `steps.py` | 1 | `stuck_dims` |
+| `SpyreOptimizationGraph` | `target, divisions_committed, ir, drain_plans, lx_relayout_plans, nodes` (op order), `data_edges, pins, cuts: set[int]` (the tick before each cut); `node(name), pins_on, step, read_ticks, lifetime` (`OpNode` and a `RELAYOUT` step); offsets and footprints in units of `target.alignment` | 1, filled by 2 | rules |
+| `build_graph`, `select_target` | `(ir, target, *, divisions_committed=False, drain_plans=None, lx_relayout_plans=())`, never writes the IR, asserts one config per type; `(config) -> Target` | 2 | adapter, `check_buffers` fixture |
+| `carry_pairs` | `(graph) -> list[CarryPair(storage, reader, role)]` | 2 | `resident_read` skip |
 | `DirectReadStick` | `(axis, eps)`, set only past the 3-trip gate `WDC:263` | 1, filled by 2 | `DIRECT_READ_SOURCE` |
 
 Provides, all under `torch_spyre._inductor.scratchpad.lx_allocator`:
 
 | symbol | signature | for Stages | stability |
 |---|---|---|---|
-| `rules.Always`, `rules.RuleTag` | section 2 | 5, 6, 7, 8, 11 | final |
+| `rules.RuleTag`, `rules.tag_name`, `rules.TABLE_COLUMN` | section 2; a `str` tag is the `__name__` of a check in `ALWAYS` | 5, 6, 7, 8, 11 | final |
 | `rules.CONSTRAINT_RULES` | `dict[str, RuleTag]` | 5 | final |
 | `rules.SplitRule`, `rules.StickTable` | section 2 | 5, 13 | final |
 | `rules.Frame`, `rules.frame_of` | section 2 | 5 | final |
@@ -793,10 +908,13 @@ Provides, all under `torch_spyre._inductor.scratchpad.lx_allocator`:
 | `rules.stuck_dims`, `rules.is_stuck` | `(port) -> frozenset[int]`, `(rule) -> bool` | 5 | final |
 | `rules.residency_reason` | `(node, graph, *, decides_relayouts, tileable) -> str \| None` | 5, 6, 8, 13 | final |
 | `rules.untiled_bar` | `(node, graph) -> str \| None` | 5 | final |
-| `check.check_decisions` | `(graph, overrides=None) -> list[Violation]` | 6, 7, 8, 12, 13 | final |
-| `check.check_report` | `(graph, overrides=None) -> CheckReport` | 9, 11 | final |
-| `check.coverage` | `(graph, encoder, overrides=None) -> list[str]` | 5, 8, 9, 13 | final |
-| `check.RuleViolation`, `.Violation`, `.CheckReport` | section 5 | 6-13 | final |
+| `check.ALWAYS` | `list[Check]`, `Check = (graph, subject) -> Sequence[Violation] \| Skipped \| None`; names in section 2 | 5, 6, 8, 9 | final |
+| `check.RULE_CHECKS` | `Mapping[Rule, Check]`, run only for flags in `graph.target.rules` | 5, 6, 8, 9 | final |
+| `check.optimizations_used` | `(subject: OpNode \| DataEdge) -> Optimization` | 5, 6, 8 | final |
+| `check.check_decisions` | `(graph) -> list[Violation]`; reads every flag and size from `graph.target` | 6, 7, 8, 9, 12, 13 | final |
+| `check.check_report` | `(graph) -> CheckReport` | 9, 11 | final |
+| `check.coverage`, `check.Coverage`, `check.FamilyCapabilities` | `(family, target) -> Coverage(gaps, unused)`: `gaps` lists restrictions, rules and forced step kinds the family cannot encode, `unused` lists chosen step kinds and optimizations it never uses; a `Protocol` with `ENCODES`, `RULES`, `STEPS`, `OPTIMIZATIONS` | 5, 7, 8, 9, 13 | final |
+| `check.RuleViolation`, `.Violation`, `.Skipped`, `.CheckReport` | section 5 | 6-13 | final |
 | `check.nests` | `(graph) -> dict[OpNode, int]` | 7 | final |
 | `check.live_boxes`, `.LiveBox` | section 5 | 10, through `no_overlap`; `check_buffers` shares them | final |
 | `check.no_overlap` | `(graph) -> list[Violation]` | 9, 10 | final |
@@ -831,34 +949,42 @@ New, device-free unless marked.
 | `test_residency_reason_matches_allocator[...]` | Equals `_residency_reasons` on real ops, each rule's first failure, for both modes and both `decides_relayouts`. |
 | `test_rows_never_raise_on_a_wrong_node_type[...]` | Each flag on each node type. |
 | `test_every_flag_has_data` | Every `Restriction` member but `NONE` is handled by a data function, so a new flag fails until it has one. |
+| `test_every_str_tag_names_a_check` | Every `str` tag in `CONSTRAINT_RULES` and in rows from `always_splits` is the `__name__` of a check in `ALWAYS`, or `TABLE_COLUMN`. |
 
 `tests/inductor/test_lx_check.py`:
 
 | test | asserts |
 |---|---|
 | `test_legal_plan_passes[...]` | A hand-decoded legal plan per node type reports nothing, and `evaluated` is non-empty. |
-| `test_each_rule_fires[...]` | One parametrized case per `Always` member, flag and `PortFact`: edit one decision, and exactly that rule is reported on that subject. |
-| `test_override_removes_a_flag` | The parent's `ReductionNode` example: the padded split is reported by default and not under the override. |
-| `test_override_never_touches_always` | Overriding every type to `NONE` still reports `NO_OVERLAP`, `CORE_BUDGET`. |
-| `test_coverage_names_missing_flag` | With a stub `ENCODES`, and with overrides. |
+| `test_each_rule_fires[...]` | One parametrized case per `ALWAYS` check, `Rule` flag, `Restriction` flag and `PortFact`: edit one decision, and exactly that rule is reported on that subject. |
+| `test_every_rule_flag_has_a_check`, `test_every_optimization_has_a_use` | Every `Rule` member but `NONE` is a key of `RULE_CHECKS`; `optimizations_used` can return every `Optimization` member but `NONE`. |
+| `test_derived_target_removes_a_flag` | The parent's `ReductionNode` example: the padded split is reported on a graph built with `SPYRE` and not on one built with `replace(SPYRE, ops=SPYRE_OPS.with_type(ReductionNode, ...))`. |
+| `test_rule_flag_off_is_not_checked` | Two split reduction axes are reported under `SPYRE` and not under `replace(SPYRE, rules=SPYRE.rules & ~Rule.ONE_REDUCTION_SPLIT)`, where `skipped` counts the flag. |
+| `test_optimization_off_rejects_use[...]` | One case per `Optimization` member: a plan using it passes under `SPYRE` and is reported, tagged with the member, under a target without it. |
+| `test_target_never_drops_always` | A target with every config at `Restriction.NONE`, `rules=Rule.NONE` and every optimization on still reports `boxes_fit_lx` and `core_budget`. |
+| `test_node_config_reported` | A node whose `restrictions` differ from its type's config in `graph.target.ops` is reported by `node_config`. |
+| `test_check_reads_sizes_from_target` | The same plan passes under `SPYRE` and reports `boxes_fit_lx` and `core_budget` under a target with smaller `lx_bytes` and `cores`. |
+| `test_coverage_names_missing_members` | A stub family lacking one `Restriction` that only one node type's config sets, one `Rule` and the forced `StepKind.RESTICKIFY` gets one line each in `gaps`; lacking `StepKind.RELAYOUT` and one `Optimization` puts one line each in `unused` and none in `gaps`; a stub with everything gets neither. |
 | `test_rule_error_is_contained` | A raising rule lands in `errors`, and other rules still run. |
 | `test_shorter_box_never_invents_overlap` | Tiled, in-place and relayout span cases. |
-| `test_in_place_is_physical` | A smaller child passes; an in-place overwrite on a `CopyOut` edge is reported. |
+| `test_in_place_is_physical` | A smaller child passes; an in-place overwrite on an edge with a `COPY_OUT` step is reported. |
 | `test_tile_aligned_is_physical` | `TileReads.aligned` decides: an aligned nest passes with no match pair on a spilled buffer, and a misread is reported. |
 | `test_decisions_fields` | Alignment units, split names, `reduction`, `tile_splits`, `spill_reason`. |
-| `test_relayout_before_restickify_is_legal` | `CROSS_FRAME` passes with the relayout first in `transforms`, fails after. |
+| `test_relayout_before_restickify_is_legal` | `cross_frame` passes with the `RELAYOUT` step first in `edge.steps`, fails after. |
 | `test_rule_violation_lists_violations` | |
 
 `tests/inductor/test_lx_plan_adapter.py`:
 
 | test | asserts |
 |---|---|
-| `test_in_place_inferred_from_address` | True on an in-place overwrite, false on a `CopyOut` edge with equal addresses. |
+| `test_in_place_inferred_from_address` | True on an in-place overwrite, false on an edge with a `COPY_OUT` step and equal addresses. |
 | `test_restickify_op_decodes_on_its_node` | Division, residency and offset land on the node; the step gets none. |
 | `test_prefetch_view_from_first_reader` | Joint path, `b.lx_view` unset. |
 | `test_relayout_shared_by_group` | One instance on two edges, one box, all byte fields set, `reduction_split` on a completed route. |
 | `test_spill_reason_copied` | `b.spill_reason` lands on the node, and `decisions` reports it. |
 | `test_copy_out_shared_per_producer` | |
+| `test_cuts_from_tiling_groups` | `graph.cuts` holds the tick of the last op before each tiling-group boundary and nothing else. |
+| `test_adapter_target_uses_allocator_capacity` | The graph's `target.lx_bytes` is `allocator.size`; the rest is `select_target(config)`. |
 | `test_mismatch_reports_lifetime_and_size` | |
 | `test_check_buffers_on_synthetic_graphs[...]` | CP-SAT and SA on `synthetic_cooptimization_graphs.synthetic_graphs()`, no violations. |
 | `test_check_buffers_on_captures[...]` | Same on `cooptimization_capture_loader.load_captures()`. |
@@ -869,7 +995,7 @@ New, device-free unless marked.
 | test | asserts |
 |---|---|
 | `test_plan_identical_with_check_on_and_off` | Addresses, chosen divisions and the proto match, CP-SAT at one worker. |
-| `test_check_failure_does_not_reach_the_compile[...]` | `check_todays_plan` raises `Unsupported`, `SolveError`, `AssertionError`: `plan_allocation` finishes unchanged and greedy is not entered. |
+| `test_check_failure_does_not_reach_the_compile[...]` | `check_todays_plan` raises `Unsupported`, `SolveError`, `AssertionError`: `ScratchpadAllocator.plan_allocation` finishes unchanged and greedy is not entered. |
 | `test_solve_failure_checks_only_the_fallback` | One record, naming `ScratchpadAllocator`. |
 | `test_check_sees_the_ir_the_solve_saw` | Hook runs before `apply_chosen_tilings`. |
 | `test_late_placement_rechecks_no_overlap` | |
@@ -883,9 +1009,12 @@ the moved rules. Card suites for the exit gate: `test_scratchpad_use`, `test_wor
 are not on the parent's device list.
 
 What proves the parent's claim: `test_each_rule_fires` proves each rule has a check,
-`test_domains_match_collect` proves rule data equals today's, `test_every_flag_has_data`
-holds "a new flag needs three things", the hook tests prove "reports but never fails a
-compile", and the exit gate below proves plans pass.
+`test_domains_match_collect` proves rule data equals today's, `test_every_flag_has_data`,
+`test_every_rule_flag_has_a_check` and `test_every_optimization_has_a_use` hold "a new flag
+needs three things", `test_rule_flag_off_is_not_checked` and
+`test_optimization_off_rejects_use` prove the card switches, `test_coverage_names_missing_members`
+proves coverage, the hook tests prove "reports but never fails a compile", and the exit gate
+below proves plans pass.
 
 ## Parity and gates
 
@@ -915,8 +1044,8 @@ summary, since they add encodings of these rules and a new family.
 extension and Stage 2 does not exist yet, so these are reasoned expectations, with no counts.
 
 *Silent, because the same compile already judges them.* `MATMUL_STICKS` and
-`POINTWISE_STICKS` (`_check_stick_constraints`), `RESIDENT_READ` (`commit_lx_views` raises),
-`CORE_BUDGET` (an assert on the joint path), and on CP-SAT `NO_OVERLAP` and in-place
+`POINTWISE_STICKS` (`_check_stick_constraints`), `resident_read` (`commit_lx_views` raises),
+`core_budget` (an assert on the joint path), and on CP-SAT `boxes_fit_lx` and in-place
 structure. A report in this group is almost certainly a port defect.
 
 *Port defects to fix in place, most of what the first run will show:*
@@ -928,19 +1057,20 @@ structure. A report in this group is almost certainly a port defect.
 - Multi-output ops and unsized buffers, as `Mismatch`. The feasibility report saw 18 read-set
   and 86 size differences of this kind on the zoo.
 - `_input_layout_overrides`, where `read_layout()` must give the override.
-- `SPLIT_DIVIDES`, `TILES` and span rules on tiled frames, the first time real
+- `split_divides`, `Rule.TILES_OFF_STICK` and span rules on tiled frames, the first time real
   `predict_frame` output meets these rules.
 
 *Could be real.* The paths with no `is_legal` behind them: pinned divisions, the pruned
 exhaustive menu, the placement path, the greedy fallback, and SA's generated divisions. Watch
-`SPLIT_DIVIDES`, `SPAN_FLOOR` and `ONE_REDUCTION_SPLIT`. On the CP-SAT default path I expect
+`split_divides`, `span_floor` and `Rule.ONE_REDUCTION_SPLIT`. On the CP-SAT default path I expect
 no real report, because every clause is either a menu filter or a model constraint.
 
-*Will not be exercised much.* `PINNED` and `COPY_OUT` are vacuous here. The tiling rules run
-only in `test_solver_auto_coarse_tiling` and with `AUTO_COARSE_TILING=1`. Loop-carry pairs
-are skipped and judged at commit. Restickifies are close to unexercised on the zoo; the two
-restickify graphs in Stage 0's fixed set give `CROSS_FRAME` and `RESTICKIFY` real input. So
-"reports nothing" at this gate is weaker for these rules than for the rest.
+*Will not be exercised much.* `pinned_steps_stay` and `Rule.COPY_OUT_IN_HBM` are vacuous
+here. The tiling rules run only in `test_solver_auto_coarse_tiling` and with
+`AUTO_COARSE_TILING=1`. Loop-carry pairs are skipped and judged at commit. Restickifies are
+close to unexercised on the zoo; the two restickify graphs in Stage 0's fixed set give
+`cross_frame` and `restickify_sticks_differ` real input. So "reports nothing" at this gate
+is weaker for these rules than for the rest.
 
 From #5682's regression guards, this stage reuses plan equivalence through Stage 0 and
 the solve-status guard through the record's allocator and solver fields.
@@ -959,7 +1089,9 @@ the solve-status guard through the record's allocator and solver fields.
 | A broad `except` hides that the check never runs. | `evaluated` counters; summary fails if a suite has plans but no records. |
 | The solver's lifetime exceeds the bound on purpose, so a real overlap of solver spans goes unseen. | Accepted. The bound is what correctness needs: a longer span "can only cost space" (`ILP:1225`). |
 | #5695 lands first. | The adapter reads `chosen_division` for joint buffers and ownership only on the placement path, which #5695 leaves. A rebase re-records baselines. |
-| #5682 moves `span_reduction` into the solver. | `SPAN_FLOOR` reads `node.span_floors`; only the builder's source changes. |
+| #5682 moves `span_reduction` into the solver. | `span_floor` reads `node.span_floors`; only the builder's source changes. |
+| An op tiled before the solve (a `spyre_hint` or `for_each_tile` op) decodes with a non-empty `tiling`, so `COARSE_TILING` reads as used while `auto_coarse_tiling` is off. | `optimizations_used` skips a node with a `tiling` hazard pin, which Stage 2 sets on every op with `loop_info`; the exit-gate summary groups reports by tag, so a miss shows as `COARSE_TILING` on one op kind. |
+| The adapter judges a different card than the allocator planned for. | The adapter's target is `select_target(config)` with `lx_bytes=allocator.size`; `test_adapter_target_uses_allocator_capacity`. |
 
 ## Deviations from the parent plan
 
@@ -967,19 +1099,23 @@ the solve-status guard through the record's allocator and solver fields.
    `plain_reduction_k_split_domains` and `reduction_window_blocked_vars`, but its `Restriction`
    has no such members, and the code has five such families (`WDC:368`, `WDC:400`, `WDC:801`,
    `WDC:871-992`, `WDC:1008`). `_check_stick_all_same` also covers dtype, most reductions and
-   gathers (`OSV:668-672`), not only `PointwiseNode`. Resolution: Stage 1 adds the five flags
-   on `ReductionNode` and `POINTWISE_STICKS` on `ReductionNode` and `IndirectNode`. The stick
+   gathers (`OSV:668-672`), not only `PointwiseNode`. Resolution: Stage 1 adds the five
+   members to `Restriction` and sets them in `SPYRE_OPS`'s `ReductionNode` config, and sets
+   `POINTWISE_STICKS` in its `ReductionNode` and `IndirectNode` configs. The flags live in
+   the per-card configs, not on the node types, so another card's `OpFactory` can leave any
+   of them out. The stick
    rules of `_keep_by_index_layouts`, `_topk_layouts`, `_conv_layouts`, `_exx2_layout` and
    `_layernormnorm_layout` map to no flag, so those ops stay pinned.
-2. **Existing rules that map to nothing in the parent.** Resolution: the added `Always`
-   members in section 2, for `WDC:496`, `WDC:299`, `WDC:661`, `WD:954`, `WD:930`,
+2. **Existing rules that map to nothing in the parent.** Resolution: the added `ALWAYS`
+   checks in section 2, for `WDC:496`, `WDC:299`, `WDC:661`, `WD:954`, `WD:930`,
    `constrain_residency` (`ILP:534`), `_constrain_relayout_copies` (`ILP:1579`), the
-   fixed-division pins (`ALLOC:3739-3770`) and the cross-frame hazard. `constrain_residency` is
-   the most important wrong-code rule in the allocator and is missing from the parent's
-   always-on list. `_input_residency_reason` is folded into `RESIDENCY`.
+   fixed-division pins (`ALLOC:3739-3770`) and the cross-frame hazard, plus `node_config`,
+   which repeats Stage 2's one-config-per-type assertion. `constrain_residency` is the most
+   important wrong-code rule in the allocator and is missing from the parent's always-on
+   list. `_input_residency_reason` is folded into `residency`.
 3. **"The split divides the axis" is false for a stick axis.** `factor_domain` uses only the
    stick count (`WD:892-893`), so 130 elements on 3 sticks splits 3 ways. A literal port
-   would reject legal plans. Resolution: `SPLIT_DIVIDES` uses `Frame.basis`.
+   would reject legal plans. Resolution: `split_divides` uses `Frame.basis`.
 4. **`splits_while_stuck(node, flag)` needs a tiling.** Rule data is frame-relative
    (`WD:1002-1009`), and 50 of 2,674 frames differ in more than extents. Resolution: an
    optional `tiling` argument.
@@ -992,10 +1128,10 @@ the solve-status guard through the record's allocator and solver fields.
    text say a padded gather output lifts the ban, through
    `is_output_stick_aligned_for_entry`. No such name exists and `PU:1812-1845` has no
    exception. Resolution: no exception, no builder fact.
-8. **`IN_PLACE` and `TILE_ALIGNED` are physical rules.** The parent's In-place overwrite row, "same
-   layout and footprint", is what CP-SAT encodes. SA's packer allows a smaller child
-   (`torch_spyre/csrc/perm_layout_native.cpp:547`). Resolution: table D's physical form for
-   every family; OR-Tools stays stricter by encoding.
+8. **`in_place_conditions` and `tiles_line_up` are physical rules.** The parent's In-place
+   overwrite row, "same layout and footprint", is what CP-SAT encodes. SA's packer allows a
+   smaller child (`torch_spyre/csrc/perm_layout_native.cpp:547`). Resolution: table D's
+   physical form for every family; OR-Tools stays stricter by encoding.
 9. **The stick functions stay.** The plan says this stage's flags take them over and Stage 13
    deletes them. `_matmul_layouts` and `_multi_arg_pointwise_layouts` generate candidates and
    set `restick_cost_fn` for the beam (`PL:2314`, `PL:2320`, `PL:3175`, `PL:3212`), and
@@ -1007,6 +1143,12 @@ the solve-status guard through the record's allocator and solver fields.
 11. **"Runs on every plan in every suite" cannot hold through `build_graph`.** Direct solver
     suites and in-repo captures have no IR. Resolution: `check_buffers` for those plans, a
     partial check, stated as partial.
+12. **The partial-reduction cut guard is a `Rule` flag, not an always-on rule.** The parent's
+    Stage 6 lists "the partial-reduction cut guard" as always-on, and its `Rule` list has
+    `RESIDENT_TILE_UNREDUCED`. Both are `_add_partial_reduction_cut_guard` (`ILP:1030`), and
+    its reason, a split reduction combined core to core, describes this card (section 2).
+    Resolution: one rule, `Rule.RESIDENT_TILE_UNREDUCED`, checked when the target sets it;
+    Stage 6 encodes it under the same condition.
 
 ## Open questions
 
@@ -1015,10 +1157,14 @@ None.
 ## Out of scope
 
 - Encoding any of this: Stages 5, 6 and 8. No solver reads the new data here.
-- The builder and its fact recording: Stage 2.
-- The `Restriction` and `PortFact` classes and the per-type frozen flags: Stage 1.
+- The builder, its fact recording and its config mask, `select_target` and the build-time
+  one-config-per-type assertion: Stage 2.
+- The flag classes (`Restriction`, `PortFact`, `Rule`, `Optimization`), `Target`, `OpFactory`,
+  `OpConfig` and the `SPYRE_OPS` configs: Stage 1.
+- Running `coverage` over every (family, target) pair: Stages 7 and 8, once a family exists.
 - `read_back`: Stages 7 and 8. `RuleViolation` being raised: Stage 9.
 - Conditional port facts: Stage 11. Offset-free stick, outer-dim and EA rules, and stick rules
   for conv, topk, keep_by_index, exx2 and layernormnorm: those stay pinned.
-- Cross-frame hazard and partial-reduction cut guard encodings: Stage 6.
+- Encodings of the cross-frame hazard and of `Rule.RESIDENT_TILE_UNREDUCED` (the
+  partial-reduction cut guard): Stage 6.
 - Loop-carry views: skipped here, and `get_ncores_for_buffers` judges them at commit.
