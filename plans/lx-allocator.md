@@ -32,8 +32,9 @@ The design has three parts.
   be annealed, and it can be tested without a solver.
   - Op nodes are joined by data edges, which carry transform steps. The graph also keeps
     the op order and the pins.
-  - Every node is one `OpNode` dataclass. Its kind is an `OpKind` value, and the target's
-    op factory sets its ports and `Restriction` flags when the builder makes it.
+  - Each op kind is a dataclass subclass of `OpNode` that carries the fields its
+    restrictions read. The target's op factory sets each node's `Restriction` flags and
+    allowed port facts when the builder makes it.
 - **The target describes the card.** A frozen `Target` holds everything that differs
   between accelerator cards: the op factory, the sizes, the rules that vary by card, the
   steps the card can perform, the optimizations the solve may use, and the cost model. It
@@ -43,9 +44,10 @@ The design has three parts.
   - it records the boxes to place and consumes the cost model;
   - it solves the model and reads the plan back onto the graph.
 
-Plain data is a dataclass. A kind that differs from another only in constants is an enum
-value with a row in a table, not a subclass. Behaviour lives in functions and in the
-families.
+Plain data is a dataclass. Node types subclass `OpNode`, because a restriction may need
+data fields only its op carries, such as a matmul's `k` and `n`. A kind that differs from
+another only in constants, such as a step kind, is an enum value with a row in a table.
+Behaviour lives in functions and in the families.
 
 ### Entry point
 
@@ -85,7 +87,7 @@ classDiagram
         +data_edges: list~DataEdge~
         +pins: list~Pin~
         +cuts: set~int~
-        +add_node(kind, name, axes, attrs) OpNode
+        +add_node(node_type, name, axes, fields) OpNode
         +connect(out, in_port) DataEdge
         +pin(target, what, value, source) Pin
         +pins_on(target, what) list~Pin~
@@ -93,17 +95,15 @@ classDiagram
         +lifetime(node) tuple
     }
     class OpNode {
-        <<dataclass>>
-        +kind: OpKind
+        <<abstract dataclass>>
+        +PORTS: tuple~str~$
+        +runs: bool$
         +name: str
         +axes: tuple~Axis~
         +size: int
         +in_ports: dict~str, InPort~
         +out: OutPort
         +restrictions: Restriction
-        +k: Axis | None
-        +n: Axis | None
-        +scatter: bool
         +work_split: WorkSplit
         +resident: bool
         +offset: int
@@ -114,13 +114,24 @@ classDiagram
         +same_index_read(port) bool
         +footprint(splits, tiling) int
     }
-    class OpKind {
-        <<enum>>
-        POINTWISE
-        MATMUL
-        REDUCTION
-        INDIRECT
-        INPUT
+    class PointwiseNode {
+        PORTS = in0 .. inN
+    }
+    class MatmulNode {
+        PORTS = x, y
+        +k: Axis
+        +n: Axis
+    }
+    class ReductionNode {
+        PORTS = in0
+    }
+    class IndirectNode {
+        PORTS = table, index, values
+        +scatter: bool
+    }
+    class InputNode {
+        PORTS = none
+        runs = False
     }
     class DataEdge {
         <<dataclass>>
@@ -147,21 +158,25 @@ classDiagram
     SpyreOptimizationGraph o-- DataEdge : data_edges
     SpyreOptimizationGraph o-- Pin : pins
     SpyreOptimizationGraph --> Target : target
-    OpNode --> OpKind : kind
+    OpNode <|-- PointwiseNode
+    OpNode <|-- MatmulNode
+    OpNode <|-- ReductionNode
+    OpNode <|-- IndirectNode
+    OpNode <|-- InputNode
     OpNode *-- InPort : in_ports
     OpNode *-- OutPort : out
     DataEdge o-- Step : steps
     Pin ..> DataEdge : or a port or a node
 ```
 
-`k` and `n` are set only on a matmul, and `scatter` only on an indirect op. `k` and `n`
-are the contraction axis and the output-column axis that `MATMUL_STICKS` reads (port `x`
-stuck on K, port `y` and the out port on N). The builder finds them once from the reads' index symbols, as
-`_matmul_layouts` does today with `find_reduction_var` and `find_matmul_generated_var`,
+A subclass adds only the fields its restrictions read. `MatmulNode.k` and `.n` are the
+contraction axis and the output-column axis that `MATMUL_STICKS` reads (port `x` stuck
+on K, port `y` and the out port on N). The builder finds them once from the reads' index
+symbols, as `_matmul_layouts` does today with `find_reduction_var` and `find_matmul_generated_var`,
 including the `M = 1` and `N = 1` cases where one symbol simplifies away. Ports `x` and
 `y` bind to operands 0 and 1 (`identify_matmul_inputs` confirms the positional order).
 
-An `INDIRECT` node is a gather (an indirect read) or a scatter (an indirect write,
+`IndirectNode` is a gather (an indirect read) or a scatter (an indirect write,
 `scatter = True`). Port `table` reads the shared value table or scatter destination,
 `index` reads the indices, and `values` reads a scatter's source (a gather leaves it
 unbound). Every core reads the table at one base address, so `INDIRECT_ACCESS` keeps its
@@ -170,7 +185,7 @@ data dims unsplit; only the index-entry dims carry the op's parallelism.
 #### Ports
 
 A node connects to data edges through named ports: one `InPort` per operand it reads and
-one `OutPort` for what it writes. The op's `OpConfig` declares its port names, so rules,
+one `OutPort` for what it writes. Each node type declares its port names in `PORTS`, so rules,
 pins and edges name an operand (`x`, `table`) rather than an index. Both are dataclasses
 with no shared base. They are not frozen, because `connect` attaches the edges after the
 builder makes them. The out port carries the node's output layout as a
@@ -233,13 +248,14 @@ describes the tensor or the read behind one operand, not the op. A rule keyed on
 therefore applies to every op that touches that tensor, through the port that carries
 it, and the port's axis map turns the tensor dims it names into the op's loop axes.
 `QFP8WT` on a weight restricts both the op that writes it (its out port) and the matmul
-that reads it (port `y`), and no op config mentions QFP8WT.
+that reads it (port `y`), and no node type mentions QFP8WT.
 
 #### Target and op factory
 
-A `Target` is one card. Its `OpFactory` holds one `OpConfig` per op kind, and
-`make` stamps that config onto each node it builds. The node class is the same for every
-kind and every card; what differs is the configuration.
+A `Target` is one card. Its `OpFactory` holds one `OpConfig` per node type, and `make`
+stamps that config onto each node it builds. A node type's fields and ports are the same
+on every card, because they describe the op; its flags and allowed facts are
+configuration, because they describe what the card can do with it.
 
 ```mermaid
 classDiagram
@@ -260,16 +276,15 @@ classDiagram
     }
     class OpFactory {
         <<frozen dataclass>>
-        +ops: dict~OpKind, OpConfig~
-        +make(kind, name, axes, attrs) OpNode
-        +with_kind(kind, changes) OpFactory
+        +ops: dict~type[OpNode], OpConfig~
+        +make(node_type, name, axes, fields) OpNode
+        +with_type(node_type, changes) OpFactory
     }
     class OpConfig {
         <<frozen dataclass>>
         +ports: tuple~str~
         +restrictions: Restriction
         +facts: PortFact
-        +runs: bool
     }
     class CostModel {
         +objective(graph) sympy.Expr
@@ -285,18 +300,18 @@ classDiagram
     class Optimization {
         <<Flag>>
     }
-    class OpKind
+    class OpNode
 
     Target *-- OpFactory : ops
     Target *-- CostModel : cost_model
     Target ..> Rule
     Target ..> Optimization
-    OpFactory *-- OpConfig : one per OpKind
-    OpFactory ..> OpKind
+    OpFactory *-- OpConfig : one per node type
+    OpFactory ..> OpNode : makes
     OpConfig ..> Restriction
 ```
 
-Every target fills `ops` for every `OpKind`. A second card that shares most of the first
+Every target fills `ops` for every node type. A second card that shares most of the first
 card's rules is derived from it, so the shared part is defined once and the differences
 are visible in one place:
 
@@ -311,9 +326,9 @@ SPYRE = Target(name="spyre", ops=SPYRE_OPS, cores=SPYRE_CORES, lx_bytes=SPYRE_LX
 OTHER = replace(
     SPYRE,
     name="other",
-    ops=SPYRE_OPS.with_kind(
-        OpKind.MATMUL,
-        restrictions=SPYRE_OPS.ops[OpKind.MATMUL].restrictions
+    ops=SPYRE_OPS.with_type(
+        MatmulNode,
+        restrictions=SPYRE_OPS.ops[MatmulNode].restrictions
         & ~Restriction.ENCODED_K_UNSPLIT),
     steps=SPYRE.steps | {StepKind.TRANSPOSE},
 )
@@ -514,30 +529,30 @@ class Optimization(Flag):
     COARSE_TILING = auto()   # coarse tiles and their nests
 ```
 
-Each op kind's config in `SPYRE_OPS`:
+Each node type's restrictions in `SPYRE_OPS`, and the fields they read:
 
-| `OpKind` | ports | restrictions | runs |
-|---|---|---|---|
-| `POINTWISE` | `in0` .. `inN` | `WHOLE_STICKS \| POINTWISE_STICKS` | yes |
-| `MATMUL` | `x`, `y` | `WHOLE_STICKS \| MATMUL_STICKS \| PADDED_REDUCTION_UNSPLIT \| ENCODED_K_UNSPLIT` | yes |
-| `REDUCTION` | `in0` | `WHOLE_STICKS \| PADDED_REDUCTION_UNSPLIT` | yes |
-| `INDIRECT` | `table`, `index`, `values` | `WHOLE_STICKS \| INDIRECT_ACCESS` | yes |
-| `INPUT` | none | `NONE` | no |
+| node type | restrictions | fields the restrictions read |
+|---|---|---|
+| `PointwiseNode` | `WHOLE_STICKS \| POINTWISE_STICKS` | ports' axis maps |
+| `MatmulNode` | `WHOLE_STICKS \| MATMUL_STICKS \| PADDED_REDUCTION_UNSPLIT \| ENCODED_K_UNSPLIT` | `k`, `n`, ports' facts |
+| `ReductionNode` | `WHOLE_STICKS \| PADDED_REDUCTION_UNSPLIT` | padded reductions |
+| `IndirectNode` | `WHOLE_STICKS \| INDIRECT_ACCESS` | `scatter`, ports `table` and `index` |
+| `InputNode` | `NONE` | none |
 
 - **Flags are set per node by the factory.** The builder never assigns `restrictions`
-  after `make`, and it asserts that every node of one kind carries that kind's config,
+  after `make`, and it asserts that every node of one type carries that type's config,
   so two matmuls in one graph cannot disagree. A test changes flags by building with a
   derived target, for example
-  `replace(SPYRE, ops=SPYRE_OPS.with_kind(OpKind.REDUCTION, restrictions=...))`, so
+  `replace(SPYRE, ops=SPYRE_OPS.with_type(ReductionNode, restrictions=...))`, so
   `encode` and `check_decisions` take no override argument.
 - **A flag only names a rule.** Two functions turn a flag into data from the node's
-  facts and its kind's fields:
+  facts and the fields its node type adds:
   - `splits_while_stuck(node, flag)` gives split domains that apply while something is
     stuck;
   - `stick_tables(node, flag)` gives tables of legal sticks.
 
   Each family's `encode` encodes that data, and `check_decisions` evaluates it.
-- **Port facts trigger rules an op kind cannot.** A rule keyed only on a fact is an
+- **Port facts trigger rules a node type cannot.** A rule keyed only on a fact is an
   always-on rule over every port that carries it:
   - `QFP8WT`: the dims indexing the second stick coordinate and the batch dims stay
     unsplit;
@@ -550,11 +565,12 @@ Each op kind's config in `SPYRE_OPS`:
   axis outside `graph.target.optimizations` (narrowed further by config, as coarse
   tiling is today), and `check_decisions` rejects a plan that uses it anyway.
 - **Coverage is checked at config time.** `coverage(family, target)` reports every
-  restriction (across all op kinds), rule, step kind and optimization the target uses
+  restriction (across all node types), rule, step kind and optimization the target uses
   that the family's `ENCODES`, `RULES`, `STEPS` or `OPTIMIZATIONS` lacks. Tests run over
   every (family, target) pair, and a gap is an explicit skip.
-- **A new flag needs three things:** its data, an encoding in each family that serves a
-  card using it, and a check. Cards without the flag never see it.
+- **A new flag needs three things:** its data (a new field on the node types it applies
+  to, if the existing ones don't hold it), an encoding in each family that serves a card
+  using it, and a check. Cards without the flag never see it.
 
 **Always-on rules** hold on every card, so they are not flags. The `ALWAYS` list names
 the check functions; the encoder always applies them and `check_decisions` always checks
@@ -581,11 +597,11 @@ Data edges carry no restrictions.
 | topic | decision |
 |---|---|
 | Targets | One frozen `Target` per accelerator card: op factory, sizes, rules, steps, optimizations, cost model. Chosen from config, so it is in the FX graph cache key. A card that shares rules with another is derived from it with `dataclasses.replace` and flag arithmetic. Different cards in one program are future work. |
-| Node kinds | One `OpNode` dataclass for every kind. The kind is an `OpKind` value, and the target's `OpFactory` sets ports and flags from the kind's `OpConfig` at build, so a card's differences live in configuration, not in node classes. |
-| Class count | Plain data is a dataclass, a kind that differs only in constants is an enum value with a table row, and only the families carry behaviour. |
-| Graph inputs | `INPUT` nodes with downstream edges only. How an input arrives (its stick) is a pin. |
-| Ports | Every operand a node reads is a named `InPort` and its output an `OutPort`, both dataclasses, with names declared per op kind. Data edges run from an out port to an in port, and rules and pins name ports, never operand indices. |
-| Port facts | A `PortFact` set on each port, derived once by the builder and masked by the op config. Out-port facts come from the layout's element arrangement. In-port facts come from the edge's read layout, so a step that changes the layout changes them, and from the read itself (overlap, direct-read provenance). Rules keyed on a tensor property live here, not on op kinds. |
+| Node types | A dataclass subclass of `OpNode` per op kind, adding only the fields its restrictions read (`MatmulNode.k` and `.n`, `IndirectNode.scatter`) and declaring its `PORTS`. The target's `OpFactory` sets each node's flags and allowed facts from its type's `OpConfig` at build, so a card's differences live in configuration, not in new node classes. |
+| Class count | Plain data is a dataclass. Node types are subclasses because their fields differ. A kind that differs only in constants, such as a step kind, is an enum value with a table row. Only the families carry behaviour. |
+| Graph inputs | Leaf `InputNode`s with downstream edges only. How an input arrives (its stick) is a pin. |
+| Ports | Every operand a node reads is a named `InPort` and its output an `OutPort`, both dataclasses, with names declared per node type. Data edges run from an out port to an in port, and rules and pins name ports, never operand indices. |
+| Port facts | A `PortFact` set on each port, derived once by the builder and masked by the op config. Out-port facts come from the layout's element arrangement. In-port facts come from the edge's read layout, so a step that changes the layout changes them, and from the read itself (overlap, direct-read provenance). Rules keyed on a tensor property live here, not on node types. |
 | Layout | One `FixedTiledLayout` per node, on its out port, carrying its `SpyreTensorLayout`. An in port holds no layout of its own: what a consumer needs is a restriction over its port names, and a mismatch is a step on the edge. |
 | Memory | No `Buffer` class. Nodes and steps carry their own footprint, residency and offset, and placement works over both. |
 | Who applies rules | The family's `encode`, at op, edge, op-op and graph level. There is no separate lookup or strategy object. |
@@ -634,22 +650,24 @@ and either justified or fixed.
 - No production code changes in this stage.
 
 **Stage 1. Graph types.**
-- Add the dataclasses `SpyreOptimizationGraph`, `OpNode`, `InPort`, `OutPort`,
-  `DataEdge`, `Pin`, `Step`, `WorkSplit` and `Axis`, the enums `OpKind` and `StepKind`
-  with the `STEP_KINDS` table, and `PortFact`. Layouts are torch-spyre's own
+- Add the dataclasses `SpyreOptimizationGraph`, `OpNode` and its subtypes with their
+  `PORTS` (`PointwiseNode`, `MatmulNode` with `k` and `n`, `ReductionNode`,
+  `IndirectNode` with `scatter`, `InputNode`), `InPort`, `OutPort`, `DataEdge`, `Pin`,
+  `Step`, `WorkSplit` and `Axis`, the enum `StepKind` with the `STEP_KINDS` table, and
+  `PortFact`. Layouts are torch-spyre's own
   `FixedTiledLayout` and `SpyreTensorLayout`, not a new type.
 - Add `Target`, `OpFactory` and `OpConfig`, and the `SPYRE` target with `SPYRE_OPS` for
-  every op kind. `config.target` selects it and defaults to `SPYRE`.
+  every node type. `config.target` selects it and defaults to `SPYRE`.
 - The graph layer imports no solver.
-- Unit tests cover: a node's flags and ports come from its kind's config, a derived
+- Unit tests cover: a node's flags and allowed facts come from its type's config, a derived
   target changes only what it names, ports by name, port facts masked by the config,
   lifetimes, an edge's read layout after its steps, and pins by source.
 
 **Stage 2. Builder.**
 - `build_graph(ir, target)` makes one node per op through `target.ops`, choosing the
-  `OpKind` with the same predicates codegen uses, keeps the nodes in op order, and stores
-  `graph.target`. It asserts that every node of one kind carries that kind's config.
-- It binds each operand to its kind's in port, works out each port's axis-to-dim map once
+  node type with the same predicates codegen uses, keeps the nodes in op order, and stores
+  `graph.target`. It asserts that every node of one type carries that type's config.
+- It binds each operand to its node type's in port, works out each port's axis-to-dim map once
   from the read's index expression, and connects data edges from out port to in port.
 - It derives each port's facts, masked by the op config: `QFP8WT` and `STAGGERED_EA`
   from the layout's element arrangement, `OVERLAPPING_READ` from the read's coordinates
@@ -675,7 +693,7 @@ and either justified or fixed.
 - They take over these rules from today's code:
   - `work_division_constraints.py`: `coordinate_mask_blocked_vars` becomes
     `PADDED_REDUCTION_UNSPLIT`, and each other op-specific constraint function becomes
-    a flag in the configs of the op kinds it applies to, with its data taken from the
+    a flag in the configs of the node types it applies to, with its data taken from the
     node's facts.
     Examples are the qfp8wt K split domain, `plain_reduction_k_split_domains` and
     `reduction_window_blocked_vars`;
