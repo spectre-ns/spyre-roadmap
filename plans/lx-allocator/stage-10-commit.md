@@ -1,13 +1,13 @@
 # LX allocator, Stage 10: Commit
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0, 1, 2, 3, 4, 5, 6, 7, 8, 9. Needed by: Stages 11, 12, 13.
 
 ## Goal
 
-When this PR merges, `SpyreOptimizer.commit(graph)` lowers a solved graph onto the
-`GraphLowering` directly, runs the post passes and writes the cost dump, and the temporary Stage 9
-bridge is gone. No code in the optimizer reads `LifetimeBoundBuffer` or `CoreDivisionBuffer`, and
+When this PR merges, `commit(graph)` lowers a solved graph onto the `GraphLowering` directly and
+runs the post passes, `optimize` writes the full cost dump, and the temporary Stage 9 bridge is
+gone. No code in the optimizer reads `LifetimeBoundBuffer` or `CoreDivisionBuffer`, and
 none calls `_post_solve` or `_push_allocation`. On every corpus entry the new commit produces the
 same IR as those two methods: the same ops in the same order, the same clones, addresses, views,
 divisions, loop metadata and relayout registry, and the same `LxContextSwitchingPass` result. The
@@ -182,7 +182,7 @@ any commit edit, and only when the solve had a cost expression. It holds what th
 ### Where the code lives
 
 A new module `torch_spyre/_inductor/scratchpad/lx_allocator/commit.py` holds the lowering.
-`SpyreOptimizer.commit`, in `lx_allocator/optimizer.py`, is a thin call into it. The dependency runs
+`commit(graph)`, in `lx_allocator/optimizer.py`, is a thin call into it. The dependency runs
 one way: `commit.py` imports from `allocator.py`, and `allocator.py` imports nothing from
 `commit.py`, so `_push_allocation` and every existing test patch on `allocator_module` keep working.
 
@@ -200,7 +200,7 @@ class CommitPlan:
     spans: Mapping[str, int]               # resident name -> placed per-core bytes
     views: Mapping[str, PerCoreView]       # names whose view is decided, see below
     relayouts: tuple[LXRelayoutPlan, ...]
-    copy_outs: Mapping[str, frozenset[str]]  # producer -> consumers on CopyOut edges
+    copy_outs: Mapping[str, frozenset[str]]  # producer -> consumers on COPY_OUT edges
     drains: Mapping[str, DrainPlan]        # graph.drain_plans
 
 @dataclass(frozen=True)
@@ -217,34 +217,33 @@ class CommitResult:
 def read_commit_plan(graph: SpyreOptimizationGraph) -> CommitPlan: ...
 def lower_commit(graph: SpyreOptimizationGraph, plan: CommitPlan) -> CommitResult: ...
 
-class SpyreOptimizer:
-    def commit(self, graph: SpyreOptimizationGraph) -> None:
-        if graph.ir is None:                # a hand-built graph in a unit test
-            return
-        plan = read_commit_plan(graph)
-        if config.dump_cost_expr_file and self._solved is not None:
-            write_cost_dump(graph, self.cost_model, self._solved.encoder, self._solved.solution)
-        self.last_commit = lower_commit(graph, plan)
-        for post_pass in self.post_optimization_passes:
-            post_pass.apply_pass(graph.ir)
+def commit(graph: SpyreOptimizationGraph) -> None:
+    if graph.ir is None:                # a hand-built graph in a unit test
+        return
+    lower_commit(graph, read_commit_plan(graph))
+    for post_pass in _context_switching_passes():
+        post_pass.apply_pass(graph.ir)
 ```
 
 `commit` runs the post passes itself, on `graph.ir`, after `lower_commit`. They belong here and not
 in `plan_allocation`, because Stage 11's held-plan path calls `commit` directly. They run last, as
-at `allocator.py:1052`, and `LxContextSwitchingPass` stays a separate, unchanged pass.
-`optimize` keeps its accepted attempt in `self._solved` before it calls `commit`.
+at `allocator.py:1052`, and `LxContextSwitchingPass` stays a separate, unchanged pass. The list is
+Stage 9's `_context_switching_passes()`, the same for every family. `plan_allocation` calls
+`commit` after `optimize` returns with a plan read back, never after a proven-infeasible solve.
 
 `read_commit_plan` makes no IR edit. It is the last point a bug can be reported with the graph
 intact. It raises `RuleViolation` for what would otherwise miscompile silently:
 
-- a `Restickify` with `pinned=False`, or a `Transpose`, see "Step kinds";
-- a pinned `Restickify` whose `realized_by` is `None` or names an op missing from `ir.operations`;
-- a pinned step of any type other than `Restickify` or `CopyOut`;
-- a `Relayout` after a pinned `Restickify` on one edge, see "Folding relayouts";
+- a `RESTICKIFY` step with `pinned=False`, or a step whose kind is not in `graph.target.steps`,
+  see "Step kinds";
+- a pinned `RESTICKIFY` step whose `realized_by` is `None` or names an op missing from
+  `ir.operations`;
+- a pinned step of any kind other than `RESTICKIFY` or `COPY_OUT`;
+- a `RELAYOUT` step after a pinned `RESTICKIFY` step on one edge, see "Folding relayouts";
 - an `in_place` edge whose two ends are not both resident at one offset;
-- a `CopyOut` that is resident or has an offset;
-- a `Relayout` that is not resident, or whose source is an `InputNode`, or two `Relayout` instances
-  of one source and one `to_view` partition;
+- a `COPY_OUT` step that is resident or has an offset;
+- a `RELAYOUT` step that is not resident, or whose source is an `InputNode`, or two `RELAYOUT`
+  steps of one source and one `to_view` partition;
 - a resident `InputNode` with no `prefetch_view`.
 
 It does not repeat `check_decisions`. Everything after this point names buffers, never holds an
@@ -252,7 +251,8 @@ op across `apply_tilings`, because `coarse_tile` replaces op objects under the s
 (`torch_spyre/_inductor/wsr/coarse_tile.py:2153-2163`).
 
 The graph holds alignment units, and this is the edge that scales them:
-`placements[name] = node.offset * graph.alignment`, and likewise for `Relayout.offset`. `spans[name]`
+`placements[name] = node.offset * graph.target.alignment`, and likewise for a `RELAYOUT` step's
+`offset`. `spans[name]`
 is `ceil_div(node.size, split.output_partition * split.output_tile_count)`, today's unrounded
 `per_core_size` (`plan_solver.py:395`), which `check_priced_footprint` compares against. A resident
 input has no `WorkSplit`, so its span is `ceil_div(node.size, node.prefetch_view.split_product)`.
@@ -263,8 +263,8 @@ which take precedence over the judge in `accepted_lx_views`.
 with every op pinned still re-commits ownership today.
 
 Lowering knows no solver family. It reads decisions from the graph and never a menu index, so a
-debug greedy family that fills in the same fields commits without change. The base
-`Encoder.dump_tables` returns `cost_expr=None`, so such a family writes no dump line.
+debug greedy family that fills in the same fields commits without change. Such a family's
+`dump_tables` returns `cost_expr=None`, so it writes no dump line.
 
 ### The order of work
 
@@ -298,7 +298,7 @@ again, as `_finish_plan_check` does on the old path. Stages are computed at step
 `read_commit_plan`, because their inputs exist only there: `calculate_liveness` on the tiled graph
 (`allocator.py:3551`) and the judge on committed ownership (`allocator.py:3613`). Step 6 still edits
 no IR, and no address has landed. For each stage it sets `node.resident`, `node.offset` to
-`address // graph.alignment` and `node.spill_reason` to `None`, the graph form of
+`address // graph.target.alignment` and `node.spill_reason` to `None`, the graph form of
 `allocator.py:3638`. `:3635` aligns to 128 (`plan_solver.py:1073`), so the division is exact. Stage
 3's `no_overlap(graph)`, which reads no IR, then judges every box, and a violation raises
 `RuleViolation`.
@@ -315,7 +315,7 @@ module with today's public function left as a thin wrapper. Stage 13 deletes the
 | `commit_chosen_divisions(graph, chosen, planned_names)` | `allocator.py` | `commit_divisions:2907-2944` | wrapper |
 | `check_priced_footprint(graph, name, division, priced, size)` | `allocator.py` | body of the `check_priced_footprints` loop | wrapper loop |
 | `accepted_lx_views(graph, names, source_views, drained_readers)` | `allocator.py` | `commit_lx_views:3015-3029` | wrapper sets `buffer.lx_view` |
-| `collective_output_stages(graph, placed, spilled, residents, relayouts, capacity)` | `allocator.py` | `_stage_collective_outputs:3549-3646` | method wraps it and writes `b.address`, `b.lx_view`, `b.spill_reason` |
+| `collective_output_stages(graph, placed, spilled, residents, relayouts, capacity)` | `allocator.py` | `_stage_collective_outputs:3549-3646` | method wraps it and writes `b.address`, `b.lx_view`, `b.spill_reason`; the new path passes `graph.target.lx_bytes` |
 | `push_one_placement(...)` | `allocator.py` | `_push_allocation:2069-2154` | `_push_allocation` becomes its loop plus line 2158 |
 | `cost_record(...)` | `plan_solver.py` | `cost_expr_record`'s body, see "Cost dump" | `cost_expr_record` derives plain values from buffers and calls it |
 
@@ -340,19 +340,20 @@ same four structural checks plus the admitted-pair check on the chosen splits al
 
 ### Step kinds
 
-Commit does not walk edges inserting steps one at a time. It reads the steps on the edges and
-lowers each **kind** in the phase where the IR allows it.
+Commit does not walk edges inserting steps one at a time. It reads each edge's `DataEdge.steps`
+and lowers each `StepKind` in the phase where the IR allows it.
 
-| step | how it becomes IR | through |
+| `step.kind` | how it becomes IR | through |
 |---|---|---|
-| `CopyOut` | Nothing per edge. `tilings` carries each op's `TileSpec`, and `apply_tilings` builds one copy per producer. `plan.copy_outs` is only verified. A pinned `CopyOut` is skipped. | `coarse_tile`, not `GraphEditor` |
-| `Restickify`, pinned | Nothing inserted. Its `realized_by` node gets a division and an address in the ordinary walk. | see "Pinned steps" |
-| `Restickify`, unpinned | `read_commit_plan` raises. Unpinned steps exist only from Stage 11b, carrying `target`, and Stage 11b changes this raise: `insert_restickify` lowers them, so commit inserts nothing. | Stage 11 |
-| `Relayout` | Folded into one `LXRelayoutPlan` per group, materialized last. | `GraphEditor.insert_clone_before_consumers` |
-| `Transpose` | Not built. `read_commit_plan` raises. | |
+| `COPY_OUT` | Nothing per edge. `tilings` carries each op's `TileSpec`, and `apply_tilings` builds one copy per producer. `plan.copy_outs` is only verified. A pinned `COPY_OUT` step is skipped. | `coarse_tile`, not `GraphEditor` |
+| `RESTICKIFY`, pinned | Nothing inserted. Its `realized_by` node gets a division and an address in the ordinary walk. | see "Pinned steps" |
+| `RESTICKIFY`, unpinned | `read_commit_plan` raises. Unpinned steps exist only from Stage 11b, carrying `target`, and Stage 11b changes this raise: `insert_restickify` lowers them, so commit inserts nothing. | Stage 11 |
+| `RELAYOUT` | Folded into one `LXRelayoutPlan` per group, materialized last. | `GraphEditor.insert_clone_before_consumers` |
+| a kind not in `graph.target.steps` | `read_commit_plan` raises. | |
 
-Per edge, the steps are read in list order, which is physical, and nothing sorts them. `ORDER` only
-placed a step when a decoder appended it, so commit never reads it (Deviation 3).
+Per edge, the steps are read in list order, which is physical, and nothing sorts them.
+`STEP_KINDS[kind].order` only placed a step when a decoder appended it, so commit never reads it
+(Deviation 3).
 
 **Verifying copy-outs.**
 
@@ -371,19 +372,21 @@ def verify_copy_outs(ir: GraphLowering, plan: CommitPlan) -> None:
 
 Only that direction is checked. `coarse_tile` also copies out consumers deferred past a reduction
 (`wsr/coarse_tile.py:767`), which the solve has no edge step for. A tiled graph output, or a tiled
-buffer read only by an extern kernel, is cut with no data edge to carry a step: `read_back` adds no
-`CopyOut`, its traffic is priced by node, and `verify_copy_outs` skips such a producer. Those
-reverse differences are logged at DEBUG. `CopyOut` steps are deduplicated by producer in
-`plan.copy_outs`, so three readers mean one set entry and one IR copy.
+buffer read only by an extern kernel, is cut (its tick is in `graph.cuts`) with no data edge to
+carry a step: `read_back` adds no `COPY_OUT` step, its traffic is priced by node, and
+`verify_copy_outs` skips such a producer. Commit passes no cuts to `apply_tilings`, which derives
+its own nests; `graph.cuts` serves only that DEBUG log of reverse differences. `COPY_OUT` steps are
+deduplicated by producer in `plan.copy_outs`, so three readers mean one set entry and one IR copy.
 
-**Folding relayouts.** `relayout_plans(graph)` walks `graph.steps()`, which lists each shared
-`Relayout` once, and folds one `LXRelayoutPlan` per instance from `step.edges`:
+**Folding relayouts.** `relayout_plans(graph)` walks `graph.all_steps()`, which lists each shared
+`RELAYOUT` step once, and folds one `LXRelayoutPlan` per step from `step.edges`:
 
 - The **source** is `edge.src.node.name`, the same on every edge of the step.
 - The **consumers** are the `edge.dst.node.name`s. A relayout that feeds a restickify sits before
   the pinned step on the edge into the `RestickifyNode`, so that node is its consumer. A relayout
   of a restickify's output sits on an edge out of that node, so that node is its source. A
-  `Relayout` after a pinned `Restickify` on one edge has no meaning, so `read_commit_plan` raises.
+  `RELAYOUT` step after a pinned `RESTICKIFY` step on one edge has no meaning, so
+  `read_commit_plan` raises.
 - Consumers sort by name and plans by `(source, consumer_names)`. `FiredRelayoutGroup.from_chosen`
   sorts by an interned group id, which the graph does not hold and the parent's direction keeps out
   of the graph layer. The cost is the narrow normal form in "Parity and gates".
@@ -391,11 +394,11 @@ reverse differences are logged at DEBUG. `CopyOut` steps are deduplicated by pro
 | `LXRelayoutPlan` field | source |
 |---|---|
 | `source_name`, `consumer_names` | as above |
-| `source_view`, `source_footprint_bytes`, `destination_footprint_bytes` | the `Relayout` fields of those names |
-| `destination_view` | `Relayout.to_view` |
+| `source_view`, `source_footprint_bytes`, `destination_footprint_bytes` | the `RELAYOUT` step's fields of those names |
+| `destination_view` | `step.to_view` |
 | `num_cores` | `source_view.num_cores` |
 | `completed_producer_cores` | `()` if `reduction_split <= 1`, else the cores of `derive_completed_reduction_routes(source_view, to_view, reduction_split)` |
-| `source_address`, `destination_address` | the source's and the `Relayout`'s `offset * graph.alignment` |
+| `source_address`, `destination_address` | the source's and the step's `offset * graph.target.alignment` |
 
 `LXRelayoutPlan` and `materialize_lx_relayouts` stay as they are, so the registry that
 `cost_features`, `scheduler` and `spyre_kernel` read does not change.
@@ -439,14 +442,15 @@ the debug log and to `CommitResult.spill_reasons`, where the harness reads it.
 - `RuleViolation` from `read_commit_plan`: nothing edited.
 - `RuleViolation` from `verify_copy_outs` or step 6, or `Unsupported` from steps 3 to 5: tilings are
   already applied, so a fallback would replan a graph it did not see (`allocator.py:2902-2905`).
-  These propagate, because `optimize` calls `commit` outside the fallback flow.
+  These propagate, because `plan_allocation` calls `commit` after `optimize` returns, outside the
+  fallback flow.
 - `SolveError` stays before commit, so `scratchpad_planning`'s guarantee (`allocator.py:5496-5500`) holds.
 
 ### Removing the Stage 9 bridge
 
-The bridge goes in the same commit that switches `SpyreOptimizer.commit`, so no tree has neither
-or both. That commit deletes `lx_allocator/optimizer_bridge.py` (`records_from_graph`,
-`_CommitBridge`), `SpyreOptimizer._commit_via_bridge`, Stage 9's reduced cost line and
+The bridge goes in the same commit that switches `plan_allocation` to `commit(graph)`, so no tree
+has neither or both. That commit deletes `lx_allocator/optimizer_bridge.py` (`records_from_graph`,
+`_CommitBridge`), `_commit_via_bridge`, Stage 9's reduced cost line and
 `tests/inductor/test_optimizer_bridge.py` with its config shard, and adds
 `test_optimizer_reads_no_solver_records`. The Stage 3 adapter stays: it runs the other way, records
 onto the graph, and the shadow gate needs it. The gate's base still has the bridge, so its removal
@@ -454,28 +458,32 @@ costs no comparison.
 
 ### Cost dump
 
-`commit` writes the full `cost_expr_record` schema from decoded values, in place of Stage 9's reduced
-line. It writes before `lower_commit`, because `bundle_terms` reads the untouched IR, as `_solve`
-does today, and it writes nothing when the encoder had no priced expression, also as today.
+`optimize` writes the full `cost_expr_record` schema from decoded values, in place of Stage 9's
+reduced line. It writes once `check_decisions` passes and before it returns, because it is the last
+holder of the accepted attempt's family, `Encoding` and `Solution`, and because `bundle_terms` reads
+the untouched IR, as `_solve` does today: `plan_allocation` calls `commit` only after `optimize`
+returns. It writes nothing when the encoding had no priced expression, also as today. The cost
+model is `graph.target.cost_model`.
 
 `cost_expr_record`'s body moves to `cost_record`, which takes plain values, so one body builds the
-record. Menus stay inside the encoder, so this stage adds one method to `Encoder`, and adds
-`score_ns()` and `off_expression_ns()` to `Solution` with the defaults of `plan_solver.py:1173-1181`.
-`AnnealSolution` already overrides both.
+record. Menus stay inside the family's `Encoding`, so this stage adds `dump_tables` to the `Family`
+protocol, and adds `score_ns()` and `off_expression_ns()` to `Solution` with the defaults of
+`plan_solver.py:1173-1181`. `AnnealSolution` already overrides both.
 
 ```python
 @dataclass(frozen=True)
 class DumpTables:
-    cost_expr: sympy.Expr | None                # as the encoder priced it; None writes no line
+    cost_expr: sympy.Expr | None                # as `encode` priced it; None writes no line
     domains: CostDomains
     divisions: Mapping[str, Mapping[str, Any]]  # the record's `divisions` value
     priced_relayouts: Mapping[str, Any]         # the record's `priced_relayouts` value
 
-class Encoder:
-    def dump_tables(self, solution: Solution) -> DumpTables: ...
+class Family(Protocol):
+    ...                                         # Stage 7's members
+    def dump_tables(self, encoding: Encoding, solution: Solution) -> DumpTables: ...
 
 def graph_bindings(graph, domains: CostDomains, solution: Solution) -> dict[sympy.Symbol, int]: ...
-def write_cost_dump(graph, cost_model: CostModel, encoder: Encoder, solution: Solution) -> None: ...
+def write_cost_dump(graph, family: Family, encoding: Encoding, solution: Solution) -> None: ...
 ```
 
 `graph_bindings` is `solved_bindings` over decoded values. For each name in `domains.nodes` it binds
@@ -488,11 +496,11 @@ record's index 0 wrong.
 | record key | source on the new path |
 |---|---|
 | `bindings` | `graph_bindings`, plus each `division_<name>` from `tables.divisions` |
-| `bundles`, `objective_ns` | `cost_model.bundle_terms(graph, tables.domains)`, `tables.cost_expr` |
+| `bundles`, `objective_ns` | `graph.target.cost_model.bundle_terms(graph, tables.domains)`, `tables.cost_expr` |
 | `relayout_terms` | each `SplitKeyedCharge` in `tables.cost_expr.args` |
-| `divisions`, `priced_relayouts` | `tables`. OR-Tools fills them from `DivisionTable`, `Gate.pairs` and `Gate.relayouts`; SA from `AnnealModel.menus` and `relations`, with no relayouts |
+| `divisions`, `priced_relayouts` | `tables`. `OrToolsFamily` fills them from `DivisionTable`, `Gate.pairs` and `Gate.relayouts`; `SAFamily` from `AnnealModel.menus` and `relations`, with no relayouts |
 | `off_expression_ns`, `score_ns`, `solve` | `solution`, with `solve` from `solution.stats` |
-| `buffers`, `buffer_sizes`, `params`, `op_names`, `op_ids`, `env` | as today (`allocator.py:3369-3391`), with `env.solver` the family key and `env.allocator` `"SpyreOptimizer"` |
+| `buffers`, `buffer_sizes`, `params`, `op_names`, `op_ids`, `env` | as today (`allocator.py:3369-3391`), with `env.solver` the family's `FAMILIES` key and `env.allocator` `"plan_allocation"` |
 
 Not verified: SA's `ViewRelation` holds no pair list, and a generated tiling can lie outside the
 menu, so whether `matches` and `chosen` reproduce today's under `AUTO_COARSE_TILING=1` on SA is
@@ -514,13 +522,13 @@ hashed, and every user recompiles once more when this PR lands.
 | `torch_spyre/_inductor/scratchpad/allocator.py` | Extract `push_one_placement`, `commit_chosen_divisions`, `check_priced_footprint`, `accepted_lx_views`, `collective_output_stages`. No behaviour change. |
 | `torch_spyre/_inductor/scratchpad/coarse_tiling.py` | Extract `apply_tiling_choices`, `splits_from_divisions`. No behaviour change. |
 | `torch_spyre/_inductor/scratchpad/plan_solver.py` | Extract `cost_record`. No behaviour change. |
-| `.../lx_allocator/optimizer.py` | Real `commit`; `optimize` keeps `self._solved`; bridge call and reduced cost line deleted. |
+| `.../lx_allocator/optimizer.py` | Real `commit(graph)`, called by `plan_allocation` after `optimize`; `optimize` calls `write_cost_dump`; bridge call and reduced cost line deleted. |
 | `.../lx_allocator/optimizer_bridge.py`, `tests/inductor/test_optimizer_bridge.py`, `tests/configs/torch_spyre_tests/inductor/test_optimizer_bridge_config.yaml` | Deleted. |
-| `.../lx_allocator/family/base.py`, `family/ortools_encoder.py`, `family/sa/`, `family/placement.py` | `DumpTables`, `Encoder.dump_tables`, `Solution.score_ns`, `.off_expression_ns`. |
+| `.../lx_allocator/family/base.py`, `family/ortools_encode.py`, `family/sa/`, `family/placement.py` | `DumpTables`, `Family.dump_tables` with `OrToolsFamily.dump_tables` and `SAFamily.dump_tables`, `Solution.score_ns`, `.off_expression_ns`. |
 | `optimizer_pass_sources()` (Stage 9) | Adds `lower_commit`. |
 | `tests/inductor/lx_equivalence.py`, `lx_corpus.py` | New record fields, `SCHEMA_VERSION`, `compile_model(stop_at="codegen")`, the commit hook, `commit_shadow`, all under "Parity and gates". |
 | `tests/inductor/test_lx_commit.py`, `test_lx_commit_e2e.py` | New host tests, new device tests. |
-| `docs/source/compiler/scratchpad_planning.md` | Name `SpyreOptimizer.commit` beside `_push_allocation` at `:308`. |
+| `docs/source/compiler/scratchpad_planning.md` | Name `commit(graph)` beside `_push_allocation` at `:308`. |
 
 Commits, each leaving the suites green:
 
@@ -534,8 +542,9 @@ Commits, each leaving the suites green:
 4. **Add `lower_commit` and `verify_copy_outs`** with host tests, plus `commit_shadow`, which
    drives them from the old allocators. This is how the new code runs before production calls it.
 5. **Add `dump_tables`, `graph_bindings` and `write_cost_dump`** with host tests, still uncalled.
-6. **Switch `SpyreOptimizer.commit`, delete the bridge,** and add the post passes, the dump, the
-   `optimizer_pass_sources()` entry, the commit hook, the guard, device tests and the doc note.
+6. **Switch `plan_allocation` to `commit(graph)`, delete the bridge,** and add the post passes, the
+   dump, the `optimizer_pass_sources()` entry, the commit hook, the guard, device tests and the doc
+   note.
 
 ## Interfaces
 
@@ -543,36 +552,37 @@ Commits, each leaving the suites green:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| `SpyreOptimizationGraph` | `.ir: GraphLowering \| None`, `.alignment`, `.capacity`, `.divisions_committed`, `.drain_plans`, `.nodes`, `.data_edges`, `.node(name)`, `.steps()` | 1, filled by 2 | walking the plan; `commit(graph)` reaches the IR only through `.ir` |
+| `SpyreOptimizationGraph` | `.ir: GraphLowering \| None`, `.target`, `.divisions_committed`, `.drain_plans`, `.nodes` (op order), `.data_edges`, `.cuts: set[int]`, `.node(name)`, `.all_steps()` | 1, filled by 2, 7, 8 | walking the plan; `commit(graph)` reaches the IR only through `.ir` |
+| `Target` | `graph.target.alignment`, `.lx_bytes`, `.steps: frozenset[StepKind]`, `.cost_model` | 1, cost model from 4 | unit scaling, staging capacity, step kinds offered, cost dump |
 | `OpNode` | `.name`, `.op`, `.size` (total bytes), `.graph_output`, `.work_split`, `.resident`, `.offset` (alignment units), `.spill_reason` | 1, filled by 2, 7, 8 | placements, spans, reasons |
 | `InputNode.prefetch_view` | `PerCoreView \| None`; `work_split` stays `None` on inputs | 1, filled by 7, 8 | LX prefetches |
 | `WorkSplit` | `.splits`, `.tiling: tuple[TileLevel, ...]`, `.output_partition`, `.output_tile_count` | 1 | spans |
 | `division_from_work_split`, `tile_spec_of` | `(node, split) -> CoreDivision`, `(node, split) -> TileSpec` | 2 | `.reduction_syms`, `.label`, `CommitPlan.tilings` |
-| `DataEdge` | `.src`, `.dst`, `.in_place`, `.transforms` in physical list order | 1, filled by 2, 7, 8 | steps, in-place |
-| `Transform` | `.resident`, `.offset`, `.footprint` (alignment units), `.pinned`, `.edges` | 1, filled by 7, 8 | steps |
-| `Restickify`, `RestickifyNode` | `Restickify(to_stick, pinned=True, realized_by=node)`, with no footprint or box; a direct `OpNode` subclass, decoded as any node | 1, filled by 2 | pinned restickifies |
-| `Relayout` | `.to_view`, `.reduction_split`, `.source_view`, `.source_footprint_bytes`, `.destination_footprint_bytes` | 1, filled by 3, 7, 8 | the plan |
+| `DataEdge` | `.src`, `.dst`, `.in_place`, `.steps: list[Step]` in physical list order | 1, filled by 2, 7, 8 | steps, in-place |
+| `Step`, `StepKind`, `STEP_KINDS` | `Step(kind=..., ...)`: `.kind`, `.resident`, `.offset`, `.footprint` (alignment units), `.pinned`, `.edges`; `StepKind.COPY_OUT`, `.RESTICKIFY`, `.RELAYOUT` | 1, filled by 7, 8 | steps |
+| `RESTICKIFY` step, `RestickifyNode` | `Step(kind=StepKind.RESTICKIFY, to_stick=..., pinned=True, realized_by=node)`, with no footprint or box; a direct `OpNode` subclass, decoded as any node | 1, filled by 2 | pinned restickifies |
+| `RELAYOUT` step | `.to_view`, `.reduction_split`, `.source_view`, `.source_footprint_bytes`, `.destination_footprint_bytes` | 1, filled by 3, 7, 8 | the plan |
 | `no_overlap`, `RuleViolation` | `(graph) -> list[Violation]`, `RuleViolation(violations)` | 3 | step 6, failures |
-| `build_graph`, `decode_todays_plan` | `(ir, *, capacity, alignment, divisions_committed, drain_plans, lx_relayout_plans)`; `(graph, allocation, accepted_relayouts) -> list[Mismatch]`, temporary, removed in Stage 13 | 2, 3 | `commit_shadow` |
+| `build_graph`, `select_target`, `decode_todays_plan` | `(ir, target, *, divisions_committed, drain_plans, lx_relayout_plans)`; `(config) -> Target`; `(graph, allocation, accepted_relayouts) -> list[Mismatch]`, temporary, removed in Stage 13 | 2, 3 | `commit_shadow` |
 | `CostModel.bundle_terms`, `.params`; `CostDomains`, `NodeDomain`, `Sym`, `SplitKeyedCharge` | `(graph, domains) -> list[tuple[list[str], sympy.Expr]]`; as Stage 4 | 4 | cost dump |
 | `_loop_carry_update_edge` | moved to `family/edge_tables.py` | 6 | `check_drain_committed` |
-| `read_back` | offsets in alignment units; both ends of an in-place pair; one shared `Relayout` per group; `OpNode.spill_reason` | 7, 8 | the plan |
+| `Family.read_back` | `read_back(solution, graph) -> None`: offsets in alignment units; both ends of an in-place pair; one shared `RELAYOUT` step per group; `graph.cuts`; `OpNode.spill_reason` | 7, 8 | the plan |
+| `Family`, `Encoding`, `FAMILIES`; `OrToolsFamily`, `SAFamily` | Stage 7's protocol, which this stage extends with `dump_tables`: `from_config(config)`, `encode(graph) -> Encoding`, `solve(encoding, settings) -> Solution`; `Encoding.model`, `.ortools` (`OrToolsState.tables`, `.edges`); `AnnealModel.menus`, `.relations`; `FAMILIES: Mapping[str, type[Family]]` | 5, 6, 7, 8 | `dump_tables`, cost dump |
 | `Solution`, `AnnealSolution` | `.offsets` by `PlacementKey`, resident sites only; `.stats`; `score_ns()`, `off_expression_ns()` on `AnnealSolution` | 7, 8 | cost dump |
-| `SpyreOptimizer.optimize` | calls `commit` after `check_decisions` and outside the fallback flow; private `_Solved(key, encoder, model, solution)` | 9 | failure semantics, cost dump |
-| `SpyreOptimizer.post_optimization_passes` | `list[ScratchpadOptimizationPass]` | 9 | `commit` runs them |
+| `plan_allocation`, `optimize` | `plan_allocation(ir, config) -> SpyreOptimizationGraph`; `optimize(graph, family, fallback, settings)`: `check_decisions` raises before return, and nothing is read back after a proven-infeasible solve | 9 | `plan_allocation` calls `commit` after `optimize`, outside the fallback flow; `optimize` writes the cost dump |
+| `_context_switching_passes` | `() -> list[ScratchpadOptimizationPass]`, the same for every family | 9 | `commit` runs them |
 | `optimizer_pass_sources()` | planner sources in the FX key | 9 | adds `lower_commit` |
-| `records_from_graph`, `_CommitBridge`, `SpyreOptimizer._commit_via_bridge` | temporary; records in `_build_cd_bound_buffers` order, inputs first | 9 | G2's base, then deleted here |
+| `records_from_graph`, `_CommitBridge`, `_commit_via_bridge` | temporary; records in `_build_cd_bound_buffers` order, inputs first | 9 | G2's base, then deleted here |
 | harness | `lx_gate.sh`, `Recorder.record_commit`, `snapshot_commit`, `OPTIONAL_TARGETS`, `compile_model`, `corpus_coverage`, `SCHEMA_VERSION` | 0 | gates, extended below |
 
 ### Provides
 
 | symbol | signature | for Stages | stability |
 |---|---|---|---|
-| `SpyreOptimizer.commit` | `commit(graph) -> None`, runs `post_optimization_passes` after `lower_commit` | 11, 12, 13 | final |
-| `SpyreOptimizer.last_commit` | `CommitResult \| None` | this PR's harness hook | final |
-| `read_commit_plan`, `lower_commit`, `CommitPlan`, `CommitResult`, `CollectiveStage`; `relayout_plans` | as in Design; `(graph) -> tuple[LXRelayoutPlan, ...]` | 11 | final |
-| `write_cost_dump`, the `cost_expr_record` writer | as in Design; today's schema | 12, 13 | final |
-| `cost_record`, `DumpTables`, `Encoder.dump_tables` | as in Design | none | final |
+| `commit` | `commit(graph) -> None`, runs `_context_switching_passes()` after `lower_commit` | 11, 12, 13 | final |
+| `read_commit_plan`, `lower_commit`, `CommitPlan`, `CommitResult`, `CollectiveStage`; `relayout_plans` | as in Design; `lower_commit` returns the `CommitResult` the harness hook reads; `(graph) -> tuple[LXRelayoutPlan, ...]` | 11 | final |
+| `write_cost_dump`, the `cost_expr_record` writer | `(graph, family, encoding, solution) -> None`; today's schema | 12, 13 | final |
+| `cost_record`, `DumpTables`, `Family.dump_tables` | as in Design; `dump_tables(encoding, solution) -> DumpTables`, which extends Stage 7's `Family` protocol; `OrToolsFamily` and `SAFamily` implement it | 12, 13 (every family `FAMILIES` holds) | final |
 | `push_one_placement`, `commit_chosen_divisions`, `check_priced_footprint`, `accepted_lx_views`, `collective_output_stages`; `apply_tiling_choices`, `splits_from_divisions` | as in Design | 13 | final; they stay in `allocator.py` and `coarse_tiling.py` |
 
 For Stage 13: `commit.py` imports these from `allocator.py`, so they stay there: the five functions
@@ -590,11 +600,11 @@ real IR of `tests/inductor/test_scratchpad_use.py:106`.
 | test | asserts |
 |---|---|
 | `test_read_plan_makes_no_ir_edit` | Operations, FX and layouts are unchanged after `read_commit_plan`. |
-| `test_read_plan_rejects_unpinned_restickify`, `..._transpose`, `..._pinned_relayout`, `..._relayout_after_restickify`, `..._in_place_offset_mismatch`, `..._spilled_end`, `..._resident_copy_out`, `..._missing_pinned_op`, `..._input_without_prefetch_view` | `RuleViolation` naming the subject. |
-| `test_read_plan_scales_units` | `placements` and plan addresses are `offset * graph.alignment`; plan footprints are the unrounded byte fields. |
+| `test_read_plan_rejects_unpinned_restickify`, `..._step_kind_off_target`, `..._pinned_relayout`, `..._relayout_after_restickify`, `..._in_place_offset_mismatch`, `..._spilled_end`, `..._resident_copy_out`, `..._missing_pinned_op`, `..._input_without_prefetch_view` | `RuleViolation` naming the subject. |
+| `test_read_plan_scales_units` | `placements` and plan addresses are `offset * graph.target.alignment`, also on a derived target with another alignment; plan footprints are the unrounded byte fields. |
 | `test_order_is_inputs_first_in_co_opt`, `test_order_is_inputs_last_when_committed` | `plan.order` matches each allocator's record order. |
-| `test_shared_relayout_is_one_plan`, `test_two_views_are_two_plans` | Two edges, one instance: one plan, consumers sorted by name. One source, two views: two plans. |
-| `test_relayout_group_disagreement_raises` | Two instances of one source and view raise. |
+| `test_shared_relayout_is_one_plan`, `test_two_views_are_two_plans` | Two edges, one `RELAYOUT` step: one plan, consumers sorted by name. One source, two views: two plans. |
+| `test_relayout_group_disagreement_raises` | Two `RELAYOUT` steps of one source and view raise. |
 | `test_relayout_before_pinned_restickify_feeds_the_restickify`, `test_relayout_of_restickify_output_reads_the_restickify` | Plan consumer is the `RestickifyNode`; on an edge out of it, plan source is. |
 | `test_completed_route_sets_producer_cores` | `reduction_split > 1` yields the same cores as `derive_completed_reduction_routes`. |
 | `test_pinned_restickify_is_not_reinserted`, `..._shared_by_two_edges_commits_once`, `..._takes_division_and_address` | No op is added. One node, one division, one address, landing on the existing op. |
@@ -608,11 +618,11 @@ real IR of `tests/inductor/test_scratchpad_use.py:106`.
 | `test_staged_overlap_raises_before_placement` | An overlapping stage raises `RuleViolation` at step 6, and no placement runs. |
 | `test_spill_reason_reads_the_node`, `test_spill_reason_added_by_tiling` | The rule in Design, a staged node has none, and clones do not appear. |
 | `test_relayouts_materialize_after_placements` | `materialize_lx_relayouts` receives a source that already has its address and view. |
-| `test_verify_copy_outs_rejects_missing_copy`, `..._ignores_graph_output_copy` | `RuleViolation`; a producer with no `CopyOut` step is skipped. |
+| `test_verify_copy_outs_rejects_missing_copy`, `..._ignores_graph_output_copy` | `RuleViolation`; a producer with no `COPY_OUT` step is skipped. |
 | `test_commit_runs_post_passes_after_lower` | A recording pass sees the lowered IR, once, on every family. A graph with `ir=None` returns early. |
 | `test_optimizer_reads_no_solver_records` | `lx_allocator/optimizer.py` and `commit.py` do not mention `LifetimeBoundBuffer`, `CoreDivisionBuffer`, `_push_allocation` or `_post_solve`. |
 | `test_commit_module_is_in_pass_sources` | `lower_commit` is in `optimizer_pass_sources()`, so `commit.py` is hashed. |
-| `test_cost_dump_terms_evaluate`, `test_cost_dump_is_written_before_lowering`, `test_no_cost_dump_without_priced_expression` | No `value_ns` is `None` under `graph_bindings`, relayout charges included. The line precedes every IR edit. No expression, no line. |
+| `test_cost_dump_terms_evaluate`, `test_cost_dump_is_written_before_lowering`, `test_no_cost_dump_without_priced_expression` | No `value_ns` is `None` under `graph_bindings`, relayout charges included. `optimize` writes the line before `plan_allocation` calls `commit`, so it precedes every IR edit. No expression, no line. |
 
 `tests/inductor/test_lx_commit_e2e.py`, device, each with the new family selected and values
 checked against CPU: `test_copy_out_one_per_producer` (one `coarse_tile_copy_*` for three outside
@@ -630,8 +640,8 @@ The parent's claim for this stage is proven by G1 and G2 below, not by the unit 
 
 ## Parity and gates
 
-The parent says: "`SpyreOptimizer.commit` inserts each edge's steps in canonical order (pinned
-steps already exist), then commits divisions and offsets through `GraphEditor`. This replaces
+The parent says: "`commit(graph)` inserts each edge's steps in canonical order (pinned steps
+already exist), then commits divisions and offsets through `GraphEditor`. This replaces
 `_push_allocation`," "`LxContextSwitchingPass` runs after commit, unchanged," and under
 Verification, "comparing proto, decisions and committed plans between the stage's parent and the
 change." Stage 0 records "inserted clones, relayout ops, addresses, divisions and spill reasons."
@@ -655,9 +665,9 @@ record is taken at two points:
   `CustomPreSchedulingPasses.__call__`, so commit 2 adds `compile_model(stop_at="codegen")`. No run
   has shown a `fake` compile reaching codegen. A model that does not gets P2 on the card only.
 
-The commit hook moves from `_push_allocation` to `SpyreOptimizer.commit` by wrapping the
-`lower_commit` it calls, so the `CommitRecord` snapshot stays before the post passes, where the old
-hook takes it. It calls `snapshot_commit` with `allocator="SpyreOptimizer"` and
+The commit hook moves from `_push_allocation` to `commit(graph)` by wrapping the `lower_commit` it
+calls, so the `CommitRecord` snapshot stays before the post passes, where the old hook takes it. It
+calls `snapshot_commit` with `allocator="plan_allocation"` and
 `spill_reasons=result.spill_reasons`, and its target joins `OPTIONAL_TARGETS`, because the base has
 no `commit`. The `_push_allocation` hook stays for the old path.
 
@@ -727,7 +737,7 @@ Anything else blocks the merge.
 | A staged output overlaps a live box. | Step 6 raises before any address lands. `test_staged_overlap_raises_before_placement`. |
 | Not verified: `live_boxes` may measure a staged node larger than the `partition_footprint` its gap was found with, so step 6 raises on a good plan; and a resident input's span from `prefetch_view` may differ from its prefetch division's `per_core_size`, which feeds only staging's gap search. | G1 and G2 on models with staging. |
 | The post passes are lost with the bridge. | `test_commit_runs_post_passes_after_lower`; `test_context_switching_after_commit`; P1. |
-| Failure after tilings is treated as recoverable. | `optimize` contract in Consumes; a test that `Unsupported` from step 4 propagates. |
+| Failure after tilings is treated as recoverable. | `plan_allocation` contract in Consumes; a test that `Unsupported` from step 4 propagates. |
 | #5695 lands first and adds deferred divisions. | It changes `commit_divisions`, which this stage extracts, so both paths inherit it. Rebase, re-record. It also adds "after the solve, for ops the solve committed no split to", which belongs in `commit_chosen_divisions`. |
 | `scratchpad_planning` runs under `_flat_operations` (`passes.py:447`), so `graph.operations` may be an `OpsView`, where a rebind raises (`passes.py:472`). | Only the editor's and `coarse_tile`'s existing index, insert and remove calls are used. `tests/inductor` loop-node tests in the suites. |
 | The FX cache reuses stale compiles after a commit change. | `test_commit_module_is_in_pass_sources`. |
@@ -740,30 +750,37 @@ Anything else blocks the merge.
    divisions next, offsets and clones after them (clones copy `work_slices`,
    `graph_editor.py:285-290`), and relayouts last (`lx_relayout.py:2076-2081` raises unless the
    address is already committed). Resolution: the ten-step order in Design.
-2. **`CopyOut` cannot be inserted per edge or through `GraphEditor`.** `apply_tilings` takes specs
-   only, and `_plan_tiling_propagation` decides copy-outs itself, per producer
-   (`wsr/coarse_tile.py:590`). Resolution: lower tilings, then verify the `CopyOut` steps against
+2. **A `COPY_OUT` step cannot be inserted per edge or through `GraphEditor`.** `apply_tilings`
+   takes specs only, and `_plan_tiling_propagation` decides copy-outs itself, per producer
+   (`wsr/coarse_tile.py:590`). Resolution: lower tilings, then verify the `COPY_OUT` steps against
    `propagation.kind`. Accumulator, fill and combine ops have no step and need none.
 3. **There is no canonical order.** The plan says commit inserts steps in canonical order, and
-   `Relayout.ORDER = 2` follows `Restickify.ORDER = 1`. A relayout feeding a restickify is legal
-   (`allocator.py:1513-1521`), though the only evidence for it is a mocked test. Resolution: list
-   order of `DataEdge.transforms` is authoritative and physical, and commit sorts nothing.
+   `STEP_KINDS[StepKind.RELAYOUT].order` (2) follows `STEP_KINDS[StepKind.RESTICKIFY].order` (1).
+   A relayout feeding a restickify is legal (`allocator.py:1513-1521`), though the only evidence
+   for it is a mocked test. Resolution: list order of `DataEdge.steps` is authoritative and
+   physical, and commit sorts nothing.
 4. **Commit replaces more than `_push_allocation`.** It also replaces
    `_finalize_lx_relayout_allocation`, all of `_post_solve` and `_get_spill_reasons`. That includes
    `_stage_collective_outputs`, a post-solve residency change the plan does not mention. Resolution:
-   port it unchanged, run it after `check_decisions` as a named exception, and judge `NO_OVERLAP`
-   again at step 6.
+   port it unchanged, run it after `check_decisions` as a named exception, and judge `boxes_fit_lx`
+   again at step 6, through `no_overlap(graph)`.
 5. **`_push_allocation` is not deleted here.** The default stays on the old allocators until
    Stage 12, and Stage 13's list covers it only through their classes. Resolution: "replaces" holds
    on the new path. Stage 13 deletes the wrappers.
-6. **Unpinned `Restickify` is not lowered in Stage 10.** The plan implies it. Stick pins make it
-   unreachable and any lowering untestable. Resolution: raise. Stage 11b changes the raise, and no
-   stub is left behind.
+6. **An unpinned `RESTICKIFY` step is not lowered in Stage 10.** The plan implies it. Stick pins
+   make it unreachable and any lowering untestable. Resolution: raise. Stage 11b changes the raise,
+   and no stub is left behind.
 7. **"`LxContextSwitchingPass` runs after commit, unchanged"** changes behaviour for SA, which has
    no post passes today (`allocator.py:5433-5435`). This is a real bug on main, reachable only with
    `LAYOUT_SOLVER=simulated_annealing`, and this plan assumes no upstream fix. Resolution: `commit`
    runs the pass for every family. SA plans gain brackets where a buffer straddles a risky extern
    kernel, which is a correctness gain and a listed parity exception.
+8. **`Family` gains `dump_tables(encoding, solution)`.** The parent's protocol has only `encode`,
+   `solve` and `read_back`, and `commit(graph)` sees neither the family nor its `Encoding`. The
+   full `cost_expr_record` needs the family's menus and its chosen entries, which only the family
+   can read out of its own native model. Resolution: the protocol gains the method, and `optimize`,
+   which holds the accepted family, `Encoding` and `Solution`, writes the dump before it returns.
+   A family whose tables carry `cost_expr=None` writes no line.
 
 ## Open questions
 
