@@ -1,6 +1,6 @@
 # LX allocator, Stage 13: Deletions
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0-10 and 12. Needed by: none (Phase 3 exit). Stage 11 may land before or
 after this stage: nothing here needs it, and nothing deleted here is something it needs.
 
@@ -10,13 +10,13 @@ snapshot. Where a line may have moved by Stage 13, the symbol name is the refere
 
 ## Goal
 
-When this PR merges, `scratchpad_planning` has one path: `SpyreOptimizer`, with the `ortools`
-or `sa` family. The old allocator classes, the solver base classes, the five placement
-solvers, `CpSatLayoutSolver`, `SaCoOptimizingSolver` and the greedy re-plan are gone, along
-with the side-by-side machinery, every temporary item earlier stages left for this stage, and
-config values, tests and docs that only served them. Family plans do not change: the Stage 0
-harness shows an empty diff on family cells between Stage 12's head and every commit here,
-C12's gated change aside.
+When this PR merges, `scratchpad_planning` has one path: `plan_allocation`, with the `ortools`
+or `sa` family. The old allocator classes, whose role `plan_allocation` takes over, the solver
+base classes, the five placement solvers, `CpSatLayoutSolver`, `SaCoOptimizingSolver` and the
+greedy re-plan are gone, along with the side-by-side machinery, every temporary item earlier
+stages left for this stage, and config values, tests and docs that only served them. Family
+plans do not change: the Stage 0 harness shows an empty diff on family cells between Stage 12's
+head and every commit here, C12's gated change aside.
 
 Stays unchanged: the beam, `_distribute_work`, `span_reduction`, `LX_PLANNING=0`,
 `elide_proven_read_copies`, `LxContextSwitchingPass`, the native packer, and sticks pinned
@@ -72,7 +72,7 @@ with `ScratchpadAllocator(GreedyLayoutSolver, ...)` (`scratchpad/allocator.py:54
 
 The PR does not open until all of these hold. The audit in step C0 checks each one.
 
-- Stage 12's rollout step 6 holds. That includes `lx_fallback_family` non-empty and
+- Stage 12's rollout step 6 holds. That includes `fallback_solver` non-empty and
   `lx_solver_completed_reduction_routes` on by default, the condition C12 rests on.
 - No code under `torch_spyre/` outside the deleted set constructs an old class, except
   through the seams in the table below.
@@ -87,7 +87,7 @@ Stage 11 is not a condition. `lx_sticks_in_solve` may hold either value, or not 
 | symbol | defined | prod importers and callers | docs and tools | after deletion |
 |---|---|---|---|---|
 | `ScratchpadAllocator` | `scratchpad/allocator.py:951` | `allocator.py:796` (field type), `:3085` (base), `:5377`, `:5465`, `:5474`, `:5511`; docstrings `lx_context_switching.py:363`, `pass_utils.py:4191`, `config.py:347` | `scratchpad_planning.md`, `co_optimizer.md`, `api/torch_spyre.rst`, `allocator-architecture.svg` | Pipeline gone; residency methods go to `LxRecordBuilder`. `_BufferResidencyChecks.allocator` retyped. Docstrings rewritten. |
-| `CoOptimizingAllocator` | `allocator.py:3085` | `allocator.py:750`, `:5433`, `:5451`, `:5459`; string in `residency_rules.py:357`; docstrings `exhaustive_search.py:48,166`, `plan_solver.py:264,775`, `sa_cooptimizer.py:770` | `user_guide/examples/profile_ops.py:893-911` | As above. `:750` calls Stage 6's `_loop_carry_update_edge`. The certificate string changes in C2. `profile_ops.py` keeps Stage 12's `select_optimizer()` and drops the allocator branch. |
+| `CoOptimizingAllocator` | `allocator.py:3085` | `allocator.py:750`, `:5433`, `:5451`, `:5459`; string in `residency_rules.py:357`; docstrings `exhaustive_search.py:48,166`, `plan_solver.py:264,775`, `sa_cooptimizer.py:770` | `user_guide/examples/profile_ops.py:893-911` | As above. `:750` calls Stage 6's `_loop_carry_update_edge`. The certificate string changes in C2. `profile_ops.py` keeps Stage 12's `family_key(config)` and drops the allocator branch. |
 | `MemoryPlanSolver` | `plan_solver.py:970` | Bases: `greedy_solver.py:31`, `firstfit_bestfit_solver.py:82`, `simulated_annealing.py:104`; typing: `simulated_annealing.py:70,99`, `allocator.py:960,990,1007,1090,3218,5345,5369` | `simulated_annealing_layout.md` | Gone last, when every subclass has gone. `excluded`, `record_exclusions` and `partition` stay in behaviour through `first_fit_place` only. |
 | `CoreDivisionLayoutSolver` | `plan_solver.py:1156` | Bases: `exhaustive_search.py:34`, `ilp_solver_ortools.py:623`, `sa_cooptimizer.py:686`; `allocator.py:3088,3117,3219,5460` | `co_optimizer.md` | Gone with `MemoryPlanSolver`. |
 | `CpSatLayoutSolver` | `ilp_solver_ortools.py:623` | `allocator.py:5354-5357` only | `scratchpad_planning.md`, `co_optimizer.md` | File `ilp_solver_ortools.py` deleted, helpers included (below). |
@@ -97,7 +97,7 @@ Stage 11 is not a condition. `lx_sticks_in_solve` may hold either value, or not 
 | `ExhaustiveSearchSolver` | `exhaustive_search.py:34` | `allocator.py:97,5452`; comment `sa_cooptimizer.py:1274` | `scratchpad_planning.md`, `api/torch_spyre.rst:756` | File deleted, with `prune` and `allow_exhaustive_search`. |
 | `SimulatedAnnealingLayoutSolver` | `simulated_annealing.py:104` | `allocator.py:94,5373` | `simulated_annealing_layout.md`, three examples | File deleted after `SolverToPermutation` moves. |
 | `SaCoOptimizingSolver` | `sa_cooptimizer.py:686` | `allocator.py:99,5434` | `sa_co_optimization.md` | File deleted (below). |
-| `SolveError` re-plan | `allocator.py:5495-5515` | Class `plan_solver.py:43`, raised `ilp_solver_ortools.py:872,1436` and by Stage 9's `select_optimizer` and `_fall_back`, doc `config.py:382`, docstring `allocator.py:2904` | `scratchpad_planning.md` | Handler, raises and class gone (see "`scratchpad_planning` after"). |
+| `SolveError` re-plan | `allocator.py:5495-5515` | Class `plan_solver.py:43`, raised `ilp_solver_ortools.py:872,1436` and by Stage 9's `select_families` and `_fall_back`, doc `config.py:382`, docstring `allocator.py:2904` | `scratchpad_planning.md` | Handler, raises and class gone (see "`scratchpad_planning` after"). |
 | `_matmul_layouts` | `propagate_layouts.py:1464` | `:2320`, `:3175` | `coarse_tiling_loops.md:1312` | **Stays** (D1). |
 | `_multi_arg_pointwise_layouts` | `propagate_layouts.py:1896` | `:2314`, `:3212`; comments `constants.py:94`, `lowering.py:2203` | `coarse_tiling_loops.md`, `indirect_access.md:250` | **Stays** (D1). |
 | `_check_stick_all_same` | `op_spec_validation.py:675` | `:672`, from `_check_stick_constraints`, run at `spyre_kernel.py:1485` | none | **Stays** (D1). |
@@ -120,7 +120,7 @@ Groups are from an AST call graph of `allocator.py`.
 | Residency | `_residency_by_buf`, `_residency_reasons`, `_buffer_residency_reason`, `_input_residency_reason`, `_op_output_good_for_lx_reuse`, `_is_index_or_indirectly_accessed`, `_untiled_residency_bar`, `_read_count`, `_get_op_name` | Move verbatim to `LxRecordBuilder` in C2. This is the closure of `_BufferResidencyChecks`' calls, from an AST walk (D2). |
 | Moved by Stages 2, 5, 6 | `_inplace_edge_ok`, `_op_inputs_good_for_lx_inplace`, `_enumerate_core_divisions`, `_tiling_candidates`, `_clone_divisions_and_matches`, `_cd_parent_relayouts`, `_cap_relayout_groups`, `_relayout_consumer_costs`, `_intern_view_group`, `_coarse_tile_loop_trip_count`, `_views_for_divs`, `_parent_residency_edges`, `_cd_parent_matches`, `_loop_carry_update_edge`, `_loop_carry_read_edges`, `_determine_in_place_division_invariant`, `_restickify_barrier`, `_restickify_read_is_core_local` | One-line delegates since those stages. Deleted with the class in C8, and callers use the moved function. |
 | Record prep | `_prepare_buffers` (joint), `_division_map`, `_seed_aligned_division`, `_build_cd_bound_buffers`, `_division_space`, `_tile_reads`, `_eligible_clone_inputs`, `_relayout_copy_buffers`, `_direct_read_candidates_priced`, `_pricing_operations`, `_extract_op_features` | Deleted in C8. The new path has its own form through Stages 2, 4, 5 and 6. A method C0 shows `graph_builder`, `rules`, `edge_tables` or `commit` still calling becomes a module function in `allocator.py` first. |
-| Commit | `_push_allocation`, `_set_one_allocation`, joint `_finalize_lx_relayout_allocation`, `_post_solve`, `_stage_collective_outputs` | Replaced by `SpyreOptimizer.commit`. Stage 10 left these as wrappers, deleted in C8. `_stage_collective_outputs` is not in the parent plan (D8). |
+| Commit | `_push_allocation`, `_set_one_allocation`, joint `_finalize_lx_relayout_allocation`, `_post_solve`, `_stage_collective_outputs` | Replaced by Stage 10's `commit(graph)`. Stage 10 left these as wrappers, deleted in C8. `_stage_collective_outputs` is not in the parent plan (D8). |
 | Reporting | `_get_spill_reasons`, `_log_lx_pinning` | Stage 10 keeps the log output, because a debug log that names no spill reason is a silent loss. |
 
 Module-level helpers stay in `allocator.py` under their names: `_lx_planning_size`
@@ -293,12 +293,12 @@ plan, so the gate is exact.
 
 **When ortools is missing.** The arch marker at `pyproject.toml:40` and `:59` stays.
 `cpsat_expr_printer.py:40-46` and Stage 7's `family/ortools_family.py` guard the import, so
-importing `FACTORIES` never fails. `select_optimizer` promotes the fallback family with one
+importing `FAMILIES` never fails. `select_families` promotes the fallback family with one
 warning, which also removes the `ValueError` default compiles hit today.
 
 **The debug greedy from PR #5 stays possible.** It needs a family slot, a plan with no solve,
 and the same check. `_distribute_work` gives every op a division with no solve, Stage 7's
-`Packer` packs plain ints, `FACTORIES` stays open, `check_decisions` is independent of the family,
+`Packer` packs plain ints, `FAMILIES` stays open, `check_decisions` is independent of the family,
 no gate fails a family with an empty `ENCODES`, and `scratchpad_planning` names no family. The
 value `"greedy"` is free for that family to take later.
 
@@ -308,13 +308,13 @@ value `"greedy"` is free for that family to take later.
 def scratchpad_planning(graph: GraphLowering) -> None:
     """Plan and commit LX placement for a lowered graph."""
     # Imported locally: commit.py, which optimizer.py imports, imports this module.
-    from torch_spyre._inductor.scratchpad.lx_allocator.optimizer import select_optimizer
+    from torch_spyre._inductor.scratchpad.lx_allocator.optimizer import plan_allocation
 
-    select_optimizer().plan_allocation(graph)
+    plan_allocation(graph, config)
 ```
 
 ```python
-@_runs(anchor_lx_relayout_ownership, scratchpad_planning, SpyreOptimizer,
+@_runs(anchor_lx_relayout_ownership, scratchpad_planning, plan_allocation,
        *optimizer_pass_sources())
 def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     if not config.lx_planning:
@@ -329,15 +329,16 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
 and `ilp_solver_ortools` from it, and C0 checks that it names nothing else this stage deletes.
 Each commit changes hashed sources, so each moves the key.
 
-`select_optimizer()` stops returning `None`, because no old path remains. It raises `ValueError`
-on an empty `lx_fallback_family`, before any solve, so `fallback` is `None` only on a promoted
-family. `SolveError` goes from its body and from `_fall_back`, whose two raises become
-`RuntimeError`: Stage 9's step 1 names the status, and step 4 names both statuses. `INFEASIBLE` from
-the fallback still reaches `_return_infeasible`. SA reports `FEASIBLE` on every solve, so on the
-default configuration either raise is a bug. A non-SA fallback with no plan raises too, because no
-re-plan remains. With Stage 11 landed, `plan_sticks` loses its `SolveError` branch in C4.
+`family_key(config)` stops returning `None`, because no old path remains. `select_families`
+raises `ValueError` on an empty `fallback_solver`, before any solve, so `fallback` is `None` only
+on a promoted family. `SolveError` goes from its body and from `_fall_back`, whose two raises
+become `RuntimeError`: Stage 9's step 1 names the status, and step 4 names both statuses.
+`INFEASIBLE` from the fallback still reaches `_return_infeasible`. SA reports `FEASIBLE` on
+every solve, so on the default configuration either raise is a bug. A non-SA fallback with no
+plan raises too, because no re-plan remains. With Stage 11 landed, `plan_sticks` loses its
+`SolveError` branch in C4.
 
-`LxContextSwitchingPass` runs inside `SpyreOptimizer.commit` for both families (surprise 2,
+`LxContextSwitchingPass` runs inside `commit(graph)` for both families (surprise 2,
 Consumes). Its import of `ScratchpadOptimizationPass` from `allocator.py` stays, and the
 local-import comment at `allocator.py:5421` goes with `select_allocator`.
 
@@ -345,11 +346,11 @@ local-import comment at `allocator.py:5421` goes with `select_allocator`.
 
 | value | readers after this stage | action |
 |---|---|---|
-| `layout_solver` | `select_optimizer`, `tools/cost_model/run_decode_matmul_sweep.py:165`, `tools/lx_planning/lx_semantic_plan.py:234` | `Literal["ortools", "sa"]`, as below. Rewrite the comment at `config.py:347-363`. |
+| `layout_solver` | `family_key`, `tools/cost_model/run_decode_matmul_sweep.py:165`, `tools/lx_planning/lx_semantic_plan.py:234` | `Literal["ortools", "sa"]`, as below. Rewrite the comment at `config.py:347-363`. |
 | `allow_exhaustive_search` | none | Remove (`config.py:369-377`), plus `api/torch_spyre.rst:754-761`. `config.py` warns at import if `ALLOW_EXHAUSTIVE_SEARCH` is set, since a stale variable is otherwise ignored silently. |
-| `co_optimizing_lx_planning` | `select_optimizer`, `materialize_hinted_views.py:135`, `lx_relayout.py:1903` until C12 | Keep. False is committed mode, `graph.divisions_committed`. Comment rewritten. |
-| `cpsat_time_limit_seconds` | `SolveSettings.from_config` | Keep. Fix the "falls back to greedy" text at `config.py:379-384`. |
-| `lx_fallback_family` | `select_optimizer` | Keep, default `sa`. `""` now raises `ValueError`. |
+| `co_optimizing_lx_planning` | `plan_allocation`, `materialize_hinted_views.py:135`, `lx_relayout.py:1903` until C12 | Keep. False is committed mode, `graph.divisions_committed`. Comment rewritten. |
+| `cpsat_time_limit_seconds` | `SolveSettings.from_config(config)` | Keep. Fix the "falls back to greedy" text at `config.py:379-384`. |
+| `fallback_solver` | `select_families` | Keep, default `sa`. `""` now raises `ValueError`. |
 | `lx_solver_completed_reduction_routes` | Stage 6's table | Keep, on. |
 | `lx_sticks_in_solve` | Stage 11, if landed | Untouched. Its final value is Stage 12's 12c. |
 | `lx_route_to_families`, `lx_check_decisions`, `lx_check_file` | none | Remove in C4. |
@@ -371,8 +372,8 @@ layout_solver: Literal["ortools", "sa"] = layout_solver_key(
 )  # type: ignore[assignment]
 ```
 
-The stored value is normalized, so the FX key moves. `select_optimizer` applies the same
-function for a value set by `config.patch`. A key outside `FACTORIES` raises `ValueError` naming
+The stored value is normalized, so the FX key moves. `family_key` applies the same
+function for a value set by `config.patch`. A key outside `FAMILIES` raises `ValueError` naming
 the valid keys, as `allocator.py:5413` does, and `greedy`, `bestfit` and `firstfit` also name the
 default. The map sits in a function because `install_config_module` turns a module-level dict
 into a config entry, which would enter the FX key. One tagged release later a follow-up commit,
@@ -383,7 +384,7 @@ named in this PR, deletes the function, and `cpsat` then raises like any other v
 | file | change |
 |---|---|
 | `torch_spyre/_inductor/scratchpad/allocator.py` | Classes out, `LxRecordBuilder` in, exhaustive chain out, `select_allocator` family out, `scratchpad_planning` rewritten |
-| `lx_allocator/optimizer.py`, `rules.py`, `check.py`, `commit.py`, `family/sa/search.py` | `select_optimizer` and `_fall_back` as above; host; `_parent_residency_edges` call, now Stage 6's moved function; `_loop_carry_update_edge` import; `_seed_permutation` |
+| `lx_allocator/optimizer.py`, `rules.py`, `check.py`, `commit.py`, `family/sa/search.py` | `family_key`, `select_families` and `_fall_back` as above; host; `_parent_residency_edges` call, now Stage 6's moved function; `_loop_carry_update_edge` import; `_seed_permutation` |
 | `lx_allocator/plan_adapter.py` | Deleted |
 | `scratchpad/greedy_solver.py`, `exhaustive_search.py`, `simulated_annealing.py`, `cooling_schedules.py`, `ilp_solver_ortools.py`, `sa_cooptimizer.py` | Deleted |
 | `scratchpad/firstfit_bestfit_solver.py` → `scratchpad/first_fit.py` | Class to functions, best-fit removed |
@@ -413,13 +414,13 @@ because a test importing a deleted name fails at collection. Commits are signed 
 | C1 | Retarget tests pinned to removed values to `ortools` and `sa` (`test_work_division_hint.py:1492,1593,1657,1735,2163`, `test_fallback_kernel.py:441`, the `solver_method` axes at `test_scratchpad_use.py:536,849,1200`). Tests only. Stage 12's soak dispatches this branch before 12b. | Both paths still exist, so any failure is a real gap in Stage 6, not deletion damage. |
 | C2 | Add `LxRecordBuilder`. Move the residency group. Old classes delegate. `rules.py`'s host and `_UNBUILT_SOLVER` test sites move to the builder or the moved functions. `TRANSFER_CERTIFICATES` path in the same commit. | Old classes still work, so the suite is green and the harness diff is empty. |
 | C3 | Extract `first_fit.py`. `FirstFitLayoutSolver` and `SolverToPermutation` become thin wrappers over it. `_seed_permutation` and `collective_output_stages` call functions. | Must precede C6, since `_seed_permutation` needs `SolverToPermutation` until then. |
-| C4 | Remove the C4 rows of "Temporary items" and the `SolveError` handler. Rewrite `scratchpad_planning`, `_maybe_scratchpad_planning`, `select_optimizer` and `_fall_back`, and `solve_decides_work_division()` if #5695 has landed. Delete `select_allocator`, `_cpsat_solver_class`, `_PLACEMENT_SOLVERS`. Narrow `layout_solver`, add `layout_solver_key`, remove `allow_exhaustive_search`. Rewrite or delete `TestSelectAllocator`, `TestSolverCapabilities`, `TestCpsatFallbackWarning`, `TestSolveErrorFallback`, `TestCpSatTimeoutFallback`, `TestCpSatAllocatorFallback` and the old-path rows of `test_planner_default.py`. Update `profile_ops.py`. List old-value plan changes in the PR. | From here old classes are unreachable in production, and tests build them directly. |
+| C4 | Remove the C4 rows of "Temporary items" and the `SolveError` handler. Rewrite `scratchpad_planning`, `_maybe_scratchpad_planning`, `family_key`, `select_families` and `_fall_back`, and `solve_decides_work_division()` if #5695 has landed. Delete `select_allocator`, `_cpsat_solver_class`, `_PLACEMENT_SOLVERS`. Narrow `layout_solver`, add `layout_solver_key`, remove `allow_exhaustive_search`. Rewrite or delete `TestSelectAllocator`, `TestSolverCapabilities`, `TestCpsatFallbackWarning`, `TestSolveErrorFallback`, `TestCpSatTimeoutFallback`, `TestCpSatAllocatorFallback` and the old-path rows of `test_planner_default.py`. Update `profile_ops.py`. List old-value plan changes in the PR. | From here old classes are unreachable in production, and tests build them directly. |
 | C4b | Retire the old arm. `bless --tier fake` on the fixed set, recording decisions and predicted total, replaces `test_golden_intree`, and the other `intree` tests move to the fixed set. Move `Cell`'s default, `ZOO_CELLS` and `MATRIX_CELLS` to `ortools` and `sa`, and drop `ALLOW_EXHAUSTIVE_SEARCH` from `Cell.env`. Delete the C4b rows of "Temporary items", and `plan_adapter` from `optimizer_pass_sources()`. | Each runs an old solver as its reference, so it would fail at C6 to C10. Must precede C5. |
 | C5 | Delete `exhaustive_search.py`, `prune`, and the exhaustive-only chain. | Top of the solver stack, nothing else depends on it. |
 | C6 | Delete `simulated_annealing.py`, `cooling_schedules.py`, the doc examples, `plot_buffers`, `quality_plot`, and `test_simulated_annealing.py` with its config yaml. | Removes the last importer of greedy and best-fit outside `allocator.py`. |
 | C7 | Delete `greedy_solver.py`, `BestFitLayoutSolver`, the two pattern classes and solver subclasses. | Depends on C6. |
 | C8 | Delete `ScratchpadAllocator`, `CoOptimizingAllocator`, placement prep, the committed-relayout methods, the delegates and Stage 10's wrappers. `commit.py` imports Stage 6's `_loop_carry_update_edge`. | Must precede C9: their signatures name `CoreDivisionLayoutSolver`. |
-| C9 | Delete `sa_cooptimizer.py` with its aliases and its `optimizer_pass_sources()` entry. Rewire `_work_slices` sites. Delete the wrappers from C3. | `AnnealBackend` has been the only production path since C4. |
+| C9 | Delete `sa_cooptimizer.py` with its aliases and its `optimizer_pass_sources()` entry. Rewire `_work_slices` sites. Delete the wrappers from C3. | `SAFamily` has been the only production path since C4. |
 | C10 | Delete `ilp_solver_ortools.py` and its `optimizer_pass_sources()` entry. Port `TestCpSatDivisionGate`, `SolveStatsTest`, `UniquenessCheckTest`, `TestCpSatUnallocatedReads`. | Same. |
 | C11 | Delete `MemoryPlanSolver`, `CoreDivisionLayoutSolver`, `SolveError`. | Now has no subclass and no raiser. |
 | C12 | Gated, and only with `lx_solver_completed_reduction_routes` on by default: delete `collect_lx_relayout_plans`, `anchor_lx_relayout_ownership`, `paired_with`, `lx_relayout_plans`. | Last rule-bearing code, kept apart so it can be dropped from the PR. |
@@ -435,30 +436,30 @@ Consumes:
 |---|---|---|---|
 | Equivalence harness | `lx_gate.sh`, `diff`, `bless --tier fake`, `Cell`, `ZOO_CELLS`, `FIXED_GRAPHS`, tiers `fake`, `unit-*`, `failure` | 0 | Every commit's gate. Old arm retired in C4b. |
 | `decode_todays_plan`, `check_todays_plan`, `check_buffers`, `Mismatch`, `PlanCheck` | As Stage 3 | 3 | Deleted in C4b. |
-| `check_decisions`, `RuleViolation`, `coverage` | As Stage 3 | 3 | Run on every plan. Untouched. |
+| `check_decisions`, `RuleViolation`, `coverage` | `check_decisions(graph)`, `coverage(family, target) -> Coverage(gaps, unused)`, as Stage 3 | 3 | Run on every plan. Untouched. |
 | `rules.stick_tables` | `(node, flag) -> list[StickTable]` | 3 | Agreement test. |
 | Division-rule bodies | One body in `rules.py`, old `work_division_constraints.py` names as adapters | 3 | Rule audit. |
 | Residency host | A never-solving allocator behind `rules.residency_reason` | 3 | Replaced in C2. |
 | `matmul_axes` | `(op: ComputedBuffer) -> MatmulAxes`, `.k`, `.n`, pure, in `lx_allocator/graph_builder.py` | 2 | C14. |
-| `build_graph` | `(ir, *, capacity=None, alignment=128, divisions_committed=False, drain_plans=None, lx_relayout_plans=())` | 2 | C12 drops the last keyword. |
+| `build_graph` | `(ir, target, *, divisions_committed=False, drain_plans=None, lx_relayout_plans=())` | 2 | C12 drops the last keyword. |
 | Moved candidate code | `lx_allocator/family/edge_tables.py`; allocator delegates | 5, 6 | Delegates go in C8. |
 | `replay_graph`, `edge_tables_from_buffers` | `replay_graph(buffers, limit, alignment)`; final test helpers | 5, 6 | `solve_records` below. |
-| `Encoder`, `Model`, `ModelAbstractFactory`, `FACTORIES` | `FACTORIES: dict[str, type[ModelAbstractFactory]]`, keys `"ortools"`, `"sa"`, in `lx_allocator/family/registry.py` | 5, 7, 8 | Selection. |
-| Guarded ortools import | `OrToolsFactory()` raises `ImportError` when `cp_model` is `None`; importing `registry` never raises | 7 | Missing-ortools path. |
+| `Family`, `Encoding`, `FAMILIES` | `FAMILIES: Mapping[str, type[Family]]`, keys `"ortools"`, `"sa"`, in `lx_allocator/family/registry.py` | 5, 7, 8 | Selection. |
+| Guarded ortools import | `OrToolsFamily` raises `ImportError` when `cp_model` is `None`; importing `registry` never raises | 7 | Missing-ortools path. |
 | `AnnealSearch._seed_permutation` | `(sizes: list[int]) -> list[int]`, in `lx_allocator/family/sa/search.py` | 8 | Calls `first_fit_order` after C3. |
-| `select_optimizer` | `() -> SpyreOptimizer \| None`, in `lx_allocator/optimizer.py`; promotes the fallback when ortools is absent | 9 | `scratchpad_planning`. `None` return removed in C4. |
-| `SpyreOptimizer.plan_allocation` | `plan_allocation(ir) -> SpyreOptimizationGraph` | 9 | Sole path. |
+| `family_key`, `select_families` | `family_key(config) -> str \| None`; `select_families(config) -> tuple[Family, Family \| None]`, in `lx_allocator/optimizer.py`, promoting the fallback when ortools is absent | 9 | `scratchpad_planning`, `plan_allocation`. `family_key`'s `None` return removed in C4. |
+| `plan_allocation` | `plan_allocation(ir, config) -> SpyreOptimizationGraph` | 9 | Sole path. |
 | `_fall_back`, `_return_infeasible` | Out of time retries the fallback; a proven infeasible graph commits nothing | 9 | Replaces the re-plan. |
 | `optimizer_pass_sources()` | Planner sources in the FX key | 9, 10 | `_runs`. Loses the modules deleted here. |
 | CI wiring | `_test_matrix.yaml` inputs `lx_route_to_families` and `layout_solver`, their export step, `lx_planner_compare.yaml` | 9, 12 | Per "Temporary items". |
 | `lx_route_to_families`, `_greedy_replan` | As Stage 9 | 9 | Removed in C4. |
 | `solve_decides_work_division()` | False on a family; with Stage 11 landed, true with `lx_sticks_in_solve` on | 9, or 11 if landed | C4. |
-| Committed mode | `graph.divisions_committed`, `CostModel(traffic_only=True)` | 1, 2, 4 | Placement-only replacement. `division_is_fixed` branches stay. |
-| `SpyreOptimizer.commit` | Replaces `_push_allocation`, including drains, hoisted LX prefetches, tilings, collective staging, spill reasons; runs `post_optimization_passes` | 10 | Commit group gone. Surprise 2. |
+| Committed mode | `graph.divisions_committed`, a target derived with `SpyreCostModel(traffic_only=True)` | 1, 2, 4, 9 | Placement-only replacement. `division_is_fixed` branches stay. |
+| `commit` | `commit(graph)`; replaces `_push_allocation`, including drains, hoisted LX prefetches, tilings, collective staging, spill reasons; runs `_context_switching_passes()` | 10 | Commit group gone. Surprise 2. |
 | `cost_expr_record` writer | Full record from decoded graph values, `env.solver` and `env.allocator` keys included | 10 | Readers of the dump. |
 | Stage 10's extractions | `push_one_placement`, `commit_chosen_divisions`, `check_priced_footprint`, `accepted_lx_views`, `collective_output_stages`, `apply_tiling_choices`, `splits_from_divisions` | 10 | Wrappers go in C8. |
 | Completed-reduction relayouts | Stage 6 table calls `derive_completed_reduction_routes`; `lx_solver_completed_reduction_routes` on by default | 6, 12 | Retargeted device tests, C12. |
-| Settings and retired-values tables, rollout step 6 | `layout_solver` default `"ortools"`, `lx_fallback_family` default `"sa"`; aliases as Stage 12's contract | 12 | Entry, Config, C4. |
+| Settings and retired-values tables, rollout step 6 | `layout_solver` default `"ortools"`, `fallback_solver` default `"sa"`; aliases as Stage 12's contract | 12 | Entry, Config, C4. |
 | `LEGACY_LAYOUT_SOLVERS`, `warn_planner_selection` | As Stage 12 | 12 | Removed in C4. |
 | `compare_planners.compare`, `Thresholds`, label `lx_compare`, lane cron | As Stage 12 | 12 | Removed by whichever of this stage and 12c lands last. |
 
@@ -481,9 +482,9 @@ All files are in `tests/inductor/` and are unit unless marked device.
 
 | file | direct / total | disposition | is coverage replaced? |
 |---|---|---|---|
-| `test_simulated_annealing.py` | 6 / 18 | **Delete** with its yaml. | `CoolingScheduleTests` (10) pin dead code. `SimulatedAnnealingTests` and stress pin placement SA: best-seen, early stop and determinism map to Stage 8's `AnnealBackend` tests. `test_annealing_step_swap_handles_evicted_buffers` has no replacement and needs none. |
+| `test_simulated_annealing.py` | 6 / 18 | **Delete** with its yaml. | `CoolingScheduleTests` (10) pin dead code. `SimulatedAnnealingTests` and stress pin placement SA: best-seen, early stop and determinism map to Stage 8's `SAFamily` tests. `test_annealing_step_swap_handles_evicted_buffers` has no replacement and needs none. |
 | `test_scratchpad_patterns.py` | class-level | Keep `TestVerifyPatterns` and `TestFirstFitPatterns` on `first_fit_place`. Drop Greedy (xfails 5 of 7) and BestFit. Port SA patterns. | SA classes port through `solve_records`. The two eviction xfails stay. |
-| `test_scratchpad_solver.py` | 16 / 144 | Delete `TestExhaustiveSearchResidency`, `TestGreedyLayoutSolver`, `TestBestFitLayoutSolver`, `TestSimulatedAnnealingLayoutSolver`. Keep `TestFirstFitLayoutSolver`, `ScoreOrderingTests`, `TestTopologicalSort`, `TestCoreDivision`, printer, `TestInvScale`, `TestObjectiveCostParams`, drain tests. Rewrite `JointDivisionSolverTests` (5), `TestCpSatJointDivision` (21), `TestCpSatPlacementOnly`, `SolveStatsTest`, `UniquenessCheckTest`, `TestCpSatUnallocatedReads`, `TestCpSatDivisionGate` on `solve_records` with `OrToolsFactory`. | Rewrite required. The 35 shared `BaseLayoutSolverTests` keep their bodies and change only `solve()`. `TestAllocatorSpillReasons` moves to Stage 10's reasons. |
+| `test_scratchpad_solver.py` | 16 / 144 | Delete `TestExhaustiveSearchResidency`, `TestGreedyLayoutSolver`, `TestBestFitLayoutSolver`, `TestSimulatedAnnealingLayoutSolver`. Keep `TestFirstFitLayoutSolver`, `ScoreOrderingTests`, `TestTopologicalSort`, `TestCoreDivision`, printer, `TestInvScale`, `TestObjectiveCostParams`, drain tests. Rewrite `JointDivisionSolverTests` (5), `TestCpSatJointDivision` (21), `TestCpSatPlacementOnly`, `SolveStatsTest`, `UniquenessCheckTest`, `TestCpSatUnallocatedReads`, `TestCpSatDivisionGate` on `solve_records` with `OrToolsFamily`. | Rewrite required. The 35 shared `BaseLayoutSolverTests` keep their bodies and change only `solve()`. `TestAllocatorSpillReasons` moves to Stage 10's reasons. |
 | `test_scratchpad_use.py` (device) | 25 / 39 | See below. | Rewrite. |
 | `test_work_division.py` | 16 / 150 | `_UNBUILT_SOLVER` sites use `LxRecordBuilder(decides_relayouts=True)` or the moved function. `TestResidencyEdgeInversion` (8) ports with Stage 8. Tests of `prune=True` at `:3526`, `:3662` delete. | Kept by construction change, as methods move verbatim. |
 | `test_work_division_hint.py` | 9 / 69 | Five greedy-pinned tests retargeted in C1. Plan-handoff tests at `:720-830` delete with C12. | See "Behaviour at risk". |
@@ -491,7 +492,7 @@ All files are in `tests/inductor/` and are unit unless marked device.
 | `test_lx_equivalence.py`, `test_lx_equivalence_compile.py` | Stage 0 | C4b as in Commits. `test_golden_intree` becomes `test_golden_fake`. | Yes, `fake` replaces buffer-level replay. |
 | `test_planner_default.py` | Stage 12 | `test_every_old_value_reaches_the_old_path`, `test_cache_key_differs_between_old_and_new`, `test_legacy_value_warns_once`, `test_value_without_replacement_names_the_default`, `test_exhaustive_flag_warns_only_on_a_family` delete in C4. | `test_scratchpad_entry.py` below. |
 | `test_sa_cooptimizer.py` | 26 / 111 | Each class ports with Stage 8. The PR lists each deleted class with its Stage 8 counterpart. Class constructed directly at 20+ sites, so most of the file is affected even where not counted. `test_ceiling_is_higher_than_the_layout_only_annealer` (`:778`) deletes. | Must be shown class by class. A class without a counterpart is ported, not dropped. |
-| `test_cooptimization_types.py` | 8 / 18 | `_NoOpSolver`, `NoOpSolverABCTest` delete. `EngineBindingTest` deletes. `SpillCostTest::test_matches_the_cpsat_engine_formula` moves to `CostModel.spill_cost`. Capture tests stay while `CoreDivisionBuffer` does. | Partly. |
+| `test_cooptimization_types.py` | 8 / 18 | `_NoOpSolver`, `NoOpSolverABCTest` delete. `EngineBindingTest` deletes. `SpillCostTest::test_matches_the_cpsat_engine_formula` moves to `SpyreCostModel.spill_cost`. Capture tests stay while `CoreDivisionBuffer` does. | Partly. |
 | `test_coarse_tiling.py` | 6 / 435 | Allocator sites use the moved functions, `:9727` patches `op_inputs_good_for_lx_inplace`, and the `FirstFitLayoutSolver` patches at `:10200`, `:10223` become `free_gap` in C3. `_check_in_place_relationships` import stays. | Kept. |
 | `test_solver_auto_coarse_tiling.py` (device) | 5 / 34 | `select_allocator()` at `:716` becomes Stage 5's `tiling_candidates`. | Kept. |
 | `test_solver_relayout_e2e.py` (device) | 4 / 25 | `_Observed` retargets. `collect_lx_relayout_plans` at `:94` needs C12's answer. | Kept. |
@@ -505,7 +506,7 @@ All files are in `tests/inductor/` and are unit unless marked device.
 `:849`, `:1200`), so `ParameterizedScratchpadUsage`'s 40 generated cases become 16.
 `TestCloneAtGraphBoundaries` gains `sa`, because its axis would otherwise shrink to `ortools`
 alone. `TestCpSatAllocatorFallback` now asserts ortools-absent compiles via SA and that the
-default config no longer raises. `TestCpSatTimeoutFallback` counts `AnnealBackend` solves
+default config no longer raises. `TestCpSatTimeoutFallback` counts `SAFamily` solves
 instead of greedy plans, and keeps `hbm_with_lx < hbm_without_lx`. `TestSolveErrorFallback`
 becomes the Stage 9 fallback and keeps its check that context switching survives it.
 `TestSelectAllocator` keeps its bogus-value case and loses the rest.
@@ -521,7 +522,7 @@ by this stage's new test. `TestInplaceEdgeGate` calls `inplace_edge_ok` (`:2033`
 | Completed-reduction relayout on device | `test_completed_reduction_relayout_device`, `test_unhinted_moe_down_route_preserves_the_chosen_split`, greedy only | Retarget to `ortools` with Stage 6's table, which needs `lx_solver_completed_reduction_routes` on. `completed_producer_cores` assertions stay. |
 | Consumers sharing a relayout destination, grouped relayouts, read expansion | `test_lx_relayout_consumers_share_destination_view`, `test_grouped_lx_relayout_device`, `test_lx_relayout_read_expansion_device`, greedy only | Retarget. Under a priced solve a relayout is chosen, not guaranteed, so a test may need a graph where the copy pays. It must not be weakened to "compiles". |
 | Atomic relayout group | `test_lx_relayout_allocation_is_atomic_in_one_greedy_solve` | Group atomicity is a model constraint. Needs a `check_decisions` case, or a Stage 6 test by name. |
-| Relayout lifetime extension | `test_lx_relayout_copies_loop_lifetime_to_every_destination`, `test_lx_relayout_keeps_source_lifetime_for_later_original_reader` | Port to `Relayout` steps. |
+| Relayout lifetime extension | `test_lx_relayout_copies_loop_lifetime_to_every_destination`, `test_lx_relayout_keeps_source_lifetime_for_later_original_reader` | Port to `RELAYOUT` steps. |
 | Spill reasons in logs | `TestAllocatorSpillReasons` | Stage 10. |
 | Placement-only SA quality | `test_annealing_never_worse_than_initial` | SA family's best-seen test. Plans change (D7). |
 | Stick agreement across op kinds | `_check_stick_all_same` over reductions and dtype ops | Stays. It reads emitted OpSpecs, which no flag sees (D1). |
@@ -530,12 +531,12 @@ New tests:
 
 | file | test | asserts |
 |---|---|---|
-| `test_scratchpad_entry.py` | `test_lx_planning_off_builds_no_optimizer` | With `lx_planning=False`, `_maybe_scratchpad_planning` touches nothing. Replaces `test_lx_anchor_pass_respects_planning_switch`. |
-| | `test_each_layout_solver_value_reaches_its_family` | Each key of `FACTORIES` selects its factory. |
+| `test_scratchpad_entry.py` | `test_lx_planning_off_skips_plan_allocation` | With `lx_planning=False`, `_maybe_scratchpad_planning` touches nothing and never calls `plan_allocation`. Replaces `test_lx_anchor_pass_respects_planning_switch`. |
+| | `test_each_layout_solver_value_reaches_its_family` | Each key of `FAMILIES` selects its family. |
 | | `test_removed_layout_solver_values_raise` | `greedy`, `bestfit`, `firstfit`, `bogus` raise `ValueError` naming the valid keys. |
 | | `test_retired_aliases_normalize_and_warn` | `cpsat` and `simulated_annealing` store `ortools` and `sa` from the env in a subprocess, warn, and reach the same family through `config.patch`. |
 | | `test_stale_exhaustive_search_env_warns` | `ALLOW_EXHAUSTIVE_SEARCH=1` warns at import. |
-| | `test_empty_fallback_family_raises` | `lx_fallback_family=""` raises `ValueError`. |
+| | `test_empty_fallback_solver_raises` | `fallback_solver=""` raises `ValueError`. |
 | | `test_ortools_absent_promotes_the_fallback_once` | Inverts today's guard test. Default config compiles. Two resolutions log once, with the import error. |
 | `test_first_fit.py` | `test_first_fit_order_golden` | Literal permutations recorded from `SolverToPermutation` at C3 on the synthetic graphs. |
 | | `test_first_fit_excludes_barred_buffers` | The three `excluded` reasons, in order, written to `spill_reason`. |
@@ -553,7 +554,7 @@ built on `replay_graph` and `edge_tables_from_buffers`:
 def solve_records(
     records: Sequence[LifetimeBoundBuffer],
     capacity: int,
-    family: type[ModelAbstractFactory],
+    family: type[Family],
     alignment: int = 128,
 ) -> list[LifetimeBoundBuffer]:
     """Encode and solve hand-written records, and write addresses back onto them."""
@@ -645,7 +646,7 @@ last check. K and N are derived once (C14), and `test_stick_rule_agreement.py` k
 generator and flags aligned. Removing them would need a replacement for `op.layouts` and the
 beam, which is a stage of its own.
 
-**D2. No stage owns the allocator's residency methods.** The plan says `SpyreOptimizer` takes
+**D2. No stage owns the allocator's residency methods.** The plan says `plan_allocation` takes
 over the classes' role, but `rules.py` reaches `_BufferResidencyChecks`, whose checks call
 methods on the allocator (`allocator.py:815`, `:873`, `:940`). Resolution: `LxRecordBuilder`, a
 small host keeping those bodies verbatim. Earlier stages moved everything else.
@@ -700,7 +701,7 @@ None.
 
 - The default flip and side-by-side runs: Stage 12.
 - `elide_proven_read_copies`: stays, as Stage 11 decides.
-- `SpyreOptimizer.commit` and how it carries drains, tilings and spill reasons: Stage 10.
+- `commit(graph)` and how it carries drains, tilings and spill reasons: Stage 10.
 - The debug greedy family itself: not staged. This plan only leaves room for it.
 - Removing any remaining buffer records: not staged (D4).
 - Unused native bindings (`overlaps`, `top_or_inf`, `finalize`): left in place.
