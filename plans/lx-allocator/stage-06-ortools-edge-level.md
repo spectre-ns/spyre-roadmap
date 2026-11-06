@@ -1,15 +1,15 @@
-# LX allocator, Stage 6: `OrToolsEncoder`, edge and op-op level
+# LX allocator, Stage 6: `OrToolsFamily.encode`, edge and op-op level
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0, 1, 2, 3, 4, 5. Needed by: Stages 7, 8, 9, 10, 11, 12, 13.
 
 ## Goal
 
-When this PR merges, `OrToolsEncoder.encode` builds the whole CP model that `CpSatLayoutSolver` builds
+When this PR merges, `OrToolsFamily.encode` builds the whole CP model that `CpSatLayoutSolver` builds
 for a joint solve, first objective included, except the 2-D no-overlap section, which Stage 7 adds. That
 covers the residency gate, relayout tables and their coupling, the running nest id, copy-outs, the
-partial-reduction cut guard, lifetime ends, in-place overwrite, LX prefetch reads, and `_encode_objective`, which lowers
-Stage 4's terms into `CpModel.objective_stages` for Stage 7 to run. The candidate tables move out of
+partial-reduction cut guard, lifetime ends, in-place overwrite, LX prefetch reads, and `encode_objective`, which lowers
+Stage 4's terms into `enc.ortools.objective_stages` for Stage 7 to run. The candidate tables move out of
 `CoOptimizingAllocator` into one solver-free module, and the allocator delegates to it. Only the test
 shadow calls the new encoder. Today's solvers, plans and protos do not change. Completed-reduction rows
 exist behind a config flag that is off.
@@ -103,8 +103,9 @@ segment makes the producer `unshareable` and `via_full == tiled`. `cut_<op>` is 
 is tiled and either some reader is apart or it is unshareable, which includes a graph output and an
 op with no modelled reader (`:1012-1023`).
 
-Note the name clash. Today's `cut_<op>` means "this op's value is copied out". The plan's
-`ExecutionEdge.cut` means "these two adjacent ops do not share a nest", which is `not joined_<a>_<b>`.
+Note the name clash. Today's `cut_<op>` means "this op's value is copied out". The plan's cut,
+`t in graph.cuts`, means "the op at tick `t` and the next op do not share a nest", which is
+`not joined_<a>_<b>`.
 
 **Partial-reduction guard.** `_add_partial_reduction_cut_guard` (`:1029-1050`) posts
 `¬cut ∨ ¬in_buffer ∨ copy_reads` when any menu entry has a reduction split.
@@ -166,7 +167,7 @@ A new solver-free module, `scratchpad/lx_allocator/family/edge_tables.py`, holds
 today sits on `CoreDivisionBuffer` for edges. Tables live in the encoder, not on the graph
 (`scratchpad-architecture-vs-main.md:155`). Menu indices appear only in `Gate.pairs`, in
 `RelayoutCandidate.source_division` and `.consumer_division`, and in `loop_id` values. None of them
-reach `DataEdge`, `ExecutionEdge`, `Pin`, `Transform` or `Sym`.
+reach `DataEdge`, `graph.cuts`, `Pin`, `Step` or `Sym`.
 
 ```python
 class GateKind(Enum):
@@ -240,7 +241,8 @@ buffer construction removed, in the same order, because order decides results he
 
 1. carry update edges (`:4196-4218`), from `carry_pairs(graph)`, which applies no residency filter,
    so that filter is here;
-2. prefetch menus (`:4226-4247`), with `get_buffer_users(graph.ir)` as today;
+2. prefetch menus (`:4226-4247`), with `get_buffer_users(graph.ir)` as today, none without
+   `Optimization.PREFETCH`;
 3. for each op in `graph.ir.operations` order: residency edges, match tables, carry merges, prefetch
    match merge, relayouts, prefetch re-merge, in-place edges from prefetches (`:4269-4450`);
 4. groups (`:4490`).
@@ -259,7 +261,7 @@ Moved or copied:
 | `_determine_in_place_division_invariant` | stays; `DataEdge.in_place_candidate` holds the same gates | Stage 13 deletes |
 | `_build_cd_bound_buffers`, the `while True` in `_prepare_buffers` | allocator keeps them; the first calls the moved functions | `settle_deferred_reads` is a copy over tables. Stage 13 deletes the old ones |
 | `RelayoutCopyBuffer`, `build_relayout_copy`, `_relayout_copy_buffers` | `RelayoutGroup` in `edge_tables.py` | copied, because old solvers still need the buffer; Stage 13 deletes the old ones |
-| `constrain_residency`, `_gate_divisions`, `constrain_merge`, `_add_tiling` from `:975`, `_add_tiling_groups`, `_add_nest_*`, `_add_lifetime_ends`, `_add_inplace_relaxation` through `:1662`, `_constrain_relayout_copies`, `_add_partial_reduction_cut_guard`, the variables of `_cut_traffic_terms`, the lowering in `_minimize_cost_expr`, `decision_variables`, `_Slots`, `_TilingGroups` | `OrToolsEncoder` | copied; `CpSatLayoutSolver` still needs them until Stage 13. `_op_readers` is not copied: it filters nothing, and gates never list a copy as a reader. |
+| `constrain_residency`, `_gate_divisions`, `constrain_merge`, `_add_tiling` from `:975`, `_add_tiling_groups`, `_add_nest_*`, `_add_lifetime_ends`, `_add_inplace_relaxation` through `:1662`, `_constrain_relayout_copies`, `_add_partial_reduction_cut_guard`, the variables of `_cut_traffic_terms`, the lowering in `_minimize_cost_expr`, `decision_variables`, `_Slots`, `_TilingGroups` | `family/ortools_encode.py` | copied; `CpSatLayoutSolver` still needs them until Stage 13. `_op_readers` is not copied: it filters nothing, and gates never list a copy as a reader. |
 
 Moving rebinds module names, so a test patching `allocator_module.X` stops applying to a moved body
 (feasibility report, deviation 4). `exp/stage-06/moved_patches.py` crosses every patched name in `tests/`
@@ -299,80 +301,103 @@ after `rebuild`, so a closure may read the tables it just built. A node rejected
 
 ### Encode order
 
-`encode` is Stage 5's sequence. The comments give what this stage fills:
+`OrToolsFamily.encode` is Stage 5's: `begin(graph)`, `build_tables(enc)`, `encode_ops(enc)`. Each
+function in `family/ortools_encode.py` takes the `Encoding` first, and the family-private state
+sits in `enc.ortools`, Stage 5's `OrToolsState`: its `ops`, `units`, `columns`, `tile_terms`,
+`tables` and `edges`, which this stage fills, and this stage's `copies`, `relayout_literals`,
+`incoming` and `objective_stages`. The comments give what this stage fills in `encode_ops`:
 
 ```python
-def encode(self, graph, restrictions=None) -> CpModel:
-    self._begin(graph, restrictions)
-    self._build_tables()
-    self._edges = self._settle_tables()  # settle_deferred_reads, then prefetch tables
-    self._encode_op_vars()               # merge_* literals through _declare_in_place_vars
-    self._encode_relayout_copies()       # _add_unit per group
-    self._encode_loop_columns()
-    self._encode_tiling()                # lines 975-1172, then _encode_lifetimes
-    self._encode_in_place()              # lines 1633-1658
-    self._encode_placement()             # _encode_capacity here; Stage 7 replaces it
-    self._post_residency()
-    self._encode_restickifies()          # no proto in Phase 2
-    self._encode_read_gates()            # gates, then relayout coupling
-    self._encode_tile_counts()
-    self._bind_symbols()
-    self._encode_sticks()
-    self._encode_objective()             # this stage; Stage 7 runs the stages
-    return self._m
+def encode_ops(enc: Encoding) -> None:   # ortools_encode.py
+    settle_tables(enc)            # settle_deferred_reads, then prefetch tables
+    encode_op_vars(enc)           # merge_* literals through declare_in_place_vars
+    encode_relayout_copies(enc)   # add_unit per group
+    encode_loop_columns(enc)
+    encode_tiling(enc)            # lines 975-1172, then _encode_lifetimes
+    encode_in_place(enc)          # lines 1633-1658
+    encode_placement(enc)         # _encode_capacity here; Stage 7 replaces it
+    post_residency(enc)
+    encode_restickifies(enc)      # no proto in Phase 2
+    encode_read_gates(enc)        # gates, then relayout coupling
+    encode_tile_counts(enc)
+    bind_symbols(enc)
+    encode_sticks(enc)
+    encode_objective(enc)         # this stage; Stage 7 runs the stages
 ```
 
-`_settle_tables` calls `settle_deferred_reads`, with `rebuild` storing `build_edge_tables(graph,
-self._menus, capacity=graph.capacity, decides_relayouts=True, ...)` in `self._edges` and
-`relayout_sources=lambda: self._edges.relayout_sources()`. It then builds one
-`DivisionTable(node.name, node, list(menu.divisions), enumerated=False)` per `PrefetchMenu`, in input
-order, apart from `self._tables`. `_encode_prefetches` calls `_add_unit` on each, so `_encode_op_vars`
-visits LX prefetches first, as today's buffer order does.
+`settle_tables` calls `settle_deferred_reads`, with `rebuild` storing `build_edge_tables(graph,
+menus(enc), capacity=graph.target.lx_bytes, decides_relayouts=StepKind.RELAYOUT in
+graph.target.steps, ...)` in `enc.ortools.edges` and
+`relayout_sources=lambda: enc.ortools.edges.relayout_sources()`. It then builds one
+`DivisionTable(node.name, node, list(menu.divisions), enumerated=False)` per `PrefetchMenu`, in
+input order, apart from `enc.ortools.tables`. `encode_prefetches` calls `add_unit` on
+each, so `encode_op_vars` visits LX prefetches first, as today's buffer order does.
 
-`_declare_in_place_vars` runs inside `_add_unit` straight after `off_`, because `merge_*` sits between
+`declare_in_place_vars` runs inside `add_unit` straight after `off_`, because `merge_*` sits between
 `off_` and `div_`. It makes one `merge_<p>_<c>` per entry of `EdgeTables.in_place`. A name repeated by a
 double read gets a second variable that the dict drops, as `ilp_solver_ortools.py:308-311` does.
 
-`_encode_relayout_copies` calls `_add_unit` per group with a one-entry `DivisionTable` whose `node` is
+`encode_relayout_copies` calls `add_unit` per group with a one-entry `DivisionTable` whose `node` is
 `None` and whose entry is `CoreDivision(splits={"relayout_copy": n})`, so `eff_size`, `cores` and
 the constants come out as they do for a copy today (`:454-479`). The bundles go in
-`CpModel.copies: dict[str, OpVars]` by group name, and `_table_owners()` returns `ops` then `copies`.
-`PlacementKey` for a copy is that name. `CpModel.relayout_literals` maps the same names to `in_buffer`.
+`enc.ortools.copies: dict[str, OpVars]` by group name, and `_table_owners(enc)` returns `ops` then
+`copies`. `PlacementKey` for a copy is that name. `enc.ortools.relayout_literals` maps the same names
+to `in_buffer`.
 
-Every constraint goes through `post(subject, rule, lambda cp: ...)` with today's exact call
+Every constraint goes through `post(enc, subject, rule, lambda cp: ...)` with today's exact call
 (`add_implication`, `add_bool_or`, `add_allowed_assignments`, `add_element`, `add_max_equality`,
 `add_at_most_one`), one `post` per constraint, so Stage 5's invariant of exactly one `Provenance` per
-constraint holds. Rules:
+constraint holds. A rule is a `Rule` flag, or the name of an `ALWAYS` check as a string:
 
 | constraints | rule |
 |---|---|
-| group ids, `apart_`, `via_full_`, `cut_`, nest ends and starts | `Always.TILE_ALIGNED` |
-| cut guard | `Always.CUT_TILE` |
-| `resident_cut_`, `reads_full_` definitions | `Always.COPY_OUT` |
-| `end_`, `start_`, `_encode_capacity` | `Always.NO_OVERLAP` |
-| `merge_*`, `add_at_most_one`, the shared offset | `Always.IN_PLACE` |
-| gate, reader not a `RestickifyNode` | `Always.RESIDENT_READ` |
-| gate, reader a `RestickifyNode` | `Always.CROSS_FRAME` |
-| served literals, coupling, the ladder's pin-out | `Always.RELAYOUT_SOURCE` |
-| the printer's helpers, through `tag("graph", rule, start)` | `Always.TABLE_COLUMN` |
+| group ids, `apart_`, `via_full_`, `cut_`, nest ends and starts | `"tiles_line_up"` |
+| cut guard | `Rule.RESIDENT_TILE_UNREDUCED` |
+| `resident_cut_`, `reads_full_` definitions | `Rule.COPY_OUT_IN_HBM` |
+| `end_`, `start_`, `_encode_capacity` | `"boxes_fit_lx"` |
+| `merge_*`, `add_at_most_one`, the shared offset | `"in_place_conditions"` |
+| gate, reader not a `RestickifyNode` | `"resident_read"` |
+| gate, reader a `RestickifyNode` | `"cross_frame"` |
+| served literals, coupling, the ladder's pin-out | `"relayout_source"` |
+| the printer's helpers, through `tag(enc, "graph", rule, start)` | `TABLE_COLUMN` |
+
+### What the target switches on
+
+The edge-level functions read the card only from `graph.target`. `OrToolsFamily` declares what they
+cover: `STEPS` holds `COPY_OUT`, `RESTICKIFY` and `RELAYOUT`, `RULES` holds `RESIDENT_TILE_UNREDUCED`
+and `COPY_OUT_IN_HBM` (Stage 5 adds the other two), and `OPTIMIZATIONS` holds `IN_PLACE`, `PREFETCH`
+and `COARSE_TILING`. A step kind outside `graph.target.steps` is never offered, and an optimization
+outside `graph.target.optimizations` gets no variables. `SPYRE` sets all of them, so none of this
+changes the proto.
+
+| off on the target | effect |
+|---|---|
+| `StepKind.RELAYOUT` | `build_edge_tables` runs with `decides_relayouts=False`: no rows, groups, copies or served literals, and residency reasons as on today's path that does not decide relayouts |
+| `StepKind.COPY_OUT` | `cut_<op>` and every `via_full_` literal are posted false, so no tiled entry whose value leaves its nest stays legal |
+| `StepKind.RESTICKIFY` | `encode_restickifies` raises on a pinned or forced restickify, because the builder made the graph for this target |
+| `Rule.RESIDENT_TILE_UNREDUCED` | the cut guard is not posted |
+| `Rule.COPY_OUT_IN_HBM` | nothing: this family has no LX copy-out, so it keeps a copy-out in HBM and is stricter than such a card |
+| `Optimization.IN_PLACE` | `EdgeTables.in_place` is empty: no `merge_*`, and `encode_in_place` posts nothing |
+| `Optimization.PREFETCH` | no `PrefetchMenu`: no input units, no `PREFETCH` gates, no in-place edge from an input |
+| `Optimization.COARSE_TILING` | Stage 5's tables hold no tiled entry, so `encode_tiling` adds nothing, as `_add_tiling` does today |
 
 ### The gate
 
-`_encode_read_gates` walks units in order and, for each, `self._edges.gates[unit.name]`, so one reader
+`encode_read_gates` walks units in order and, for each, `enc.ortools.edges.gates[unit.name]`, so one reader
 listed twice gets two gates, as today (feasibility report, deviation 1). `gates`, not
 `graph.data_edges`, drives the walk, because a listing is not an edge: a `CARRY` gate has no read
 edge, and a mutation edge or an edge to a drained collective has no listing (Deviation 7). `Gate.edges`
 holds the edges a listing stands for. `x * x` is one dep, so one listing and one edge. A self-matmul
 shares one edge across two ports. The body is `ilp_solver_ortools.py:560-597`. A PREFETCH or CARRY gate
-has no relayouts. `_gate_pairs` is the one method that reads an `(i, j)` table, so a later encoder can
+has no relayouts. `_gate_pairs` is the one function that reads an `(i, j)` table, so a later encoder can
 replace it with view-id equality (feasibility report, 2c) without touching the callers:
 
 ```python
-def _gate_pairs(self, subject, rule, pairs, src: OpVars, dst: OpVars, when) -> None:
+def _gate_pairs(enc, subject, rule, pairs, src: OpVars, dst: OpVars, when) -> None:
     """_gate_divisions: `when` implies (src.division, dst.division) is in `pairs`."""
 ```
 
-Graph mapping of a served literal: true means a `Relayout` step on that gate's edges. Stage 7 decodes
+Graph mapping of a served literal: true means a `RELAYOUT` step on that gate's edges. Stage 7 decodes
 it with `fired_relayouts` below.
 
 ### The relayout table
@@ -393,10 +418,10 @@ class RelayoutCandidate:
 per source, because `PerCoreView` equality is structural. The group stays keyed on destination view
 alone, as today, so one copy can be fed from any priced source division.
 
-On the graph a relayout appears only as a `Relayout` step. `to_view` is a `PerCoreView` in the device
-frame of the layout the step applies to. `to_view`, `reduction_split`, `source_view`,
+On the graph a relayout appears only as a step of kind `RELAYOUT`. `to_view` is a `PerCoreView` in
+the device frame of the layout the step applies to. `to_view`, `reduction_split`, `source_view`,
 `source_footprint_bytes` and `destination_footprint_bytes` all come from `FiredRelayout.row`. A price
-never reaches the graph by menu index: `_cost_domains` keys it by selector value.
+never reaches the graph by menu index: `cost_domains` keys it by selector value.
 
 "Never across a cut" and "only from a resident source" are table and coupling facts. No row has a
 tiled menu entry on either end, so a served literal already implies both ends untiled, hence no
@@ -416,7 +441,7 @@ class FiredRelayout:
     group: RelayoutGroup
     row: RelayoutCandidate
 
-def fired_relayouts(self, value: Callable[[Any], int]) -> list[FiredRelayout]:
+def fired_relayouts(enc: Encoding, value: Callable[[Any], int]) -> list[FiredRelayout]:
     """Every served literal that holds, resolved to its one row."""
 ```
 
@@ -431,13 +456,13 @@ Rules this code follows:
 3. **Verified against recomputed views.** The row's `source_view` must be `same_partition` with
    `EdgeTables.write_view(source, i)` and its `destination_view` with `read_view(gate, j)`. The views
    are computed from the menu entries, not read from the row. This costs one view per fired edge.
-4. **An independent check.** `RELAYOUT_SOURCE` in `check_decisions` gains rule 3's comparison, from
-   the decoded `work_split`s and the `Relayout` fields, without the tables, so a decoder that bypasses
-   this function still fails. With `graph.ir` `None` it counts in `skipped`.
+4. **An independent check.** `relayout_source` in `check_decisions` gains rule 3's comparison, from
+   the decoded `work_split`s and the `RELAYOUT` step's fields, without the tables, so a decoder that
+   bypasses this function still fails. With `graph.ir` `None` it counts in `skipped`.
 
 ### Nests, cuts and copy-outs
 
-`_encode_tiling` starts at line 975, after Stage 5's columns, and copies `_add_tiling`,
+`encode_tiling` starts at line 975, after Stage 5's columns, and copies `_add_tiling`,
 `_add_tiling_groups`, `_add_nest_ends` and `_add_nest_starts`, with today's variable names, over
 today's unit order for cuts and over sorted positions for groups and nest walks
 (`cpsat-graph-staged-conversion.md:325`: unit-test record lists are not in tick order).
@@ -447,40 +472,44 @@ How that maps to "a nest is a run of ops, not an object":
 | proto variable | meaning | plan name |
 |---|---|---|
 | `loop_id_<op>` | interned `level_counts` of the chosen entry | private table index |
-| `joined_<a>_<b>` | adjacent ops run the same non-empty nest | `not ExecutionEdge.cut` |
+| `joined_<a>_<b>` | adjacent ops run the same non-empty nest | `a.tick not in graph.cuts` |
 | `tile_group_<op>` | running id, steps wherever `joined` is false | the running nest id; not stored on the graph |
 | `apart_<a>_<b>` | reader's id differs | a cut lies between the edge's ends |
-| `via_full_<a>_<b>` | tiled and apart | this edge carries the `CopyOut` |
-| `cut_<op>` | some edge carries a copy-out, or a graph output | `Sym.cut(node)`, not `ExecutionEdge.cut` |
+| `via_full_<a>_<b>` | tiled and apart | this edge carries the `COPY_OUT` step |
+| `cut_<op>` | some edge carries a copy-out, or a graph output | `Sym.cut(node)`, not `graph.cuts` |
 
 There is no nest object. `nest_start`, `nest_end` and the group id are variables on the unit's
 `OpVars`. Two ops share a nest exactly when their ids agree within a segment, and on the graph exactly
-when no `ExecutionEdge.cut` lies between them. Between two adjacent untiled ops `joined` is false, so
-`cut` decodes as true: each untiled op is a run of one. An execution edge touching an op with no
-tileable entry has `cut` as a constant True. Stage 3's nest helper reads the same definition. The
-helpers Stage 7 decodes from:
+when no tick in `graph.cuts` lies from the first up to the second. Between two adjacent untiled ops
+`joined` is false, so the first op's tick decodes into `graph.cuts`: each untiled op is a run of one.
+Around an op with no tileable entry the cut is constant: its tick and the tick of the running op
+before it are always in `graph.cuts`. Stage 3's nest helper reads the same definition. The helpers
+Stage 7 decodes from:
 
 ```python
-def joined_literal(self, edge: ExecutionEdge) -> Any: ...   # a literal, or False across a segment break
-def copy_out_literal(self, node: OpNode) -> Any: ...        # cut_<op>, or False with no tiling
-def via_full_literal(self, edge: DataEdge) -> Any: ...      # a literal, or False
+def joined_literal(enc: Encoding, before: OpNode) -> Any: ...  # False across a segment break
+def copy_out_literal(enc: Encoding, node: OpNode) -> Any: ...  # cut_<op>, or False with no tiling
+def via_full_literal(enc: Encoding, edge: DataEdge) -> Any: ...  # a literal, or False
 ```
 
+`joined_literal(enc, before)` is the literal for "the next running op shares `before`'s nest", and
+`read_back` adds `before.tick` to `graph.cuts` where it is false.
+
 The cut guard is posted at today's position inside the per-op loop. `nest_start` is kept with today's
-single reader (Deviation 5). A `CopyOut` is one object per producer, shared across its `via_full`
-edges. A graph output or an op with no modelled reader has a copy-out decision and no such edge
-(Deviation 6).
+single reader (Deviation 5). A `COPY_OUT` step is one object per producer, shared across its
+`via_full` edges. A graph output or an op with no modelled reader has a copy-out decision and no
+such edge (Deviation 6).
 
 ### Lifetimes
 
-`_encode_lifetimes`, called at the end of `_encode_tiling`, copies `_add_lifetime_ends`. Slots stay
+`_encode_lifetimes`, called at the end of `encode_tiling`, copies `_add_lifetime_ends`. Slots stay
 `2t` and `2t + 1`. Each `OpVars` gets `end` and `start`, and the box span stays with Stage 7, which
-consumes `end`, `start`, `self._incoming: dict[str, list[literal]]` and the slot values.
+consumes `end`, `start`, `enc.ortools.incoming: dict[str, list[literal]]` and the slot values.
 
 ### In-place overwrite
 
 Eligibility stays today's rule for parity. The read-pattern rule is the parent's Future work and is
-not built here. `DataEdge.in_place` is the decoded value of `merge_<p>_<c>`, through `in_place_literal(edge) -> literal
+not built here. `DataEdge.in_place` is the decoded value of `merge_<p>_<c>`, through `in_place_literal(enc, edge) -> literal
 | None`. `DataEdge.in_place_candidate`, from Stage 2, is the division-invariant gate, but a flag has
 no list order and Stage 8's parity reads that order, so `in_place_candidates(node)` supplies it: the
 sources of flagged edges from computed ops, in `op_read_writes(node.op).reads` order, then flagged
@@ -490,15 +519,15 @@ input with no `PrefetchMenu`, which has no unit, and is the ordered truth for th
 `in_place_parents`. `check_in_place_parent_is_read` runs once while building `in_place`, and a
 violation raises, like `_check_in_place_relationships` today.
 
-The order inside `_encode_in_place` is `ilp_solver_ortools.py:1635-1658` with no change. OR-Tools stays
-stricter than Stage 3's physical `IN_PLACE` and `TILE_ALIGNED` by encoding: equal `eff_size`, and a match
+The order inside `encode_in_place` is `ilp_solver_ortools.py:1635-1658` with no change. OR-Tools stays
+stricter than Stage 3's physical `in_place_conditions` and `tiles_line_up` by encoding: equal `eff_size`, and a match
 pair on every edge inside a nest. The shared offset is one helper, the first post of each edge:
 
 ```python
-def _post_shared_offset(self, src: OpVars, dst: OpVars, merge) -> None: ...
+def _post_shared_offset(enc: Encoding, src: OpVars, dst: OpVars, merge) -> None: ...
 ```
 
-`_encode_placement` here only calls `_encode_capacity`, which posts `:1660-1662` for the same parity
+`encode_placement` here only calls `_encode_capacity`, which posts `:1660-1662` for the same parity
 reason. Stage 7 replaces the helper with `tie` and `_encode_capacity` with `place` (Deviation 8).
 
 ### LX prefetch without a `Buffer`
@@ -515,7 +544,7 @@ division of the input, so `CoreDivision` keys stay consumer symbols, because `sp
 the proto uses them. They never reach the graph. Stage 7 decodes with:
 
 ```python
-def prefetch_view(self, node: InputNode, value: Callable[[Any], int]) -> PerCoreView:
+def prefetch_view(enc: Encoding, node: InputNode, value: Callable[[Any], int]) -> PerCoreView:
     """The chosen row of the node's PrefetchMenu."""
 ```
 
@@ -525,19 +554,19 @@ division must read that view. Only `_gate_pairs` would change for a non-enumerat
 ### Restickify and the hazard
 
 **The pinned step needs a node.** A pre-pass restickify has a menu, residency, a tick, readers and a
-cost term today, and `Transform` carries no split. So it is a `RestickifyNode`, encoded as any op, and
-the edge into it carries `Restickify(pinned=True, realized_by=node)`. The step has no footprint,
-variables or box of its own (Deviation 1).
+cost term today, and `Step` carries no split. So it is a `RestickifyNode`, encoded as any op, and
+the edge into it carries `Step(kind=StepKind.RESTICKIFY, pinned=True, realized_by=node)`. The step
+has no footprint, variables or box of its own (Deviation 1).
 
-`_encode_restickifies` handles the general case so Stage 11 only lifts pins:
+`encode_restickifies` handles the general case so Stage 11 only lifts pins:
 
 ```python
 for edge in graph.data_edges:
-    if graph.pins_on(edge, "restickify"):  # the step exists, so PINNED holds by construction
-        self.symbol(Sym.restick(edge_name(edge)).name, True)
+    if graph.pins_on(edge, "restickify"):  # the step exists: pinned_steps_stay holds
+        symbol(enc, Sym.restick(edge_name(edge)).name, True)
         continue
-    forced = self._neq(stick_of(edge.src, graph), read_stick(edge, graph))  # folds on constants
-    self.symbol(Sym.restick(edge_name(edge)).name, forced)
+    forced = _neq(enc, stick_of(edge.src, graph), read_stick(edge, graph))  # folds on constants
+    symbol(enc, Sym.restick(edge_name(edge)).name, forced)
 ```
 
 A pinned edge is not compared, because the two sticks are host dims of different buffers: a
@@ -551,7 +580,7 @@ there. Unpinned steps, carrying `target`, first exist at 11b, which changes the 
 **The hazard.** The rule is that a restickify reads a resident source only through that source's
 same-core slice, or after a relayout, or from HBM. On the joint path this is exactly the gate: `match`
 is the same-core slice, `served` is the relayout, `via_full` is HBM. So this stage posts no new
-constraint. A gate whose reader is a `RestickifyNode` carries the rule `Always.CROSS_FRAME`. That holds
+constraint. A gate whose reader is a `RestickifyNode` carries the rule `"cross_frame"`. That holds
 only while gate tables are built for that restickify's read view, which is true for a node. Stage 11's
 solver-placed steps need tables per read stick, and own the hazard constraint then.
 
@@ -560,8 +589,8 @@ stricter behaviour (`SPYRE_LX_PLANNER_RELAYOUT=0` bars every restickify reader, 
 the proof) and applies when `graph.divisions_committed`, through the residency rule named `restickify`,
 which Stage 3 keeps. `restickify_read_is_core_local` takes the same arguments as the old method.
 
-**Order on one edge.** The list order of `DataEdge.transforms` is physical and nothing sorts it.
-`ORDER` only places a step a decoder appends. The code allows both orders:
+**Order on one edge.** The list order of `DataEdge.steps` is physical and nothing sorts it.
+`STEP_KINDS[kind].order` only places a step a decoder appends. The code allows both orders:
 
 - **Relayout before restickify is legal.** `_restickify_read_is_core_local` accepts a source when a
   plan's destination view equals the restickify's read view (`allocator.py:1513-1521`). That view is on
@@ -578,11 +607,12 @@ which Stage 3 keeps. `restickify_read_is_core_local` takes the same arguments as
   both on a hand-built P, R, C). A compile reaching it was not shown.
 
 `to_view` indexes the device dims of the layout it applies to, so the order is not cosmetic. With a
-node, the two shapes are `P -> R [Relayout, Restickify]`, where Stage 7 inserts the relayout before the
-pinned step with `insert_step`, and a relayout of R's output on the edge out of R. `CopyOut` first agrees
-with today: a restickify outside the nest reads the full buffer from HBM. `CopyOut` and `Relayout` never
-share an edge. A restickify *inside* a nest with its value cut sits on two edges here (`P -> R`,
-`R -> C[CopyOut]`). A solver-placed one could not express that, which Stage 11 has to rule out.
+node, the two shapes are `P -> R [RELAYOUT, RESTICKIFY]`, where Stage 7 inserts the relayout before
+the pinned step with `insert_step`, and a relayout of R's output on the edge out of R. `COPY_OUT`
+first agrees with today: a restickify outside the nest reads the full buffer from HBM. `COPY_OUT`
+and `RELAYOUT` never share an edge. A restickify *inside* a nest with its value cut sits on two
+edges here (`P -> R`, `R -> C[COPY_OUT]`). A solver-placed one could not express that, which Stage
+11 has to rule out.
 
 ### Completed-reduction rows
 
@@ -612,54 +642,57 @@ with committed ownership.
 
 ### The objective
 
-Stage 4 owns the terms, this stage owns `_encode_objective` and the lowering, and Stage 7 runs the
+Stage 4 owns the terms, this stage owns `encode_objective` and the lowering, and Stage 7 runs the
 stages and adds the locks.
 
 ```python
 @dataclass(frozen=True)
-class SolveStage:                  # family/ortools_encoder.py
+class SolveStage:                  # family/ortools_encode.py
     name: str                      # "cost", or a ladder name
     expr: "cp_model.LinearExprT | None"   # None: any plan, for a constant cost
     maximize: bool = False
 
-def _encode_objective(self) -> None:
-    """Fill CpModel.objective_stages and set the first stage's objective on the model."""
+def encode_objective(enc: Encoding) -> None:
+    """Fill enc.ortools.objective_stages and set the first stage's objective on enc.model."""
 ```
 
 In order:
 
-1. **Domains.** `_cost_domains()` extends Stage 5's `nodes`: `readers` from `EdgeTables.gates`, repeats
+1. **Domains.** `cost_domains(enc)` extends Stage 5's `nodes`: `readers` from `EdgeTables.gates`, repeats
    kept; one `NodeDomain` per group; and one `RelayoutOffer` per group, in name order, as
    `allocator.py:3346-3351` adds charges. `prices_ns` is `{domain.selector_values(entries[i]): price for
    i, price in group.cost_by_source_division.items()}` over the source's menu.
-2. **Priced.** `expr = cost_model.priced_objective(graph, domains, linear_only=True)`. Stage 4's
-   expression already holds the charges, as `SplitKeyedCharge`, so nothing is added here. If it is not
-   `None`, `cost_expr_to_cpsat(m.cp, m.symbols, m.columns, expr, strict=True)` lowers it. `RuntimeError`,
-   `TypeError` and `ValueError` warn and re-raise unless `config._cpsat_warn_on_cost_expr`, as `:886-900`
-   does, and then go to step 3. `UnknownSymbolError` is a `KeyError`, so a name no encoder bound is not
-   swallowed. On success `objective_stages` is `[SolveStage("cost", cost)]`, with `cp.minimize(cost)`, or
-   `[SolveStage("cost", None)]` with no objective when `cost` is a constant, and that ends it.
+2. **Priced.** `expr = graph.target.cost_model.priced_objective(graph, domains, linear_only=True)`.
+   Stage 4's expression already holds the charges, as `SplitKeyedCharge`, so nothing is added here.
+   If it is not `None`, `cost_expr_to_cpsat(enc.model, enc.symbols, enc.ortools.columns, expr, strict=True)`
+   lowers it. `RuntimeError`, `TypeError` and `ValueError` warn and re-raise unless
+   `config._cpsat_warn_on_cost_expr`, as `:886-900` does, and then go to step 3. `UnknownSymbolError`
+   is a `KeyError`, so a name no encoder bound is not swallowed. On success `objective_stages` is
+   `[SolveStage("cost", cost)]`, with `enc.model.minimize(cost)`, or `[SolveStage("cost", None)]` with
+   no objective when `cost` is a constant, and that ends it.
 3. **Unpriced.** When `priced_objective` returned `None` or lowering raised, pin every
    `relayout_literals` value to 0 before any term is built (`ilp_solver_ortools.py:1454-1455`).
 4. **Ladder symbols.** In unit order, create `resident_cut_<op>` and `reads_full_<op>_<reader>` with
    `_cut_traffic_terms`'s calls, and bind `Sym.cut`, `Sym.resident_cut`, `Sym.reads_full(p, c, listing)`,
-   `Sym.cores`, `Sym.shape` and `Sym.tiles`, the last from `tile_terms` in `_encode_tile_counts`'s walk.
+   `Sym.cores`, `Sym.shape` and `Sym.tiles`, the last from `tile_terms` in `encode_tile_counts`'s walk.
    `reads_full` is per gate listing, so a double read charges twice, as today. The proto name keeps
    today's spelling on a repeat, and the symbol takes `listing`.
-5. **Ladder stages.** For each `ObjectiveStage` in `cost_model.ladder(graph, domains)`, append
-   `SolveStage(stage.name, linear_terms_to_cpsat(m.symbols, stage.terms), stage.sense is Sense.MAXIMIZE)`,
-   then set the first stage's objective on `cp`.
+5. **Ladder stages.** For each `ObjectiveStage` in `graph.target.cost_model.ladder(graph, domains)`,
+   append `SolveStage(stage.name, linear_terms_to_cpsat(enc.symbols, stage.terms),
+   stage.sense is Sense.MAXIMIZE)`, then set the first stage's objective on `enc.model`.
 
-A `CostModel(traffic_only=True)` reaches steps 3 to 5 and gets `residency` alone, which is committed
-mode. `cost_model=None` leaves `objective_stages` empty, for tests of constraints only.
+A target whose cost model has `traffic_only=True` reaches steps 3 to 5 and gets `residency` alone,
+which is committed mode. A target with `cost_model=None` leaves `objective_stages` empty, for tests
+of constraints only.
 
 ## Changes
 
 | file | change |
 |---|---|
 | `scratchpad/lx_allocator/family/edge_tables.py` | new: tables, `Gate`, `RelayoutGroup`, `PrefetchMenu`, moved candidate code, `prefetch_menu`, `in_place_candidates`, `residency_edge`, `edge_match_pairs`, `edge_name`, `restickify_residency_bar`, `restickify_read_is_core_local`, `settle_deferred_reads` |
-| `scratchpad/lx_allocator/family/ortools_encoder.py` | hooks filled; `SolveStage`, `_encode_objective`, `_cost_domains` extension; `CpModel.copies`, `.relayout_literals`, `.objective_stages`; `OpVars` fields; `fired_relayouts`, `decision_variables`, decode helpers |
-| `scratchpad/lx_allocator/check.py` | `RELAYOUT_SOURCE` gains the view comparison |
+| `scratchpad/lx_allocator/family/ortools_encode.py` | slots filled; `SolveStage`, `encode_objective`, `cost_domains` extension; `OrToolsState.edges` filled, and `OrToolsState.copies`, `.relayout_literals`, `.incoming`, `.objective_stages` added; `OpVars` fields; `fired_relayouts`, `decision_variables`, decode helpers; the target switches |
+| `scratchpad/lx_allocator/family/ortools_family.py` | `OrToolsFamily.STEPS`, `RULES` and `OPTIMIZATIONS` gain this stage's entries |
+| `scratchpad/lx_allocator/check.py` | `relayout_source` gains the view comparison |
 | `scratchpad/allocator.py` | moved methods become delegates; no behaviour change |
 | `scratchpad/lx_relayout.py` | `RelayoutCandidate` fields; `FiredRelayoutGroup` carries `completed_producer_cores` |
 | `torch_spyre/_inductor/pass_utils.py` | `completed_reduction_split` |
@@ -676,13 +709,15 @@ gated on what it adds.
    re-pointed tests. Stage 0 harness: empty diff on proto and plans.
 2. **Add row fields.** `reduction_split`, `completed_producer_cores`, the `plan` passthrough.
 3. **Tables as data.** `edge_tables.py`'s types and functions. A test compares them with the allocator's records.
-4. **Units.** `_settle_tables`, prefetch tables, `merge_*` literals, relayout-group units.
+4. **Units.** `settle_tables`, prefetch tables, `merge_*` literals, relayout-group units.
 5. **Nests, copy-outs, guard, lifetimes.**
 6. **In-place overwrite and capacity.**
 7. **Gates and relayout coupling**, with `fired_relayouts`.
 8. **Objective.** The drop set is now the no-overlap section alone.
-9. **Restickify and the hazard**, with the `RELAYOUT_SOURCE` view comparison.
+9. **Restickify and the hazard**, with the `relayout_source` view comparison.
 10. **Completed rows behind the flag.**
+11. **Target switches.** The rows of "What the target switches on", with
+    `test_target_switches_remove_variables`. `SPYRE`'s proto does not change.
 
 ## Interfaces
 
@@ -690,22 +725,24 @@ Consumes:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| `SpyreOptimizationGraph` | `.ir`, `.nodes`, `.data_edges`, `.execution_edges`, `.capacity`, `.alignment`, `.divisions_committed`, `.pins_on(target, what)`, `.pin(...)`, `.step(node)`, `.lifetime(node)` | 1, filled by 2 | iteration, slots, in-place adjacency |
-| `DataEdge`, `ExecutionEdge` | `.src`, `.dst`, `.transforms`, `.mutation`, `.in_place_candidate`; `.before`, `.after` | 1, filled by 2 | gates, in place |
+| `SpyreOptimizationGraph` | `.ir`, `.nodes` (op order), `.data_edges`, `.target`, `.cuts: set[int]`, `.divisions_committed`, `.pins_on(target, what)`, `.pin(...)`, `.step(node)`, `.lifetime(node)` | 1, filled by 2 | iteration, slots, in-place adjacency |
+| `Target` | `.lx_bytes`, `.alignment`, `.rules`, `.steps`, `.optimizations`, `.cost_model`; `select_target(config)` | 1, 2 | capacity, the target switches, the objective |
+| `Rule`, `Optimization`, `StepKind` | `Rule.RESIDENT_TILE_UNREDUCED`, `.COPY_OUT_IN_HBM`; `Optimization.IN_PLACE`, `.PREFETCH`, `.COARSE_TILING`; `StepKind.COPY_OUT`, `.RESTICKIFY`, `.RELAYOUT` | 1 | the target switches |
+| `DataEdge` | `.src`, `.dst`, `.steps`, `.mutation`, `.in_place_candidate` | 1, filled by 2 | gates, in place |
 | `OpNode`, `InputNode` | `.op`, `.graph_output`, `.deferred_direct_read`, `.tick`, `.uses`, `.prefetch_view` | 1, filled by 2 | views; `ResidencyEdge` needs the op |
-| `RestickifyNode`, pre-pass step | `Restickify(to_stick, realized_by=node, pinned=True)`, `Pin(edge, "restickify", s, "pre-pass")` | 1, 2 | gates, `forced` |
-| `Relayout` | `to_view`, `reduction_split`, `source_view`, `source_footprint_bytes`, `destination_footprint_bytes`; list order physical | 1 | check |
+| `RestickifyNode`, pre-pass step | `Step(kind=StepKind.RESTICKIFY, to_stick=s, realized_by=node, pinned=True)`, `Pin(edge, "restickify", s, "pre-pass")` | 1, 2 | gates, `forced` |
+| `Step` of kind `RELAYOUT`, `STEP_KINDS` | `to_view`, `reduction_split`, `source_view`, `source_footprint_bytes`, `destination_footprint_bytes`; list order physical; `STEP_KINDS[kind].order` | 1 | check |
 | deferred-read pin | `Pin(node, "split", WorkSplitPin(split, reason), "hazard")`, `work_split_from_division(node, division)` | 1, 2 | rejected read |
 | `carry_pairs`, `CarryPair` | `(graph) -> list[CarryPair(storage, reader, role)]` | 2 | CARRY gates |
-| `Always`, `RuleViolation`, `check_decisions` | `Always.RESIDENT_READ`, `.RELAYOUT_SOURCE`, `.CROSS_FRAME`, `.IN_PLACE`, `.TILE_ALIGNED`, `.CUT_TILE`, `.PINNED`, `.COPY_OUT`, `.NO_OVERLAP`, `.TABLE_COLUMN` | 3 | provenance, the added comparison |
+| `ALWAYS`, `RuleTag`, `TABLE_COLUMN`, `Rule`, `RuleViolation`, `check_decisions` | `ALWAYS` checks `resident_read`, `relayout_source`, `cross_frame`, `in_place_conditions`, `tiles_line_up`, `pinned_steps_stay`, `boxes_fit_lx`, each a tag as its name string; `TABLE_COLUMN`, a tag with no check; `Rule.RESIDENT_TILE_UNREDUCED`, `Rule.COPY_OUT_IN_HBM`; `check_decisions(graph)` | 3 | provenance, the added comparison |
 | `residency_reason` | `(node, graph, *, decides_relayouts, tileable) -> str \| None` | 3 | barred producers, prefetch eligibility |
 | residency rule | `restickify` still present, calling the delegate | 3 | committed mode |
 | `Sym` | `.cut(n)`, `.resident_cut(n)`, `.reads_full(p, c, listing=0)`, `.restick(edge_name, row=None)`, `.cores(n)`, `.shape(n)`, `.tiles(n)` | 4 | symbol binding |
-| `CostModel`, `ObjectiveStage`, `Sense` | `priced_objective(graph, domains, *, linear_only) -> Expr \| None`; `ladder(graph, domains)`; `traffic_only` | 4 | `_encode_objective` |
-| `CostDomains`, `NodeDomain`, `RelayoutOffer`, `domains_from_buffers` | `(nodes, relayouts=())`; `selector_values(candidate)`; `(buffers) -> CostDomains` | 4 | `_cost_domains`, its parity |
+| `SpyreCostModel`, `ObjectiveStage`, `Sense` | `graph.target.cost_model`; `priced_objective(graph, domains, *, linear_only) -> Expr \| None`; `ladder(graph, domains)`; `traffic_only` | 4 | `encode_objective` |
+| `CostDomains`, `NodeDomain`, `RelayoutOffer`, `domains_from_buffers` | `(nodes, relayouts=())`; `selector_values(candidate)`; `(buffers) -> CostDomains` | 4 | `cost_domains`, its parity |
 | `cost_expr_to_cpsat`, `linear_terms_to_cpsat`, `UnknownSymbolError` | `(model, sym_map, buffer_map, expr, *, strict=False)`; `(sym_map, terms)` | 4 | lowering |
-| `Encoder`, `OrToolsEncoder`, `CpModel`, `Provenance` | `post`, `symbol`, `tag`; `cp`, `proto`, `ops`, `columns`, `symbols`, `tile_terms` | 5 | everything |
-| encode sequence | `_begin`, `_build_tables`, `_settle_tables`, `_encode_op_vars`, `_add_unit(table, *, size_units, boundary) -> OpVars`, `_menus`, `_encode_loop_columns`, `_post_residency`, `_encode_tile_counts`, `_bind_symbols`, `_encode_sticks`, `_cost_domains`, and the hooks | 5 | proto order |
+| `OrToolsFamily`, `Encoding`, `OrToolsState`, `Provenance` | `encode(graph) -> Encoding`; `post`, `post_in`, `post_table`, `symbol`, `tag`, each taking `enc` first; `Encoding.model` (`.proto`), `.provenance`, `.symbols`, `.ortools`; `OrToolsState.ops`, `.units`, `.columns`, `.tables`, `.tile_terms`, `.edges` | 5 | everything |
+| encode sequence, functions in `family/ortools_encode.py` | `begin(graph) -> Encoding`, `build_tables(enc)`, `encode_ops(enc)`; `settle_tables`, `encode_op_vars`, `add_unit(enc, table, *, size_units, boundary) -> OpVars`, `declare_in_place_vars(enc, v)`, `menus`, `encode_loop_columns`, `post_residency`, `encode_tile_counts`, `bind_symbols`, `encode_sticks`, `cost_domains`, `decision_variables`, and the slots, each `(enc)` | 5 | proto order |
 | `OpVars` | `.table`, `.name`, `.units`, `.in_buffer`, `.offset`, `.eff_size`, `.division`, `.division_is(i)`, `.cores`, `.core_cost`, `.loop_id`, `.tiled`; this stage adds `.merge_vars`, `.cut`, `.via_full`, `.nest_end`, `.nest_start`, `.end`, `.start`, `.relayout_reads`, `.serves` | 5 | every constraint |
 | `DivisionTable` | `.node`, `.entries`, `.enumerated`, `.tileable`; tables cover non-input nodes | 5 | menus |
 | `stick_of`, `read_stick` | `(port, graph)`, `(edge, graph)`; the second walks the edge's steps | 5 | `forced` |
@@ -722,18 +759,19 @@ Provides:
 | `settle_deferred_reads` | above | 8 | final |
 | `prefetch_menu`, `in_place_candidates`, `residency_edge`, `edge_match_pairs` | `(input_node, tables) -> PrefetchMenu \| None`; `(node) -> list[str]`, today's order; `(gate) -> ResidencyEdge \| None`; `(gate) -> tuple[tuple[int, int], ...]` | 8 | final |
 | `RelayoutCandidate.reduction_split`, `.completed_producer_cores` | defaulted fields | 7, 10 | final |
-| `SolveStage`, `CpModel.objective_stages` | `SolveStage(name, expr, maximize=False)`; `name == "cost"` for the priced stage; `expr=None` for a constant cost; ladder names `residency`, `cut tiebreak`, `parallelism`, `division shape`, `tile count` | 7 | final |
-| `CpModel.relayout_literals`, `CpModel.copies` | `dict[str, literal]`, group name to residency; `dict[str, OpVars]` | 7 | final |
-| `OrToolsEncoder.fired_relayouts`, `FiredRelayout` | `(value: Callable[[Any], int]) -> list[FiredRelayout]`; `gate`, `group`, `row`; raises unless exactly one row | 7 | final |
-| decode helpers | `joined_literal(ExecutionEdge)`; `in_place_literal(DataEdge) -> literal \| None`; `copy_out_literal(OpNode)`; `via_full_literal(DataEdge)`; a literal or `False` where not stated; `prefetch_view(node, value) -> PerCoreView` | 7 | final |
-| `OrToolsEncoder.decision_variables` | `() -> list`: residency, `merge_*`, served and division, as `ilp_solver_ortools.py:805` | 7 | final |
-| `_encode_in_place`, `self._incoming`, `OpVars.end`, `.start`, `_encode_lifetimes` | in-place loop, `add_at_most_one` before `_encode_placement`; `dict[str, list[literal]]`; `_Slots` values | 7 | final |
+| `SolveStage`, `OrToolsState.objective_stages` | `SolveStage(name, expr, maximize=False)`; `name == "cost"` for the priced stage; `expr=None` for a constant cost; ladder names `residency`, `cut tiebreak`, `parallelism`, `division shape`, `tile count` | 7 | final |
+| `OrToolsState.relayout_literals`, `.copies`, `.edges` | `dict[str, literal]`, group name to residency; `dict[str, OpVars]`; `EdgeTables`; reached as `enc.ortools` | 7 | final |
+| `fired_relayouts`, `FiredRelayout` | `(enc, value: Callable[[Any], int]) -> list[FiredRelayout]`; `gate`, `group`, `row`; raises unless exactly one row | 7 | final |
+| decode helpers | `joined_literal(enc, before: OpNode)`, false where `before.tick` goes in `graph.cuts`; `in_place_literal(enc, edge: DataEdge) -> literal \| None`; `copy_out_literal(enc, node: OpNode)`; `via_full_literal(enc, edge: DataEdge)`; a literal or `False` where not stated; `prefetch_view(enc, node, value) -> PerCoreView` | 7 | final |
+| `decision_variables` | `(enc) -> list`: residency, `merge_*`, served and division, as `ilp_solver_ortools.py:805` | 7 | final |
+| `encode_in_place`, `OrToolsState.incoming`, `OpVars.end`, `.start`, `_encode_lifetimes` | in-place loop, `add_at_most_one` before `encode_placement`; `dict[str, list[literal]]`; `_Slots` values | 7 | final |
 | `_post_shared_offset`, `_encode_capacity` | above | 7 | temporary, removed in Stage 7 |
-| `_encode_restickifies`, its `Sym.restick` binding | `Sym.restick(edge_name(edge))`, a bool in Phase 2 | 11 | final; 11b changes the raise |
+| `encode_restickifies`, its `Sym.restick` binding | `Sym.restick(edge_name(edge))`, a bool in Phase 2 | 11 | final; 11b changes the raise |
 | `restickify_residency_bar` | `(ir, name, uses, *, plans=()) -> str \| None` | none; the `restickify` residency rule calls it | final |
 | `restickify_read_is_core_local` | `(ir, name, reader, *, plans=()) -> bool` | 11 | final |
 | `_loop_carry_update_edge` | moved to `family/edge_tables.py` | 10, 13 | final |
-| `_table_owners` | `() -> Iterable[OpVars]`, `ops` then `copies` | 7 | final |
+| `_table_owners` | `(enc) -> Iterable[OpVars]`, `ops` then `copies` | 7 | final |
+| `OrToolsFamily.STEPS`, `.RULES`, `.OPTIMIZATIONS` entries | `COPY_OUT`, `RESTICKIFY`, `RELAYOUT`; `RESIDENT_TILE_UNREDUCED`, `COPY_OUT_IN_HBM`; `IN_PLACE`, `PREFETCH`, `COARSE_TILING` | 3 (`coverage`), 7 | final |
 | `edge_tables_from_buffers` | `(buffers, graph) -> EdgeTables`, in `tests/inductor/lx_replay_graph.py` | 7, 13 | final; replay arm |
 | config `lx_solver_completed_reduction_routes` | bool, default False | 12, 13 | final; Stage 12 flips the default |
 
@@ -765,7 +803,8 @@ process, with no card.
   equal to `derive_completed_reduction_routes`.
 
 `tests/inductor/test_lx_ortools_encoder_edges.py`, device-free, hand-built graphs through the encoder and a plain
-`CpSolver`. Hand-built graphs have no IR, so a stub `CostModel` supplies the expression.
+`CpSolver`. Hand-built graphs have no IR, so a derived target with a stub cost model supplies the
+expression.
 
 - Ports of `tests/inductor/test_solver_relayout_decision.py`:
   `test_relayout_fires_when_cheaper_than_the_spill`, `test_relayout_declines_when_dearer_than_the_spill`,
@@ -783,8 +822,8 @@ process, with no card.
   source view and `reduction_split` are unchanged. This is the regression test for the `fired()` bug.
 - `test_fired_relayout_raises_on_a_row_mismatch`: corrupt a row's `source_view`; `RuleViolation`.
 - `test_fired_relayout_raises_on_two_copies`, `test_fired_relayout_raises_on_a_spilled_copy`: under `-O` too.
-- `test_cut_is_not_the_copy_out`: chain a, b, c with b untiled. `joined_literal` gives cuts on both edges
-  and `copy_out_literal(b)` is `False`.
+- `test_cut_is_not_the_copy_out`: chain a, b, c with b untiled. `joined_literal` puts the ticks of a
+  and b in `graph.cuts`, and `copy_out_literal(enc, b)` is `False`.
 - Ports of the nest cases from `tests/inductor/test_scratchpad_solver.py`:
   `test_cut_stage_splits_a_pair_the_table_does_not_match` (`:1652`),
   `test_cut_stage_joins_a_matched_pair_with_different_specs` (`:1731`),
@@ -795,11 +834,14 @@ process, with no card.
   tiled P cut, P resides through `via_full`. This is the claim "a restickify may not read a core-sliced
   resident source unless a relayout comes first".
 - `test_restickify_rule_posts_nothing_new`: the same graph with a `PointwiseNode` in R's place has an
-  equal proto, and only the rule on R's gates differs, `Always.CROSS_FRAME`.
+  equal proto, and only the rule on R's gates differs, `"cross_frame"`.
 - `test_restickify_residency_bar_matches_the_old_barrier`: runs the cases at
   `tests/inductor/test_work_division_hint.py:978-982`.
 - `test_unpinned_forced_restickify_raises`, `test_in_place_excludes_via_full`,
   `test_in_place_at_most_one_each_way`.
+- `test_target_switches_remove_variables`: over targets derived from `SPYRE`, each row of "What the
+  target switches on" adds or removes exactly the variables it names, and `SPYRE` itself gives the
+  same proto as the default build.
 
 Existing suites, serial: all of the parent plan's unit list. `test_solver_relayout_decision`,
 `test_solver_relayout_candidates`, `test_work_division*`, `test_coarse_tiling`, `test_scratchpad_solver`
@@ -826,11 +868,11 @@ PR. `fake` inputs use default layouts, so this proves parity, not production pla
   range, by its checkpoints, variables and constraints. `project_today` renumbers `objective` as well.
   `vars`, `literals` and `enforcement_literal` stay the only reference fields: `element`, `table` and
   `lin_max` hold `vars` inside their expressions on OR-Tools 9.15 (`exp/stage-06/fields.py`).
-- **B:** `OrToolsEncoder(CostModel(), coarse_tiling=config.auto_coarse_tiling).encode(build_graph(ir))`, first-stage objective included,
-  `_encode_placement` posting capacity only. It runs on live compiles through `lx_shadow_plugin`, at each
+- **B:** `OrToolsFamily().encode(build_graph(ir, select_target(config)))`, first-stage objective
+  included, `encode_placement` posting capacity only. It runs on live compiles through `lx_shadow_plugin`, at each
   joint solve, on the `fake` zoo at both configs and the unit suites that hold a `GraphLowering`.
 - **Pass:** variable strings, constraint strings and the objective are equal, lists in order, for every
-  such solve. The corpus has both priced and ladder solves. `_cost_domains` also equals
+  such solve. The corpus has both priced and ladder solves. `cost_domains` also equals
   `domains_from_buffers(solver.buffers)`.
 
 Stage 7 empties the drop set, and the gate becomes the whole proto.
@@ -838,8 +880,8 @@ Stage 7 empties the drop set, and the gate becomes the whole proto.
 **In CI.** `test_lx_live_parity.py` extends to these sections on `fake` compiles of the fixed set, at
 default and tiling. The replay arm in `test_lx_encoder_sections.py` keeps `load_captures`,
 `synthetic_graphs()` and the hand-built cases: `edge_tables_from_buffers` feeds `cd_parent_matches` and
-`cd_parent_relayouts` to `_encode_read_gates` over `replay_graph`, through a test subclass's
-`_settle_tables`, and stops at `_encode_tile_counts`. It tests emission, not the tables, because those
+`cd_parent_relayouts` to `encode_read_gates` over `replay_graph`, through a test subclass's
+`settle_tables`, and stops at `encode_tile_counts`. It tests emission, not the tables, because those
 nodes have no IR. Captures are not a route to the encoder.
 
 **Reported in the PR.** Hits per `corpus_coverage` feature, restickify features included. A zero on a
@@ -871,8 +913,8 @@ listed by rule, or fixed.
   but `rw.reads | rw.writes` and the name sets around it are not ordered by contract. Caught by running the
   gate under the hash seeds in `tests/inductor/test_scratchpad_solver.py:1009`.
 - **Fake tensors.** `Gate.residency` holds ops. Nothing keeps a table on the graph or in
-  `CpModel.provenance`, and the harness must not pickle the encoder. Caught by a test that pickles `CpModel`
-  metadata and the graph.
+  `Encoding.provenance`, and the harness must not pickle the encoding's model. Caught by a test that
+  pickles `Encoding` metadata and the graph.
 - **The rebase race.** Main keeps changing `_cd_parent_relayouts`. The move in commit 1 goes first so later
   fixes land in one body. `test_lx_live_parity.py` fails in CI when the model changes without the encoder.
 - **#5695 lands first.** `settle_deferred_reads` then has to call `divide_deferred_op` before
@@ -881,7 +923,7 @@ listed by rule, or fixed.
 - **Completed rows.** Each reduction-split entry can add rows and copies, and copies dominate CP-SAT's model
   size (`sa-vs-cpsat-REPORT.md`). Not measured. The price is an unfitted estimate, so the solver may pick a
   route the hardware does not reward. The flag stays off until Stage 12's comparison and device test.
-- **Group sharing across a restickify and a plain reader.** One `Relayout` object sits on both edges, and
+- **Group sharing across a restickify and a plain reader.** One `RELAYOUT` step sits on both edges, and
   Stage 10 must insert it once. Caught by `test_one_source_two_consumers_share_one_relayout`
   (`tests/inductor/test_solver_relayout_e2e.py:596`) once Stage 10 replaces the commit path.
 - **A read that legitimately differs in stick with no restickify.** The raise would be a false alarm, for
@@ -891,13 +933,14 @@ listed by rule, or fixed.
 
 1. **Pinned restickify as a step.** Plan: "A restickify inserted before the graph is built is a pinned
    step." Code: a restickify op has its own menu, residency, tick and bundle cost (`allocator.py:3737-3800`),
-   and byte identity needs its variables. Resolution: a `RestickifyNode` plus `Restickify(pinned=True,
-   realized_by=node)` on the edge. Commit inserts nothing for the step.
+   and byte identity needs its variables. Resolution: a `RestickifyNode` plus
+   `Step(kind=StepKind.RESTICKIFY, pinned=True, realized_by=node)` on the edge. Commit inserts nothing
+   for the step.
 
 2. **"Today's `_restickify_barrier` enforces this."** Only on the placement path (`allocator.py:847-855`).
    The joint path uses the generic gate (`ilp_solver_ortools.py:534-597`), and the barrier's docstring says
    calling it there would be wrong (#4655, `allocator.py:1454-1461`). Resolution: no new joint constraint;
-   the gate carries `Always.CROSS_FRAME`, and the barrier stays for committed divisions. So
+   the gate carries `"cross_frame"`, and the barrier stays for committed divisions. So
    `SPYRE_LX_PLANNER_RELAYOUT=0` keeps not barring restickify readers on the joint path, even though the
    comment at `torch_spyre/_inductor/config.py:179-180` reads as if it did. It does narrow what is
    representable there, through the ownership proofs at `torch_spyre/_inductor/pass_utils.py:3766`, `:3898`.
@@ -933,6 +976,11 @@ listed by rule, or fixed.
    precede `_add_core_division`. Resolution: Stage 6 posts the offset equality and capacity behind helpers
    and gates with the no-overlap range dropped. Stage 7 gates the whole proto.
 
+9. **"The partial-reduction cut guard is an always-on rule."** Its rule, "a copied-out tile that
+   stays resident has no reduction split", is the card rule `Rule.RESIDENT_TILE_UNREDUCED` in the
+   parent's own `Rule` list. Resolution: the guard is posted only when `graph.target.rules` holds that
+   flag, and is tagged with it. `SPYRE` holds it, so the proto does not change.
+
 ## Open questions
 
 None.
@@ -943,8 +991,8 @@ None.
 - `no_overlap`, boxes, packing, `Solution`, `read_back`, running the objective stages and their locks: Stage 7.
 - SA relations: Stage 8. `optimize`, failure handling, the temporary commit bridge: Stage 9.
 - Inserting steps, `_push_allocation`, shared-step insertion, deriving `completed_producer_cores`: Stage 10.
-- Free sticks, gate tables per stick pair, `restick_resident`, a solver-placed `Restickify`'s division, box
-  and tick, and the hazard constraint for it: Stage 11. This stage leaves it the literal and the rule tag.
+- Free sticks, gate tables per stick pair, `restick_resident`, a solver-placed `RESTICKIFY` step's
+  division, box and tick, and the hazard constraint for it: Stage 11. This stage leaves it the literal and the rule tag.
 - Turning `lx_solver_completed_reduction_routes` on: Stage 12.
 - Deleting the old model code and the delegates: Stage 13.
 - Relayouts inside menu tilings, priced tiling objectives: the parent's Future work.
