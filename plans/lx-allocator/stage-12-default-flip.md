@@ -1,16 +1,16 @@
 # LX allocator, Stage 12: Default flip
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0 to 10; step 12c also on Stage 11. Needed by: Stage 13.
 
 ## Goal
 
-A compile with no planner settings runs `SpyreOptimizer` with the OR-Tools family, with sticks
+A compile with no planner settings runs `plan_allocation` with `OrToolsFamily`, with sticks
 still pinned (`lx_sticks_in_solve` off). The old path stays selectable by `LAYOUT_SOLVER=cpsat`,
 the kill switch. The flip does not depend on Stage 11: before it, the new path must produce
 byte-identical plans on joint arms, and it must stay within fixed bands on committed arms. This
 stage also owns three one-line defaults: the SA fallback, completed-reduction routes, and, as the
-separate step 12c, `lx_sticks_in_solve`. Nothing is deleted. Rules, encoders and commit do not
+separate step 12c, `lx_sticks_in_solve`. Nothing is deleted. Rules, families and commit do not
 change.
 
 ## Today
@@ -89,16 +89,17 @@ would stop working.
 
 | setting (env) | default | after the flip | after Stage 13 |
 |---|---|---|---|
-| `layout_solver` (`LAYOUT_SOLVER`) | `cpsat` to `ortools` | family key: `SpyreOptimizer`. Old value: old path, with a warning | `Literal["ortools", "sa"]`, see below |
+| `layout_solver` (`LAYOUT_SOLVER`) | `cpsat` to `ortools` | family key: Stage 9's `family_key(config)` names it, and `plan_allocation` builds `FAMILIES[key].from_config(config)` through `select_families`. Old value: `family_key` is `None`, the old path, with a warning | `Literal["ortools", "sa"]`, see below |
+| `target` | `"spyre"` | unchanged: `select_target` reads it on the new path, and it is in the FX key | stays |
 | `co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING`) | `1` | `0` is committed mode, `graph.divisions_committed`. Pass-level readers (`lx_relayout.py:1903`, `materialize_hinted_views.py:135`) unchanged | stays |
 | `lx_planning` (`LX_PLANNING`) | `1` | `0` skips the optimizer; layouts come from `propagate_layouts` and the beam | stays |
 | `allow_exhaustive_search` (`ALLOW_EXHAUSTIVE_SEARCH`) | `0` | old `greedy`, `bestfit`, `firstfit` only. On a family: no effect, warns if set | removed |
-| `auto_coarse_tiling` (`AUTO_COARSE_TILING`) | `0` | drives `OrToolsEncoder.coarse_tiling` and SA's generated divisions. Stays off | stays |
+| `auto_coarse_tiling` (`AUTO_COARSE_TILING`) | `0` | `select_target` keeps `Optimization.COARSE_TILING` only when it is on, for both families. Stays off | stays |
 | `lx_planner_relayout` (`SPYRE_LX_PLANNER_RELAYOUT`) | `1` | same as today, and still does not gate solver relayouts | stays |
-| `lx_solver_relayout` (`SPYRE_LX_SOLVER_RELAYOUT`) | `1` | `0`: the encoder offers no relayouts (Stage 6) | stays |
+| `lx_solver_relayout` (`SPYRE_LX_SOLVER_RELAYOUT`) | `1` | `0`: `OrToolsFamily.encode` offers no relayouts (Stage 6) | stays |
 | `read_copy_elision` (`SPYRE_READ_COPY_ELISION`) | `1` | unchanged: `elide_proven_read_copies` runs on both paths and `division_pin_reasons` reads the flag | stays |
 | `lx_route_to_families` (`SPYRE_LX_ROUTE_TO_FAMILIES`) | `0` | test selector; off, or `cpsat` stops being the old path | removed |
-| `lx_fallback_family` (`SPYRE_LX_FALLBACK_FAMILY`) | `""` to `sa` in 12a | `""` keeps the greedy re-plan | non-empty, a Stage 13 entry condition |
+| `fallback_solver` (`FALLBACK_SOLVER`) | `""` to `sa` in 12a | `""` keeps the greedy re-plan | non-empty, a Stage 13 entry condition |
 | `lx_solver_completed_reduction_routes` (`SPYRE_LX_SOLVER_COMPLETED_ROUTES`) | `0` to `1` in step 5 | off through the identity gates | on, a condition for Stage 13's C12 |
 | `lx_sticks_in_solve` (`SPYRE_LX_STICKS_IN_SOLVE`) | `0` to `1` in 12c | off through the flip | follows 12c |
 
@@ -131,8 +132,8 @@ LAYOUT_SOLVER. If you set this to work around a planner problem, please open an 
 no replacement names the default. An unknown value still raises `ValueError`, now listing the
 accepted values. `LAYOUT_SOLVER=""` still raises, so a broken pipeline is not hidden.
 
-Missing ortools needs nothing here: `select_optimizer` promotes the fallback family with a warning.
-The FX key still says `ortools`, as today's says `cpsat` on a machine that degrades.
+Missing ortools needs nothing here: Stage 9's `select_families` promotes the fallback family with a
+warning. The FX key still says `ortools`, as today's says `cpsat` on a machine that degrades.
 
 ### Retired values, the contract for Stage 13
 
@@ -197,9 +198,10 @@ counted. The two `A` runs give the A/A spread. The stall watcher kills a run aft
 so the three configs get `-v -s` in `.github/suite_test_flags.yaml` and print one line per model.
 Recording time per config is unmeasured; a config that passes the 60-minute limit splits by model.
 
-**Known cost.** The new path adds `build_graph`, `check_decisions` and encoding. If #5695 has landed,
-`solve_decides_work_division()` is false on a family with sticks pinned, so `_distribute_work` runs
-in full there and is deferred on the old arm. That delta is stated in the time gate's reasons.
+**Known cost.** The new path adds `select_target`, `build_graph`, `check_decisions` and encoding.
+If #5695 has landed, `solve_decides_work_division()` is false on a family with sticks pinned, so
+`_distribute_work` runs in full there and is deferred on the old arm. That delta is stated in the
+time gate's reasons.
 
 ### `tools/lx_planning/compare_planners.py`
 
@@ -251,12 +253,12 @@ results never reach production rows. The `/.github/` owners pick the hours.
 | step | what | leaves when |
 |---|---|---|
 | 0 | Entry: Stages 0-10 merged, Phase 2 exit met, no open `RuleViolation` issue, Stage 9's Gate 4 forced-failure report exists | all true |
-| 1 | PR 12a: cron, compare configs, compare tool, `lx_fallback_family` default `"sa"`. Default compiles keep their plans | merged |
+| 1 | PR 12a: cron, compare configs, compare tool, `fallback_solver` default `"sa"`. Default compiles keep their plans | merged |
 | 2 | Calibration, 7 nights. The `A` runs give old-vs-old. Each `Thresholds` time value and `max_aa` becomes the largest nightly value of that statistic, rounded up to the next 1%, committed before the soak | committed |
 | 3 | Soak, 7 consecutive nights passing every gate below. A new-path failure resets the count; an invalid night neither counts nor resets. Dispatches, once each: Stage 13's C1 retarget branch, so `greedy`-pinned tests meet the new path now; `LAYOUT_SOLVER=simulated_annealing` with routing on; `suite_distributed`. By hand: card calibration, Granite. hf-adapters-dev and spyre-frameworks run `LAYOUT_SOLVER=ortools` and report | all gates hold; a named owner signs off in 12b |
 | 4 | PR 12b. Its CI is `regression` on the new default. Dispatch `integration-tests.yaml` with `test_type=regression` on the branch. Do not set the `integration-test` label first, because it skips native CI (`torch_spyre_tests.yaml:115-127`) | merge queue passes |
 | 5 | By the seventh post-flip night: one zoo comparison and `test_completed_reduction_relayout_device` (`test_work_division_hint.py:2187`) with `lx_solver_completed_reduction_routes=1`, under the committed-arm bands with each difference listed by rule. Then a one-line PR turns it on | merged |
-| 6 | Stage 13 may start: 14 consecutive forward nights after step 5; two green reversed lanes; one tag holding the flip and a working kill switch; `lx_fallback_family` non-empty; routes on; no open issue resolved by using the kill switch | all true |
+| 6 | Stage 13 may start: 14 consecutive forward nights after step 5; two green reversed lanes; one tag holding the flip and a working kill switch; `fallback_solver` non-empty; routes on; no open issue resolved by using the kill switch | all true |
 | 12c | PR turning `lx_sticks_in_solve` on, and removing the compare tooling if Stage 13 has already landed. Requires 11b merged and the weekly perf run. Independent of steps 5 and 6, and may come after Stage 13. Stage numbers do not change | gate below |
 
 **Kill switch.** `LAYOUT_SOLVER=cpsat` or `simulated_annealing` before import, or `config.patch` at
@@ -275,7 +277,7 @@ path, and a failed family solve falls back to SA, never to old code. After 12c,
   `simulated_annealing_layout.md:25`: legacy status.
 - `docs/source/user_guide/debugging/failure_classes.md:163`: add `LAYOUT_SOLVER=cpsat` as a triage step.
 - `AGENTS.md:126`, `pyproject.toml:35-39,54`, the comment at `config.py:347-367`.
-- `profile_ops.py:911-916`: accept `select_optimizer()`'s result.
+- `profile_ops.py:911-916`: accept a compile that went through `plan_allocation`.
 - `torch_spyre/profiler/_ffdc.py:308`: add `LAYOUT_SOLVER`, `CO_OPTIMIZING_LX_PLANNING` and
   `AUTO_COARSE_TILING` to `_ENV_KEYS`.
 
@@ -290,7 +292,7 @@ path, and a failed family solve falls back to SA, never to old code. After 12c,
 | 33 existing configs | add `lx_compare` | 12a |
 | `.github/runner_overrides.yaml`, `.github/suite_test_flags.yaml` | as above | 12a |
 | `.github/workflows/lx_planner_compare.yaml` | forward cron | 12a |
-| `torch_spyre/_inductor/config.py` | `lx_fallback_family` default | 12a |
+| `torch_spyre/_inductor/config.py` | `fallback_solver` default | 12a |
 | `torch_spyre/_inductor/config.py` | `layout_solver` default, comment | 12b |
 | `torch_spyre/_inductor/scratchpad/allocator.py` | `LEGACY_LAYOUT_SOLVERS`, `warn_planner_selection`, error text | 12b |
 | `tests/inductor/test_planner_default.py`, config | new, `[unit, regression, integration, trunk]` | 12b |
@@ -321,20 +323,22 @@ warnings, with tests, after the flip so the default never warns; (3) `_ffdc.py`,
 | `fake` tier | compile tier | 0 | compare configs |
 | `install` patching `SolveSettings.from_config` | `SolveSettings(DEFAULT_DTIME, workers=1, deterministic=True)` | 0, 7 | deterministic arms |
 | `check_decisions`, `RuleViolation` | as in Stage 3 | 3 | correctness |
-| `FACTORIES` | keys `"ortools"`, `"sa"` in `lx_allocator/family/registry.py` | 7, 8 | default value |
+| `FAMILIES` | keys `"ortools"`, `"sa"` in `lx_allocator/family/registry.py`, mapping to `OrToolsFamily` and `SAFamily`; `FAMILIES[key].from_config(config)` builds one | 7, 8 | default value |
 | `SolveSettings.from_config` | `time_limit` from `cpsat_time_limit_seconds`, `workers` from `get_cpu_count()`, at least 2 interleaved under `deterministic` | 7 | settings test |
-| Encoder config reads | `coarse_tiling`, `lx_solver_relayout`, relayout caps, `ktir_emitter` | 5, 6 | settings test |
+| Family config reads | `Optimization.COARSE_TILING` in `graph.target.optimizations`, `lx_solver_relayout`, relayout caps, `ktir_emitter` | 2, 5, 6 | settings test |
+| `select_target`, `config.target` | `(config) -> Target`; `TARGETS[config.target]` narrowed by `sencores`, LX size and `auto_coarse_tiling`; `config.target` defaults to `"spyre"` and is in the FX key | 2 | settings test, cache behaviour |
 | `lx_solver_completed_reduction_routes` | `bool`, env `SPYRE_LX_SOLVER_COMPLETED_ROUTES`, default off | 6 | step 5 |
-| `select_optimizer` | `() -> SpyreOptimizer \| None` in `lx_allocator/optimizer.py`; promotes the fallback when ortools is absent | 9 | routing |
-| `lx_route_to_families`, `lx_fallback_family` | `bool`, `str`, envs above; fallback defaults to `""` | 9 | lanes, 12a |
-| `SpyreOptimizer.outcome`, `PlanOutcome` | `.status` holds `SolveStatus.name`; `.fell_back` | 7, 9 | guards |
+| `plan_allocation`, `optimize` | `plan_allocation(ir, config) -> SpyreOptimizationGraph`, reached from `scratchpad_planning` when `family_key(config)` is not `None`; `optimize(graph, family, fallback, settings)` | 9 | routing |
+| `family_key`, `select_families` | `(config) -> str \| None`, `None` sends the compile to the old path, and `lx_route_to_families` routes the old values; `(config) -> tuple[Family, Family \| None]` from `FAMILIES[...].from_config(config)`, promoting the fallback when ortools is absent | 9 | routing, warnings |
+| `lx_route_to_families`, `fallback_solver` | `bool`, env `SPYRE_LX_ROUTE_TO_FAMILIES`; `str`, env `FALLBACK_SOLVER`, defaults to `""` | 9 | lanes, 12a |
+| `PlanOutcome`, `last_outcome` | Stage 9's record of each `plan_allocation` call; `.status` holds `SolveStatus.name`; `.fell_back`; `last_outcome() -> PlanOutcome \| None`, the latest call in the process | 9 | guards |
 | `hbm_traffic_bytes`, `outcome` in the commit record; `decisions_from_graph`; `ortools` and `sa` cells | Stage 9's harness extensions | 9 | arm comparison |
-| Committed mode | `graph.divisions_committed`, `CostModel(traffic_only=True)` | 1, 2, 4, 9 | committed arms |
+| Committed mode | `graph.divisions_committed`, `graph.target.cost_model` with `traffic_only=True` | 1, 2, 4, 9 | committed arms |
 | SA baseline patch | `LxContextSwitchingPass` in `select_allocator`'s SA branch, test-side | 9 | old SA arms |
 | Gate 3 protocol, Gate 4 report | as in Stage 9 | 9 | time gate, 12a |
 | CI wiring | `_test_matrix.yaml` inputs `lx_route_to_families` and `layout_solver`, exporting `SPYRE_LX_ROUTE_TO_FAMILIES` and `LAYOUT_SOLVER`, unset when empty; dispatch-only `lx_planner_compare.yaml` | 9 | lanes |
 | `optimizer_pass_sources()` | planner sources in the FX key | 9, 10 | cache behaviour |
-| `SpyreOptimizer.commit` | runs `post_optimization_passes` | 10 | context switching on families |
+| `commit` | `commit(graph)`, runs `post_optimization_passes` | 10 | context switching on families |
 | `cost_expr_record` writer | full record from decoded graph values | 10 | `SPYRE_DUMP_COST_EXPR_FILE` |
 | Old path intact | `ScratchpadAllocator`, `CoOptimizingAllocator`, `_push_allocation` keep working through Stage 12 | 9, 10 | kill switch |
 | `lx_sticks_in_solve`, `solve_decides_work_division()` | true on a family only with the switch on | 11 | 12c only |
@@ -344,7 +348,7 @@ warnings, with tests, after the flip so the default never warns; (3) `_ffdc.py`,
 | symbol | signature | for Stages | stability |
 |---|---|---|---|
 | `config.layout_solver` default | `"ortools"` | 13 | final |
-| `config.lx_fallback_family` default | `"sa"` | 13 | final |
+| `config.fallback_solver` default | `"sa"` | 13 | final |
 | `config.lx_solver_completed_reduction_routes` default | on | 13 | final |
 | `config.lx_sticks_in_solve` default | on, step 12c | parent's Goal | final |
 | `LEGACY_LAYOUT_SOLVERS`, `warn_planner_selection` | above | 13 | temporary, removed in Stage 13 |
@@ -375,14 +379,14 @@ the tolerance the case carries in `test_scratchpad_use.py`, on the card.
 |---|---|
 | `test_default_layout_solver_is_ortools` | with the env unset, a config loaded by path (`test_async_compile.py:52-61`) has `ortools` |
 | `test_cache_key_differs_between_old_and_new` | key config for the four values is pairwise different (`test_solver_relayout_decision.py:286`) |
-| `test_every_old_value_reaches_the_old_path` | routing off: `select_optimizer()` is `None` and `select_allocator` gives the old class |
-| `test_family_values_reach_the_optimizer` | `ortools`, `sa`, co-opt on and off |
+| `test_every_old_value_reaches_the_old_path` | routing off: `family_key(config)` is `None`, `plan_allocation` is not called and `select_allocator` gives the old class |
+| `test_family_values_reach_plan_allocation` | `ortools`, `sa`, co-opt on and off, each running `FAMILIES[key].from_config(config)` through `select_families` |
 | `test_legacy_value_warns_once`, `test_value_without_replacement_names_the_default` | message and dedup |
 | `test_default_does_not_warn`, `test_exhaustive_flag_warns_only_on_a_family` | |
 | `test_invalid_value_lists_the_choices` | `bogus` raises `ValueError` |
-| `test_lx_planning_off_skips_the_optimizer` | `select_optimizer` not called |
+| `test_lx_planning_off_skips_the_optimizer` | `plan_allocation` not called |
 | `test_solver_relayout_off_offers_no_relayout`, `test_planner_relayout_off_keeps_solver_relayouts` | today's behaviour, kept on purpose |
-| `test_auto_coarse_tiling_reaches_the_encoder`, `test_time_limit_and_workers_reach_settings` | settings follow config |
+| `test_auto_coarse_tiling_reaches_the_target`, `test_time_limit_and_workers_reach_settings` | settings follow config: `Optimization.COARSE_TILING` in `graph.target.optimizations` |
 
 **Existing suites.** The parent's unit list, serially, and its device list, in the lane. PR 12b's CI
 runs all of `regression` on the new default.
@@ -432,7 +436,7 @@ check, `_distribute_work`).
 | id | check | pass |
 |---|---|---|
 | S1 | `check_guards` on the fixed set | no `fallback`, `solve_error` or `limit`, on either arm |
-| S2 | Every graph | `outcome.fell_back` false unforced; `status` equal, as part of I1 |
+| S2 | Every graph | `last_outcome().fell_back` false unforced; `status` equal, as part of I1 |
 | S3 | Granite, by hand | Plans identical at deterministic settings. Graphs 2 and 3 searched 46.4 s and 56.8 s of a 60 s limit, and that search has varied 31.9 s to 17.3 s on another graph, so a one-shot production status proves nothing. At one worker and a fixed seed, identical protos give equal deterministic time, and that is the check |
 | S4 | Stage 0's size bounds | pass on the new arm |
 
@@ -471,7 +475,8 @@ reruns. Thresholds do not move after calibration to make a run pass.
 - **The kill switch rots.** Caught by the reversed lane.
 - **A `fake` input hides a production difference.** Caught by the card calibration and C3.
 - **Identity fails on a graph the owning stage's gate passed, because main moved.** Caught nightly,
-  and by Stage 5's `test_lx_live_parity.py` in PR CI. Fixed in the encoder, per `AGENTS.md`.
+  and by Stage 5's `test_lx_live_parity.py` in PR CI. Fixed in the family's `encode`, per
+  `AGENTS.md`.
 - **Old arm drifts on main.** The nightly gate compares against the live old path, so drift shows up
   as an I1 failure with the cause in `diff`.
 - **Time-limit squeeze on large graphs under 12c.** Growth of 5.6% on Granite graph 3 hits the limit
@@ -497,8 +502,8 @@ reruns. Thresholds do not move after calibration to make a run pass.
 ## Open questions
 
 1. **Without ortools, should a default compile degrade to SA or keep raising?** Planned: degrade through
-   `select_optimizer`, since a `ValueError` on s390x helps nobody. If "keep raising", `select_optimizer`
-   raises instead of promoting. Stage 12 changes only its docs.
+   Stage 9's `select_families`, since a `ValueError` on s390x helps nobody. If "keep raising",
+   `select_families` raises instead of promoting. Stage 12 changes only its docs.
 2. **What planning-time budget applies to 12c?** Stage 11 projects 174 s to 230-460 s on the zoo, so
    P1's bound cannot hold there. Recommendation: one written limit once 11b's numbers exist. Only T5
    changes.
@@ -512,8 +517,8 @@ reruns. Thresholds do not move after calibration to make a run pass.
 
 - Deleting anything, and the alias code: Stage 13.
 - Sticks in the solve itself: Stage 11. Stage 12 owns only the default.
-- `SpyreOptimizer` routing, failure flow, committed mode, the `_test_matrix.yaml` input and the cache-key
-  fix: Stage 9.
-- `SpyreOptimizer.commit`, post passes and the cost dump: Stage 10.
+- Routing to `plan_allocation`, the failure flow in `optimize`, committed mode, the
+  `_test_matrix.yaml` input and the cache-key fix: Stage 9.
+- `commit(graph)`, post passes and the cost dump: Stage 10.
 - Making `SPYRE_LX_PLANNER_RELAYOUT=0` disable solver relayouts: not planned; the docs are corrected.
 - Turning on `AUTO_COARSE_TILING` by default, and the debug greedy family: not in this plan.
