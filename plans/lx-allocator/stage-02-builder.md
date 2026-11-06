@@ -1,16 +1,19 @@
 # LX allocator, Stage 2: Builder
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0, 1. Needed by: Stages 3, 4, 5, 6, 7, 8, 9, 10, 11, 13.
 
 ## Goal
 
-When this PR merges, `build_graph(ir)` turns a lowered graph into a complete
-`SpyreOptimizationGraph` with no solver and no allocator instance: one node per leaf
-op, named ports with axis maps, data and execution edges, port facts and pins. Nothing
-in production calls it yet. The one production edit is a set of extractions inside
-`allocator.py` with no behaviour change, so the CP model, decisions and committed plans
-stay byte-identical. Faithfulness is proven by comparing the graph with the allocator's
+When this PR merges, `select_target(config)` picks the card's `Target` and
+`build_graph(ir, target)` turns a lowered graph into a complete `SpyreOptimizationGraph`
+with no solver and no allocator instance: one node per leaf op, made through
+`target.ops` and kept in op order, named ports with axis maps, data edges, port facts
+masked by each node type's config, and pins. The graph keeps `target`. Nothing in
+production calls either yet. The production edits are a set of extractions inside
+`allocator.py` with no behaviour change and the `config.target` setting, which only joins
+the FX graph cache key, so the CP model, decisions and committed plans stay
+byte-identical. Faithfulness is proven by comparing the graph with the allocator's
 records, which become the test oracle rather than the builder's input.
 
 ## Today
@@ -123,11 +126,11 @@ lists the branches) and any `NopKernel`.
 
 ```python
 """torch_spyre/_inductor/scratchpad/lx_allocator/graph_builder.py"""
+def select_target(config) -> Target: ...
 def build_graph(
     ir: GraphLowering,
+    target: Target,
     *,
-    capacity: int | None = None,        # default _lx_planning_size()
-    alignment: int = 128,               # MemoryPlanSolver's default, one stick
     divisions_committed: bool = False,  # placement path: pin every running node
     drain_plans: Mapping[str, DrainPlan] | None = None,  # None computes them
     lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
@@ -138,6 +141,50 @@ def matmul_axes(op: ComputedBuffer) -> MatmulAxes: ...
 def derive_port_facts(port: Port, layout: FixedTiledLayout | None) -> PortFact: ...
 def carry_pairs(graph: SpyreOptimizationGraph) -> list[CarryPair]: ...
 ```
+
+**The target.** `select_target` is the one place config reaches the card description. It
+narrows the registered card to this compile and never widens it:
+
+```python
+def select_target(config) -> Target:
+    target = TARGETS[config.target]
+    optimizations = target.optimizations
+    if not config.auto_coarse_tiling:
+        optimizations &= ~Optimization.COARSE_TILING
+    return replace(
+        target,
+        cores=min(target.cores, config.sencores),
+        lx_bytes=min(target.lx_bytes, _lx_planning_size()),
+        optimizations=optimizations,
+    )
+```
+
+`config.target` is added here with `select_target`, its first reader. It names the card,
+defaults to `"spyre"` and is in the FX graph cache key. An unknown name raises
+`KeyError`. `_lx_planning_size()` is the DXP LX reservation today's allocators plan
+against, so while `SPYRE_LX_BYTES` is no smaller, `graph.target.lx_bytes` equals today's
+capacity. Sizes are `target.lx_bytes` and `target.alignment`, so
+`build_graph` takes no size argument.
+
+The cost model is attached here too, once Stage 4 lands: its PR adds
+`cost_model=COST_MODELS.get(target.name)` to the `replace` call. `SPYRE.cost_model` stays
+`None` in `graph/target.py`, because `graph/` must not import `cost.py`, and
+`select_target` sits outside `graph/`. Until Stage 4, `graph.target.cost_model` is `None`.
+
+**Nodes through the target.** Every node, an `InputNode` included, is made by
+`target.ops.make(node_type, name, **fields)` and then appended by `graph.add_node(node)`.
+`make` sets `node.restrictions` from the type's `OpConfig`, and nothing assigns it
+afterwards. After the last node, the builder asserts one config per type:
+
+```python
+for node in graph.nodes:
+    assert node.restrictions == target.ops.ops[type(node)].restrictions, node.name
+```
+
+A node made outside `make`, or edited after it, fails here, so two matmuls in one graph
+cannot disagree. `check_decisions` repeats the test (Stage 3). `make` raises `KeyError`
+for a type with no config, so `SPYRE_OPS` holds `OpaqueNode` and `RestickifyNode` as well
+as the parent's five.
 
 Preconditions, asserted on entry: `ir` is the active `V.graph`; `not
 has_loop_nodes(ir.operations)`, which holds under `OpsView` and fails loudly on a real
@@ -158,17 +205,21 @@ The order of work:
    overrides. `drain_plans`, when `None`, is `validated_drain_plans(ir,
    division_is_fixed=divisions_committed)`. Then `_drain_lifetime_end_overrides` as at
    `torch_spyre/_inductor/scratchpad/allocator.py:4162-4166`.
-2. Construct the graph with `capacity`, `alignment`, `max_cores=config.sencores`,
-   `divisions_committed`, `ir`, `drain_plans` and `tuple(lx_relayout_plans)`. Stage 3's
-   `residency_reason` reads these.
+2. Construct the graph with `target`, `divisions_committed`, `ir`, `drain_plans` and
+   `tuple(lx_relayout_plans)`. Stage 3's `residency_reason` reads these, and sizes and the
+   core count come from `graph.target`.
 3. Leaf nodes: one `InputNode` per `ir.graph_input_names`, including unused and scalar
    inputs, then one per name read by an op that no op writes (constants through
    `try_get_buffer`), in first-read order. A name that resolves to nothing also becomes a
    leaf with `out.layout=None`, and logs once. An `InputNode` has `op=None` and no tick.
-4. Op nodes in op order, with `tick` the leaf index. `add_node` links consecutive running
-   nodes by execution edges. `writer[name]` comes from each op's `rw.writes`.
-5. Ports, axis maps and edges.
-6. Port facts, in-place candidates, pins.
+4. Op nodes in op order, each made through `target.ops.make(classify(op, ir), ...)`, with
+   `tick` the leaf index. `graph.nodes` is then in op order, inputs first, and running
+   nodes have strictly increasing ticks; the list order is the op order every later stage
+   reads. `graph.cuts` stays empty until a `read_back` fills it. `writer[name]` comes from
+   each op's `rw.writes`.
+5. The one-config-per-type assertion.
+6. Ports, axis maps and edges.
+7. Port facts, masked by each type's `OpConfig.facts`, in-place candidates, pins.
 
 ### Op kind to node type
 
@@ -204,8 +255,9 @@ How each op that exists today lands:
 | `LoopNode` | never | the view hides it; the precondition refuses a nested list |
 | LX relayout copy, drain, LX prefetch, output clone | never at build time | decisions; `RelayoutCopyBuffer` records have no node |
 
-`OpaqueNode` runs, has `restrictions = NONE`, takes its committed division and never
-resides. `RestickifyNode` has `WHOLE_STICKS` only: it reads one stick and writes another.
+`OpaqueNode` runs, takes its committed division and never resides; its `SPYRE_OPS` config
+has `restrictions=Restriction.NONE`. `RestickifyNode`'s config has `WHOLE_STICKS` only: it
+reads one stick and writes another. Both configs are Stage 1's.
 
 ### Pre-pass restickifies
 
@@ -214,11 +266,11 @@ edge into it carries the step the node realizes:
 
 ```python
 edge = R.port("in0").edge                     # P.out -> R.in0
-edge.add_step(Restickify(to_stick=s, pinned=True, realized_by=R))
+edge.add_step(Step(kind=StepKind.RESTICKIFY, to_stick=s, pinned=True, realized_by=R))
 graph.pin(edge, "restickify", s, "pre-pass")
 ```
 
-The step has no footprint, variables or box of its own, and `apply` returns
+The step has no footprint, variables or box of its own, and `apply(step, layout)` returns
 `realized_by.out.layout`. `read_back` keeps pinned steps and adds no second one.
 
 `to_stick` is a host dim of the source: `_host_dim_carrying_sym(in_host_coords,
@@ -226,8 +278,8 @@ out_stick_sym)`, the derivation at `torch_spyre/_inductor/padding.py:995`, where
 `out_stick_sym` is `_stick_symbol(R.layout.device_layout, write)`
 (`torch_spyre/_inductor/padding.py:543`). `SPARSE_STICK` if there is no such dim.
 
-An edge has a `Restickify` step exactly when it has the pin. Before a solve,
-`DataEdge.transforms` holds only pinned steps.
+An edge has a `RESTICKIFY` step exactly when it has the pin. Before a solve,
+`DataEdge.steps` holds only pinned steps.
 
 ### Axes and ports
 
@@ -291,7 +343,7 @@ mutation target has mismatched `size` and `stride` on the mutation layout.
 **Axis map.** `{axis: _host_dim_carrying_sym(coords, axis.symbol) for axis in axes if
 axis.symbol in coord symbols}` (`torch_spyre/_inductor/padding.py:498`). Dims are host dims
 of the read layout. That helper's convention is the outermost dim, the "governing" one.
-One axis can reach several dims, so `Port.dims_of(axis)` returns all of them from `coords`.
+One axis can reach several dims, so `dims_of(port, axis)` returns all of them from `coords`.
 Checked by experiment on real IR:
 
 | read | coords | `axis_map` |
@@ -346,8 +398,17 @@ call `mem_usage_by_buf`, which runs `get_ncores_for_buffers`.
 ### Port facts
 
 `derive_port_facts(port, layout)` is pure: it reads the port, its node's `op` and the
-given layout, so Stage 11 can ask it about a candidate layout. `build_graph` calls it once
-per port with the port's own layout.
+given layout, so Stage 11 can ask it about a candidate layout. It returns what the layout
+and the read show, before any card's mask. `build_graph` calls it once per port with the
+port's own layout and stores the result masked by the config of the port's node type:
+
+```python
+port.facts = derive_port_facts(port, layout) & target.ops.ops[type(port.node)].facts
+```
+
+A card whose config leaves a fact out never derives it on that type's ports. The mask is
+per node type, so a `QFP8WT` tensor's producer out port and its matmul's `y` port are each
+masked by their own node's config. Stage 11 applies the same mask from `graph.target`.
 
 | fact | port | derivation | old reader |
 |---|---|---|---|
@@ -507,8 +568,9 @@ Nothing here assumes a solver, so a debug greedy solve is unaffected.
 
 | file | change |
 |---|---|
-| `torch_spyre/_inductor/scratchpad/lx_allocator/graph_builder.py` | new: `build_graph`, `classify`, `matmul_axes`, `derive_port_facts`, `carry_pairs`, `MatmulAxes`, `CarryPair`, private helpers |
+| `torch_spyre/_inductor/scratchpad/lx_allocator/graph_builder.py` | new: `select_target`, `build_graph`, `classify`, `matmul_axes`, `derive_port_facts`, `carry_pairs`, `MatmulAxes`, `CarryPair`, private helpers |
 | `torch_spyre/_inductor/scratchpad/lx_allocator/division_convert.py` | new: the three conversions |
+| `torch_spyre/_inductor/config.py` | `target: str = "spyre"`, in the FX graph cache key |
 | `torch_spyre/_inductor/scratchpad/allocator.py` | extract `division_pin_reasons`, `inplace_edge_ok`, `op_inputs_good_for_lx_inplace` |
 | `tests/inductor/test_graph_builder.py` | new, device-free fixtures |
 | `tests/inductor/test_graph_builder_e2e.py` | new, `fake` compiles |
@@ -519,9 +581,11 @@ Commits, each with tests green:
 
 1. The three `allocator.py` extractions. Harness diff empty.
 2. `division_convert.py` with its round-trip test.
-3. `classify`, nodes, axes, ports, axis maps, `matmul_axes`, node rule inputs.
+3. `config.target`, `select_target`, `classify`, nodes through `target.ops.make` in op
+   order, the one-config-per-type assertion, axes, ports, axis maps, `matmul_axes`, node rule
+   inputs.
 4. Edges, lifetimes, in-place candidates, `carry_pairs`.
-5. `derive_port_facts`.
+5. `derive_port_facts` and the config mask.
 6. Pins, including pinned restickify steps and committed mode.
 7. The oracle and the e2e test.
 
@@ -531,16 +595,19 @@ Commits, each with tests green:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| `SpyreOptimizationGraph` | `capacity, alignment, max_cores, divisions_committed, ir, drain_plans, lx_relayout_plans`; `add_node`, `node`, `connect(out, in_port)`, `pin(target, what, value, source)`, `pins_on`, `read_ticks`, `lifetime` | 1 | the build |
-| `OpNode` | `op, tick, uses, size, graph_output, lifetime_start_override, lifetime_end_override, mutation_target, deferred_direct_read, span_floors, tile_local_axes`, `first_use_is_read`; `operands=`, `layout=`; `port(name)`, `add_in_port(name, *, operand=None) -> InPort` | 1 | nodes |
+| `Target`, `TARGETS` | `Target(name, ops, cores, lx_bytes, alignment, stick_bytes, rules, steps, optimizations, cost_model=None)`, frozen; `TARGETS: Mapping[str, Target]`, `{"spyre": SPYRE}` | 1 | `select_target` |
+| `OpFactory`, `OpConfig`, `SPYRE_OPS` | `OpFactory.ops: Mapping[type[OpNode], OpConfig]`, `make(node_type, name, **fields) -> OpNode` (`KeyError` for a type with no config), `with_type(node_type, **changes)`; `OpConfig(restrictions, facts)`; one config per node type, `OpaqueNode` and `RestickifyNode` included | 1 | nodes, the assertion, the facts mask |
+| `Optimization` | `Flag` with `COARSE_TILING` among its members | 1 | `select_target` |
+| `SpyreOptimizationGraph` | `target, divisions_committed, ir, drain_plans, lx_relayout_plans, nodes, cuts`; `add_node(node)`, `node`, `connect(out, in_port)`, `pin(target, what, value, source)`, `pins_on`, `read_ticks`, `lifetime` | 1 | the build |
+| `OpNode` | `restrictions: Restriction` (set by `make`); `op, tick, uses, size, graph_output, lifetime_start_override, lifetime_end_override, mutation_target, deferred_direct_read, span_floors, tile_local_axes`, `first_use_is_read`; `operands=`, `layout=`; `port(name)`, `add_in_port(name, *, operand=None) -> InPort` | 1 | nodes |
 | node subtypes | `MatmulNode.k`, `.n: Axis \| None`, `.reduction_type`; `ReductionNode.reduction_type`, `.conv_params`; `IndirectNode.scatter`; `PointwiseNode`, `InputNode`, `OpaqueNode`, `RestickifyNode` | 1 | nodes |
-| `Port`, `InPort`, `OutPort` | `axis_map, facts, dep, coords, device_coords`, `dims_of(axis)`; `operand, index, edge, read_layout, direct_read`; `layout: FixedTiledLayout \| None, index, edges` | 1 | ports |
+| `InPort`, `OutPort`, `Port`, `dims_of` | both: `name, node, axis_map, facts, dep, coords, device_coords`; `InPort`: `operand, index, edge, read_layout, direct_read`; `OutPort`: `layout: FixedTiledLayout \| None, index, edges`; `Port = InPort \| OutPort`; `dims_of(port, axis)` | 1 | ports |
 | `Axis`, `WorkSplit`, `TileLevel` | `Axis(symbol, extent, reduction=False, granularity=None, off_output_coords=False, symbolic=False)`, `WorkSplit(splits={}, tiling=())`, `TileLevel = tuple[Axis, int]` | 1 | axes, pins, conversion |
-| `PortFact` | Stage 1's `Flag` members | 1 | facts |
-| `DataEdge`, `ExecutionEdge` | `src, dst, transforms, mutation, in_place_candidate`, `add_step(step)`, `read_layout()`; `before, after` | 1 | edges |
-| `Restickify` | `Restickify(to_stick, realized_by=None, target=None, **transform_fields)`, built with `pinned=True`, `realized_by=node` | 1 | pinned steps |
+| `Restriction`, `PortFact` | Stage 1's `Flag` members | 1 | the assertion, facts |
+| `DataEdge` | `src, dst, steps, mutation, in_place_candidate`, `add_step(step)`, `read_layout()` | 1 | edges |
+| `Step`, `StepKind` | `Step(kind=StepKind.RESTICKIFY, to_stick=..., pinned=True, realized_by=node)`; `apply(step, layout)` | 1 | pinned steps |
 | `Pin`, `WorkSplitPin`, `DimOrderPin`, `DirectReadStick` | `WorkSplitPin(split, reason, seeds=())`, `DimOrderPin(indirect_device_pos, stride_map)`, `DirectReadStick(axis, eps)`; sources `graph input`, `pre-pass`, `layout`, `hazard`, `committed`, `greedy`, `hint` | 1 | pins |
-| `stick_dims`, `SPARSE_STICK` | `stick_dims(layout) -> tuple[int, ...]`, `SPARSE_STICK = -1` | 1 | stick pins |
+| `stick_dims`, `SPARSE_STICK` | `stick_dims(layout) -> tuple[int, ...]`, `SPARSE_STICK = -1`, in `steps.py` | 1 | stick pins |
 | `lx_graph_fixtures.py` | layout builders | 1 | unit fixtures |
 | harness | `record_compile(name, cell, out, *, device="fake", observers=...)`, `Observer.on_solve_begin(allocator, solver, ir, buffers, cost_expr)`, `check_guards`, `lx_gate.sh`, `Cell`, `DEFAULT_CELL`, `TILING_CELL`, `FIXED_GRAPHS`, `corpus_coverage`, `CARD_ONLY` | 0 | oracle, gates |
 
@@ -548,19 +615,21 @@ Commits, each with tests green:
 
 | symbol | signature | for Stages | stability |
 |---|---|---|---|
-| `build_graph` | above | 3-8, 9 (wrapped as `SpyreOptimizer.build_graph`), 10, 11, 13 | final |
+| `select_target` | `(config) -> Target`: `TARGETS[config.target]` with `cores` and `lx_bytes` narrowed by config and `COARSE_TILING` dropped unless `config.auto_coarse_tiling`; from Stage 4 it also attaches `COST_MODELS.get(target.name)` with `replace` | 3, 4 (adds the cost model), 9 (called by `plan_allocation`) | final |
+| `config.target` | `str`, default `"spyre"`, in the FX graph cache key | 9, 12 (through `select_target`) | final |
+| `build_graph` | `(ir, target, *, divisions_committed=False, drain_plans=None, lx_relayout_plans=()) -> SpyreOptimizationGraph`; every node through `target.ops.make`, `graph.target` stored, one config per type asserted, nodes in op order | 3-8, 9 (called by `plan_allocation`), 10, 11, 13 | final |
 | `classify`, `_committed_work_split` | `(op, ir) -> type[OpNode]`; `(node) -> WorkSplit`, never writes the IR | 11 | final |
 | `matmul_axes`, `MatmulAxes` | `(op) -> MatmulAxes` | 13 | final |
-| `derive_port_facts` | `(port, layout) -> PortFact` | 11 | final |
+| `derive_port_facts` | `(port, layout) -> PortFact`, before the config mask; a caller masks with `graph.target.ops.ops[type(port.node)].facts` | 11 | final |
 | `carry_pairs`, `CarryPair` | `(graph) -> list[CarryPair]`, `CarryPair(storage, reader, role)` | 3, 6, 8 | final |
 | `work_split_from_division` | `(node, division) -> WorkSplit` | 3, 5, 6, 7, 8 | final |
 | `division_from_work_split` | `(node, split) -> CoreDivision` | 3, 5, 9, 10 | final |
 | `tile_spec_of` | `(node, split) -> TileSpec` | 3, 10 | final |
 | `division_pin_reasons` | above | 5 | final |
 | `inplace_edge_ok`, `op_inputs_good_for_lx_inplace` | module functions, today's semantics | 6 | final |
-| graph fields, declared by Stage 1, filled here | `graph.ir`, `.divisions_committed`, `.max_cores`, `.drain_plans`, `.lx_relayout_plans` | 3, 4, 5, 6, 8, 9, 10 | final |
-| node fields, same | `OpNode.op`, `.tick`, `.uses`, `.size`, `.graph_output`, lifetime overrides, `.mutation_target`, `.deferred_direct_read`, `.span_floors`, `.tile_local_axes`; `.reduction_type`; `ReductionNode.conv_params`; `MatmulNode.k`, `.n`; `IndirectNode.scatter` | 3-10 | final |
-| port and edge fields, same | `Port.axis_map`, `.facts`, `.dep`, `.coords`, `.device_coords`; `InPort.operand`, `.index`, `.read_layout`, `.direct_read`; `OutPort.layout`, `.index`; `DataEdge.in_place_candidate`, `.mutation` | 3, 5, 6, 8, 11 | final |
+| graph fields, declared by Stage 1, filled here | `graph.target`, `.ir`, `.divisions_committed`, `.drain_plans`, `.lx_relayout_plans`; `graph.nodes` in op order; `graph.cuts` empty | 3, 4, 5, 6, 8, 9, 10 | final |
+| node fields, same | `OpNode.restrictions`, from the type's `OpConfig`; `OpNode.op`, `.tick`, `.uses`, `.size`, `.graph_output`, lifetime overrides, `.mutation_target`, `.deferred_direct_read`, `.span_floors`, `.tile_local_axes`; `.reduction_type`; `ReductionNode.conv_params`; `MatmulNode.k`, `.n`; `IndirectNode.scatter` | 3-10 | final |
+| port and edge fields, same | on both port types: `.axis_map`, `.facts` (masked by the node type's `OpConfig.facts`), `.dep`, `.coords`, `.device_coords`; `InPort.operand`, `.index`, `.read_layout`, `.direct_read`; `OutPort.layout`, `.index`; `DataEdge.in_place_candidate`, `.mutation`; `DataEdge.steps` holds only pinned `RESTICKIFY` steps | 3, 5, 6, 8, 11 | final |
 | pins | `Pin` with `what` one of `stick`, `restickify`, `split`, `tiling`, `loop_carry`, `drain`, `opaque`, `dim_order` | 3, 5, 6, 8, 10, 11 | final |
 
 ## Tests
@@ -572,11 +641,19 @@ Commits, each with tests green:
 Stage 1's `lx_graph_fixtures.py`. This pattern was run against the snapshot for pointwise,
 reduction and gather ops. Extern kinds use
 `MagicMock(spec=...)`. No test imports a solver, which is this stage's "no solver involved".
+Every fixture builds with `SPYRE`, or with a target derived from it by `replace` and
+`SPYRE_OPS.with_type`.
 
 | test | asserts |
 |---|---|
 | `test_classify_*`, one per row of the op-kind tables | the node type, and that a `Scatter` is never a `PointwiseNode` when its write is indirect |
 | `test_one_node_per_leaf_op` | names equal `[op.get_name()]` plus inputs; a barred op still has a node |
+| `test_nodes_in_op_order` | `graph.nodes` is the inputs, then the ops in `ir.operations` order; running ticks strictly increase; `graph.cuts` is empty |
+| `test_select_target` | `TARGETS[config.target]`; `cores` is `config.sencores` at `SENCORES=1` and at the default; `lx_bytes` is `_lx_planning_size()`; `COARSE_TILING` is in `optimizations` only with `auto_coarse_tiling`; `ops`, `rules` and `steps` are the registered card's; an unknown name raises `KeyError` |
+| `test_graph_keeps_target` | `graph.target is target` |
+| `test_nodes_made_through_target` | every node's `restrictions` equals `target.ops.ops[type(node)].restrictions`; a target derived with `SPYRE_OPS.with_type(ReductionNode, restrictions=...)` changes the `ReductionNode`s and no other node |
+| `test_one_config_per_type_asserted` | a `make` patched to give one node other flags raises `AssertionError` naming that node |
+| `test_port_facts_masked_by_config` | a target whose `MatmulNode` config leaves `QFP8WT` out of `facts` gives a matmul's `y` port no `QFP8WT`, while the producer's out port and `derive_port_facts` on `y` still report it |
 | `test_every_read_has_a_source` | each dep is bound to exactly one port, each port with a resolvable name has an edge |
 | `test_self_alias_pointwise_has_one_port`, `test_self_alias_matmul_shares_an_edge` | `x * x` gives `in0`; `x.edge is y.edge`, one graph edge |
 | `test_two_offsets_two_ports` | two ports, two edges, one source |
@@ -585,7 +662,7 @@ reduction and gather ops. Extern kinds use
 | `test_matmul_axes[general, m1, n1]` | `k`, `n`; `n is None` when N is 1 |
 | `test_gather_ports_by_predicate`, `test_scatter_table_port`, `test_mutation_scatter_edge_is_flagged` | binding regardless of read order; `mutation=True` |
 | `test_two_input_reductions_keep_both_ports` | `conv2d`, `keepbyindex` have `in0`, `in1` |
-| `test_node_rule_inputs` | `conv_params`, `span_floors`, `tile_local_axes`, `reduction_type`, `graph.max_cores` against their sources |
+| `test_node_rule_inputs` | `conv_params`, `span_floors`, `tile_local_axes`, `reduction_type`, `graph.target.cores` against their sources |
 | `test_out_index` | the write's index; `None` with no single `MemoryDep` write or no `origin_node.target` |
 | `test_in_place_input_edge` | set only with `clone_at_graph_boundaries()` on, at the input's last reader; an input with no LX prefetch keeps the flag and has no record |
 | `test_port_fact_*` | each fact on and off, on out and in ports, against the old predicate on the same op |
@@ -605,7 +682,8 @@ reduction and gather ops. Extern kinds use
 **`tests/inductor/test_graph_builder_e2e.py`, on `fake` compiles.** A fake compile needs a
 process of its own, so each model runs through `record_compile(model, cell, out,
 device="fake", observers=("graph_builder_oracle:make_observer",))`. The observer's
-`on_solve_begin` calls `build_graph(ir, divisions_committed=not joint)` on the live graph,
+`on_solve_begin` calls `build_graph(ir, select_target(config), divisions_committed=not
+joint)` on the live graph,
 where `joint` is `isinstance(allocator, CoOptimizingAllocator)`, and
 `assert_graph_matches_records(graph, buffers)` on the result, and the compile continues. A
 mismatch raises inside the observer, `check_guards` reports it, and the case fails. Models
@@ -630,8 +708,10 @@ Device, on the card: `test_work_division`, `test_scratchpad_use`, because commit
 `_division_map`. `make check-all-configs` after adding the configs, and `pre-commit run
 --files <changed>`.
 
-**What proves the claim.** `test_classify_*`, `test_axis_map_*`, `test_port_fact_*` and
-`test_pin_*` prove the plan's Stage 2 bullets on fixtures. The e2e oracle proves nothing was
+**What proves the claim.** `test_classify_*`, `test_nodes_made_through_target`,
+`test_one_config_per_type_asserted`, `test_nodes_in_op_order`, `test_axis_map_*`,
+`test_port_fact_*`, `test_port_facts_masked_by_config` and `test_pin_*` prove the plan's
+Stage 2 bullets on fixtures. The e2e oracle proves nothing was
 lost on real graphs.
 
 ## Parity and gates
@@ -672,16 +752,21 @@ The stage has no planning-time gate because nothing calls the builder. Its cost 
 | A #5682 Step 2 item moves a stick pass after the solve, so layouts are not final at build time | `stick` pins would pin stale layouts, and the oracle's `size` row fails first. Rebase work for whichever lands second |
 | `build_graph` is called after `_post_solve` | stale graph. The precondition catches materialized relayouts, not chosen tilings, so this rests on the contract |
 | `node.op` makes the graph unpicklable, because IR holds FakeTensor refs | graphs are not pickled; live compiles replace replay |
+| A node is made outside `target.ops.make`, or its flags are edited after it | the one-config-per-type assertion at build, `test_one_config_per_type_asserted`, and Stage 3's repeat of it in `check_decisions` |
+| `select_target` and today's allocator disagree on the LX size | `lx_bytes` reads `_lx_planning_size()`, the same function today's default capacity reads; `test_select_target` |
 
 ## Deviations from the parent plan
 
 1. **Input.** The plan: "Build from the allocator's full record list". The code: records
    are unusable as input, for the four reasons under Today. Resolution: `build_graph` takes
-   `GraphLowering`, as the class diagram does, and records are the test oracle.
+   `GraphLowering`, as the parent's `build_graph(ir, target)` does, and records are the test
+   oracle.
 2. **Five subtypes, and "one node per op" vs "a pinned step".** Extern kernels and CPU
    buffers run, hold a tick and a record, and fit none of the five. Byte-identical protos
    need a node for a restickify, and a `PointwiseNode` would break `POINTWISE_STICKS`.
    Resolution: `OpaqueNode`, and `RestickifyNode` plus a pinned step with `realized_by`.
+   Each has its own `OpConfig` in `SPYRE_OPS`, since every target fills `ops` for every
+   node type.
 3. **Fixed `PORTS`.** `conv2d`, `depthwiseconv2dnative` and `keepbyindex` have two reads
    (`torch_spyre/_inductor/constants.py:261,268`), and a fused pointwise prologue can add
    more (`torch_spyre/_inductor/wsr/loop_tiling_common.py:450-451`). A scatter destination
@@ -690,8 +775,8 @@ The stage has no planning-time gate because nothing calls the builder. Its cost 
    synthetic `table` port with a `mutation=True` edge, `values` for plain operands and
    numbered overflow ports on `IndirectNode`; a `target` port on `MatmulNode`.
 4. **`axis_map: dict[Axis, int]`.** One axis can reach several dims (the flatten row in the
-   table above). Resolution: the dict keeps the outermost dim, and `Port.dims_of` gives all
-   of them.
+   table above). Resolution: the dict keeps the outermost dim, and `dims_of(port, axis)`
+   gives all of them.
 5. **"An in port holds no layout of its own".** `_input_layout_overrides`
    (`torch_spyre/_inductor/insert_restickify.py:940`,
    `torch_spyre/_inductor/pass_utils.py:161`) makes one op read a graph input in a layout
@@ -721,6 +806,16 @@ The stage has no planning-time gate because nothing calls the builder. Its cost 
     (`torch_spyre/_inductor/work_division_constraints.py:739-751`), and table reads are
     outside all of these rules. Resolution: table ports carry no layout facts, and
     `InPort.operand` gives the input position.
+14. **`build_graph(ir, target)` takes three more arguments.** The placement path's committed
+    divisions, the allocator's validated drain plans and the relayout plans it started from
+    differ per compile and per allocator, not per card, so they do not belong on `Target`.
+    Resolution: keyword-only `divisions_committed`, `drain_plans` and `lx_relayout_plans`,
+    whose defaults give the parent's two-argument call.
+15. **The target is narrowed per compile.** The parent's `plan_allocation` reads
+    `TARGETS[config.target]` as registered. `SENCORES`, the DXP LX reservation and
+    `AUTO_COARSE_TILING` vary per compile today, and the parent's "narrowed further by
+    config, as coarse tiling is today" asks for this. Resolution: `select_target(config)`,
+    which `plan_allocation` calls in place of the bare lookup.
 
 ## Open questions
 
@@ -734,6 +829,8 @@ None.
 - Menus, `_seed_aligned_division`, `_legal_fixed_division`: Stage 5.
 - `settle_deferred_reads`, carry match edges, relayout candidates, the cross-frame hazard,
   in-place encoding and its list order: Stage 6.
-- `SpyreOptimizer.build_graph` and any production call: Stages 3 and 9.
+- `Target`, `OpFactory`, `OpConfig`, `SPYRE`, `SPYRE_OPS` and `TARGETS`: Stage 1.
+- `COST_MODELS`, `SpyreCostModel` and the `CostModel` protocol: Stage 4.
+- `plan_allocation` and any production call: Stages 3 (the report-only hook) and 9.
 - Lifting stick pins, and recovering stick candidates that `finalize_layouts` deletes:
   Stage 11.
