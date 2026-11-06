@@ -1,6 +1,6 @@
 # LX allocator, Stage 11: Sticks in the solve
 
-Parent plan: `plans/lx-allocator.md` at `5aff4a6`. Code base: torch-spyre `5268ba95`.
+Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
 Depends on: Stages 0-10, plus torch-spyre#5682 Step 1, Step 2 items 1-5 and 7, and the issue's three
 direct tests (see "Relation to #5682"). Needed by: step 12c of Stage 12. Stages 12 and 13 do not
 depend on this stage, and it lands before or after them.
@@ -97,7 +97,7 @@ The joint path relies on the per-candidate residency gate, and `_restickify_read
 the local-read proof, which also accepts a relayout's destination view (`allocator.py:1513-1521`).
 CP-SAT's menu tilings skip restickifies (`allocator.py:4008-4009`). `build_tiling_space` has no such
 test (`wsr/enumerate_tilings.py:409-423`, `:437-469`), so SA's exclusion is Stage 8's filter in
-`SAEncoder`.
+`SAFamily.encode`.
 
 ### Surprises
 
@@ -166,7 +166,7 @@ a pass #5682 Step 2 has moved past `_maybe_scratchpad_planning` is still after t
 | `_maybe_coarse_tile_span_overflow` | Must be in the solve (#5682 Step 1). Until then `solve_decides_sticks` opts out on overflow groups. Returns at once on a held plan | A candidate with no legal menu is dropped |
 | `span_reduction` | Floors inside the menus, per candidate (#5682 Step 1). No interim (Surprise 6) | Menu per candidate |
 | `_distribute_work` | Deferred on a held plan ("The #5695 predicate") | Menu of one for pinned ops |
-| `_maybe_scratchpad_planning` | Held plan: `verify_realized`, then `SpyreOptimizer.commit`. No plan: today's path with beam sticks | None |
+| `_maybe_scratchpad_planning` | Held plan: `verify_realized`, then `commit(graph)`. No plan: today's path with beam sticks | None |
 | `elide_proven_read_copies` | Stays (D4). A solved stick can decline a proof that passes today (Risk R11) | None |
 
 ### Relation to #5682
@@ -252,7 +252,7 @@ class StickCandidate:
     layout: FixedTiledLayout       # also after the gather-pad and input-pad previews
     dims: tuple[int, ...]          # stick_dims(layout) or (SPARSE_STICK,)
     beam: bool
-    facts: PortFact                # out-port facts under this layout
+    facts: PortFact                # facts_for(graph, out port, layout)
 @dataclass(frozen=True)
 class StickPairRow:
     src: str                              # StickCandidate.key of the producer
@@ -261,7 +261,7 @@ class StickPairRow:
     restickify: FixedTiledLayout | None   # the step's target; None when the sticks agree
     crosses_frame: bool                   # a step, or a consumer that is itself a restickify
     step_bytes: int                       # padded footprint of the step, 0 without one
-    facts: PortFact                       # in-port facts under read_layout
+    facts: PortFact                       # facts_for(graph, in port, read_layout)
     @property
     def key(self) -> str: ...             # src and dst joined: the row of Sym.restick(e, row)
 @dataclass(frozen=True)
@@ -351,9 +351,10 @@ one: a menu, `in_buffer_`, a box and a cost term. `shadow_ops` makes the IR look
 
 Inside the context, Stages 2, 4, 5 and 6 and `project_transport_read_copies` all read an ordinary
 IR. `is_restickify_op` holds, so `classify` gives a `RestickifyNode`, and Stage 2 writes
-`Restickify(pinned=True, realized_by=node)` with its pin. A detached `ComputedBuffer` passes
-`_is_fusable_operation` (`fusion.py:165-178`), so it bundles as the real op does. So 11a changes no
-encoder, and Stage 6's raise and Stage 10's `read_commit_plan` hold unchanged there.
+`Step(kind=StepKind.RESTICKIFY, pinned=True, realized_by=node)` with its pin. A detached
+`ComputedBuffer` passes `_is_fusable_operation` (`fusion.py:165-178`), so it bundles as the real op
+does. So 11a changes no encoder, and Stage 6's raise and Stage 10's `read_commit_plan` hold
+unchanged there.
 
 **Which ops get a shadow.** Where #5682 Step 2 has moved a pass past the solve, its ops are
 reservations in both arms and need nothing here. Where a fixup op is still a node in the base model:
@@ -372,59 +373,59 @@ plan is identical by construction, and the gate lists it by rule. A real op with
 
 ### Lifting the pins
 
-`build_graph` gains `stick_candidates=None`, after Stage 2's keywords. When it is given, a node with
-two or more candidates gets no `"layout"` stick pin, and its `OutPort.candidates` is filled. A node
-with one gets today's pin. `"graph input"` and `"pre-pass"` pins are never lifted. `OutPort.layout`
-holds the beam's candidate before the solve, and `read_back` overwrites it.
+`build_graph(ir, target, ...)` gains `stick_candidates=None`, after Stage 2's keywords. When it is
+given, a node with two or more candidates gets no `"layout"` stick pin, and its `OutPort.candidates`
+is filled. A node with one gets today's pin. `"graph input"` and `"pre-pass"` pins are never lifted.
+`OutPort.layout` holds the beam's candidate before the solve, and `read_back` overwrites it.
 
 | restickify | on the graph | first exists |
 |---|---|---|
 | Already in the IR at the build | `RestickifyNode`, pinned step | Stage 2 |
 | Beam's, both ends pinned | Shadow `RestickifyNode`, pinned step | 11a |
-| Solver's, on an edge with `sticks` | `Restickify(pinned=False, to_stick=dim, target=row.restickify)` from `read_back`. No node, no menu | 11b |
+| Solver's, on an edge with `sticks` | `Step(kind=StepKind.RESTICKIFY, pinned=False, to_stick=dim, target=row.restickify)` from `read_back`. No node, no menu | 11b |
 
 At limit 1 no `sticks` exist, so nothing unpinned reaches an encoder or commit.
 
-### `SpyreOptimizer`
+### `plan_sticks`
 
 ```python
-class SpyreOptimizer:
-    def plan_sticks(self, ir: GraphLowering) -> SpyreOptimizationGraph | None: ...
-    def optimize(self, graph, restrictions=None, *,
-                 commit: bool = True) -> SpyreOptimizationGraph: ...
+def plan_sticks(ir: GraphLowering, config) -> SpyreOptimizationGraph | None: ...
 
 @_runs(stick_domain, build_stick_candidates, build_stick_relations)
 def _maybe_solve_sticks(graph: GraphLowering) -> None:
     if not solve_decides_sticks(graph):
         return
-    optimizer = select_optimizer()
-    if optimizer is None:                      # the old path
+    if family_key(config) is None:    # the old path
         return
-    plan = optimizer.plan_sticks(graph)
+    plan = plan_sticks(graph, config)
     if plan is None:
         return
     write_solved_sticks(graph, plan)
-    graph.spyre_held_plan = (optimizer, plan)
+    graph.spyre_held_plan = plan
 ```
 
-`plan_sticks` validates drain plans as `plan_allocation` does, then, under the beam's stamps, builds
-candidates, relations and shadow rows. Inside `shadow_ops` it builds the graph and calls
-`optimize(graph, commit=False)`. It returns `None`, leaving every `committed_stl` as the beam wrote
-it, on an infeasible outcome, an opt-out, or `SolveError` from an empty `lx_fallback_family`.
-Stage 13 removes that last branch with the class, since an empty value then raises `ValueError` in
-`select_optimizer`. If Stage 13 has already landed, the branch is not written. A `RuleViolation` propagates. `sticks.py` joins `optimizer_pass_sources()`, which is what puts it in
-the FX key.
+`plan_sticks` is the first half of `plan_allocation`. It takes `select_target(config)`, the families
+from Stage 9's `select_families(config)` and `SolveSettings.from_config(config)` as
+`plan_allocation` does, and validates drain plans. Then,
+under the beam's stamps, it builds candidates, relations and shadow rows. Inside `shadow_ops` it
+calls `build_graph(ir, target, stick_candidates=...)` and `optimize(graph, family, fallback,
+settings)`, which reads the plan back and checks it but never commits. It returns `None`, leaving
+every `committed_stl` as the beam wrote it, on an infeasible outcome, an opt-out, or `SolveError`
+from an empty `config.fallback_solver`. Stage 13 removes that last branch, since an empty value then
+raises `ValueError` when the families are selected. If Stage 13 has already landed, the branch is
+not written. A `RuleViolation` propagates. `sticks.py` joins `optimizer_pass_sources()`, which is
+what puts it in the FX key.
 
 `rebind_graph`, the first step of `verify_realized`, rebinds each node's `op` by buffer name,
 because the passes in between replace ops (`pass_utils.py:2882`). It moves a shadow's node to the
 real op and name through `ir.restickify_realized`, which `insert_restickify_on_node_inputs` writes,
-and drops dedup's constants. Commit inserts nothing. `SpyreOptimizer.commit` gains one step ahead of
+and drops dedup's constants. Commit inserts nothing. `commit(graph)` gains one step ahead of
 `read_commit_plan`: `divide_deferred_op` for each deferred op the plan holds no split for, as #5695
 does after a solve.
 
-From 11b, `read_commit_plan` accepts an unpinned step whose key is in `restickify_realized`, and its
-op takes the step's division and address in the ordinary walk. An unrealized unpinned step still
-raises.
+From 11b, `read_commit_plan` accepts an unpinned `RESTICKIFY` step whose key is in
+`restickify_realized`, and its op takes the step's division and address in the ordinary walk. An
+unrealized unpinned step still raises.
 
 ### The #5695 predicate
 
@@ -443,28 +444,31 @@ unverified: #5695 is not in the snapshot.
 
 ### Landing before or after Stages 12 and 13
 
-Nothing here reads which of them has landed. `select_optimizer()` returns `None` on the old path and
-a family otherwise. The gates select with `LAYOUT_SOLVER=ortools` or `sa`, which mean the same at
-every point, against `main` at the branch point with the switch off. The branch in
-`_maybe_scratchpad_planning` sits at the head of the wrapper, today's or Stage 13's. A compile with
-no plan reaches `scratchpad_planning` with beam sticks, whichever path that holds by then. This
-stage uses nothing Stage 13 deletes: `check_report` rather than the Stage 3 adapter, Stage 6's
-`restickify_read_is_core_local` rather than the allocator method, and Stage 8's public
+Nothing here reads which of them has landed. On the old path `family_key(config)` is `None`, and
+otherwise it names a family. The gates select with `LAYOUT_SOLVER=ortools` or
+`sa`, which mean the same at every point, against `main` at the branch point with the switch off.
+The branch in `_maybe_scratchpad_planning` sits at the head of the wrapper, today's or Stage 13's. A
+compile with no plan reaches `scratchpad_planning` with beam sticks, whichever path that holds by
+then. This stage uses nothing Stage 13 deletes: `check_report` rather than the Stage 3 adapter,
+Stage 6's `restickify_read_is_core_local` rather than the allocator method, and Stage 8's public
 `DivisionSource` and `TableRelation` rather than the aliases.
 
 ### OR-Tools encoding
 
-Stage 5 has the stick variable: `_stick_var` holds a private candidate index, and
-`_stick_is(port, dim)` is the OR of the candidates whose `dims` contain `dim`, so dim-keyed rule
-data meets key-valued sticks there. Stage 6 binds the restickify literal in `_encode_restickifies`,
+Stage 5 has the stick variable: `stick_var(enc, port)` holds a private candidate index, and
+`stick_is(enc, port, dim)` is the OR of the candidates whose `dims` contain `dim`, so dim-keyed rule
+data meets key-valued sticks there. Stage 6 binds the restickify literal in `encode_restickifies`,
 and leaves the rest here. From commit 9 this stage adds:
 
 - **Node table.** A free node's table gains a stick column. Each row is (stick key, tiling,
-  division), legality is evaluated with `work_division_context_for_op` under the candidate's stamp,
-  and footprint and cost tables key on the same row index. Position numbers stay inside the encoder.
+  division), legality is evaluated with `work_division_context_for_op` and the data of each flag in
+  `node.restrictions` under the candidate's stamp, and footprint and cost tables key on the same
+  row index. With `Rule.TILES_OFF_STICK` in `graph.target.rules`, a row's tiling is checked against
+  that row's candidate `dims`. Under D5 a tiled node has one candidate, so this is Stage 5's check.
+  Position numbers stay inside the encoder.
 - **Stick relation.** `AddAllowedAssignments([stick_u, stick_v, restick_e], rows)`. A missing pair
   is banned.
-- **Forced steps.** `_encode_restickifies` keeps its raise for a forced restickify with no pin only
+- **Forced steps.** `encode_restickifies` keeps its raise for a forced restickify with no pin only
   where `edge.sticks` is `None`.
 - **Edge match.** `build_edge_tables` gains a stick key on `pairs`. The division pair relation is
   built once per row, posted under that pair's literal. A pair with no step uses the view equality.
@@ -478,7 +482,8 @@ and leaves the rest here. From commit 9 this stage adds:
   key.
 - **`read_back`.** Each free node's value picks its candidate and writes `OutPort.layout`. After the
   relayout decode, each chosen row with a `restickify` goes through `add_step` as an unpinned
-  `Restickify`, with `resident`, `offset` and `footprint` from its box.
+  `RESTICKIFY` step, with `resident`, `offset` and `footprint` from its box. The step kind is in
+  `graph.target.steps`, as for every step an encoder inserts.
 
 ### SA encoding
 
@@ -487,7 +492,7 @@ entries are (stick key, `DivisionConfig`) from one inner source per candidate, t
 a division flip can land on another stick, as the parent plan says. `DivisionConfig`'s key gains the
 stick key. `relations[gate]` is a `TableRelation` over those entries, with the restickify forced by
 the row. The seed is the beam's stick, so postmath's point stands: a valid seed gives a valid plan.
-`SAEncoder.encode` stops refusing an unpinned stick.
+`SAFamily.encode` stops refusing an unpinned stick.
 
 SA has no relayouts. A state whose row `crosses_frame` over a source sliced across cores with no
 local proof is legal only with that source spilled: the packer treats the source as non-placeable in
@@ -509,7 +514,7 @@ real requirement is that planning splits in two: solve and read-back run before 
 commit after them, when `commit_divisions` has its `FixedTiledLayout`s. `verify_realized` is the
 proof, and any failure raises `RuleViolation`. After `rebind_graph`:
 
-1. The ops the passes inserted equal the shadow rows plus the solved `Restickify` steps, by
+1. The ops the passes inserted equal the shadow rows plus the solved `RESTICKIFY` steps, by
    `EdgeKey`, with equal target layouts.
 2. Each op's final `FixedTiledLayout` equals its candidate's `layout`, and each shadow's its
    realized op's.
@@ -521,11 +526,11 @@ proof, and any failure raises `RuleViolation`. After `rebind_graph`:
 
 Stage 6 posts no joint hazard constraint: its gate is the rule, for a read view fixed per node. With
 free sticks the read view changes per row, so the constraint is this stage's, tagged
-`Always.CROSS_FRAME`. For each row with `crosses_frame`:
-`(stick_u == src) and (stick_v == dst) and resident_u and cores_u > 1` implies a proven local read
-for the (division_u, division_v) pair, or, on the beam's pair only, a relayout. The proof is Stage
-6's `restickify_read_is_core_local` under stamps, as a table over the two divisions. `crosses_frame`
-is needed because a clone can be a restickify without any step.
+`"cross_frame"`, the name of the cross-frame hazard's check in `ALWAYS`. For each row with
+`crosses_frame`: `(stick_u == src) and (stick_v == dst) and resident_u and cores_u > 1` implies a
+proven local read for the (division_u, division_v) pair, or, on the beam's pair only, a relayout.
+The proof is Stage 6's `restickify_read_is_core_local` under stamps, as a table over the two
+divisions. `crosses_frame` is needed because a clone can be a restickify without any step.
 
 Non-beam pairs have no relayout option, so a relayout ahead of a restickify, which is legal
 (`allocator.py:1513-1521`), arises only on the beam's pair. List order stays physical. A restickify
@@ -563,12 +568,17 @@ consumer. At limit 1 there are no such edges, and a shadow takes a tick as any n
 ### Requirement 5: layout-derived port facts become conditional
 
 ```python
-class Port:
-    def facts_for(self, layout: FixedTiledLayout) -> PortFact: ...
+def facts_for(graph: SpyreOptimizationGraph, port: Port, layout: FixedTiledLayout) -> PortFact:
+    return derive_port_facts(port, layout) & graph.target.ops.ops[type(port.node)].facts
 ```
 
-`facts` remains the value under the current layout. `facts_for` wraps Stage 2's pure
-`derive_port_facts(port, layout)`, evaluated per candidate on out ports and per row on in ports.
+`port.facts` remains the value under the current layout. `facts_for` is a module function in
+`nodes.py` beside `current_layout`, wrapping Stage 2's pure `derive_port_facts(port, layout)` with
+the same `OpConfig.facts` mask Stage 2 applies to `port.facts`, so a fact the card's op config does
+not allow is absent under every candidate and never becomes conditional. It is evaluated per
+candidate on out ports and per row on in ports. `build_graph` fills each `StickCandidate.facts` and
+`StickPairRow.facts` from it, with `dataclasses.replace`, when it attaches them to a port and an
+edge, because only then is the node type known.
 
 | fact or data | source | under this stage |
 |---|---|---|
@@ -578,7 +588,8 @@ class Port:
 | `DIRECT_READ_SOURCE` | the saved record and the graph input's layout | Unconditional. Holders stay pinned |
 | `splits_while_stuck` data, `aligned_ownership_split_domains`, `restickify_padding_blocked_vars` | layouts | Per candidate, through the menu |
 
-Posting: `self.post(subject, rule, expr, when=literal)`, with the candidate's or the row's literal.
+Posting: `post(enc, subject, rule, expr, when=literal)`, with the candidate's or the row's
+literal.
 A fact with one value on all of a port's candidates is posted unconditionally, so a pinned or
 uniform graph produces no new constraints. In SA these prune per entry of `_StickedDivisions` and
 per relation entry.
@@ -613,14 +624,14 @@ the seed for SA, and the fallback when the solve returns nothing. So `_matmul_la
 |---|---|
 | proven infeasible | Warning naming user hints. Returns `None`. Beam sticks stay, and everything runs as with the switch off |
 | graph opts out | Logged and counted. Returns `None`, same route |
-| out of time with no plan (`NO_PLAN`) | Stage 9's fallback to SA over the same free graph, seeded at the beam. With no fallback family, returns `None`, same route |
+| out of time with no plan (`NO_PLAN`) | Stage 9's fallback to SA over the same free graph, seeded at the beam. With an empty `config.fallback_solver`, returns `None`, same route |
 | `verify_realized` fails | `RuleViolation`. IR already mutated, so there is no retry |
 
 `solve_decides_sticks` requires `config.lx_planning`, `config.lx_sticks_in_solve`,
 `config.co_optimizing_lx_planning` (committed mode pins divisions that exist only after
 `_distribute_work`), `not config.auto_coarse_tiling`, and empty `span_overflow_groups` under the
 beam's stamps, the interim for #5682 Step 1. `_maybe_solve_sticks` adds the family test through
-`select_optimizer()`, so the two cannot disagree.
+Stage 9's `family_key(config)`, the routing `plan_allocation` uses, so the two cannot disagree.
 
 ### Config
 
@@ -640,12 +651,12 @@ that is 11a's mode.
 | file | change |
 |---|---|
 | `<lx>/sticks.py` | New: everything in "Graph-layer additions" except the fields on the graph types |
-| `<lx>/graph/nodes.py`, `<lx>/graph/optimization_graph.py` | `OutPort.candidates`, `DataEdge.sticks`, `Port.facts_for`, `restickify_realized` |
-| `<lx>/graph_builder.py` | `stick_candidates=None`; tick gaps from 11b |
-| `<lx>/optimizer.py` | `plan_sticks`, `optimize(commit=)`, `sticks.py` in `optimizer_pass_sources()` |
+| `<lx>/graph/nodes.py`, `<lx>/graph/optimization_graph.py` | `OutPort.candidates`, `DataEdge.sticks`, `facts_for`, `restickify_realized` |
+| `<lx>/graph_builder.py` | `stick_candidates=None`, candidate and row facts through `facts_for`; tick gaps from 11b |
+| `<lx>/optimizer.py` | `plan_sticks`, `sticks.py` in `optimizer_pass_sources()` |
 | `<lx>/commit.py` | `commit` divides leftovers. `read_commit_plan` accepts realized steps |
 | `<lx>/cost.py` | `CostModel.restickify_cost`, row terms in `objective` |
-| `<lx>/family/ortools_encoder.py`, `<lx>/family/edge_tables.py` | Everything under "OR-Tools encoding", conditional facts |
+| `<lx>/family/ortools_encode.py`, `<lx>/family/edge_tables.py` | Everything under "OR-Tools encoding", conditional facts |
 | `<lx>/family/sa/` | `_StickedDivisions`, relation over stick entries, step boxes, hazard as non-placeable source |
 | the module holding `solve_decides_work_division` | True on a family with a held plan |
 | `torch_spyre/_inductor/passes.py` | `_maybe_solve_sticks`. Branch at the head of `_maybe_scratchpad_planning`. Early return in `_maybe_coarse_tile_span_overflow` |
@@ -668,7 +679,8 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
 6. `StickPairRow`, `StickRelation`, `build_stick_relations`.
 7. `predict_shadow_ops`, `shadow_ops`, `build_graph(stick_candidates=)`. Under
    `lx_stick_domain_limit=1` each beam restickify is a shadow `RestickifyNode` with its own menu,
-   plus `Restickify(pinned=True, realized_by=node)`. No encoder or commit file changes.
+   plus `Step(kind=StepKind.RESTICKIFY, pinned=True, realized_by=node)`. No encoder or commit file
+   changes.
 8. `plan_sticks`, `write_solved_sticks`, `rebind_graph`, `verify_realized`, `_maybe_solve_sticks`,
    gated on both config values and refusing any limit but 1. The predicate turns true on a held
    plan, with `commit`'s leftover step.
@@ -679,7 +691,7 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
    6's raise is scoped to edges with no `sticks`. `read_back` decodes sticks and steps.
    `read_commit_plan` accepts a realized unpinned step.
 10. Hazard under row literals; `crosses_frame`.
-11. `Port.facts_for` and conditional posting.
+11. `facts_for` and conditional posting.
 12. `restickify_cost_features`, `CostModel.restickify_cost` and row terms.
 13. SA family.
 14. `_maybe_solve_sticks` opens limit 2. Failure tests. Gate report added to the PR.
@@ -691,29 +703,31 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
 | harness | `Recorder`, `proto_text`, `StageRecord`, `lx_fake_device`, `lx_zoo.MODELS`, `FIXED_GRAPHS`, features `beam_restickify`, `fixup_copy` | 0 | Gates, compile-path tests |
-| `OutPort`, `InPort`, `DataEdge`, `Pin`, `PortFact` | parent-plan members; `DataEdge.add_step(step)` | 1 | Extended here |
-| `Restickify` | `Restickify(to_stick, realized_by=None, target=None, **transform_fields)`; `apply` returns `target` when set | 1 | Unpinned steps |
+| `OutPort`, `InPort`, `Port`, `DataEdge`, `Pin`, `PortFact` | parent-plan members; `Port = InPort \| OutPort`; `DataEdge.steps`, `DataEdge.add_step(step)` | 1 | Extended here |
+| `Step`, `StepKind.RESTICKIFY`, `apply` | `Step(kind=StepKind.RESTICKIFY, to_stick=None, realized_by=None, target=None, pinned=False, ...)`; `apply(step, layout)` returns `step.target` when set | 1 | Unpinned steps |
 | `RestickifyNode` | Stage 1's class, filled by Stage 2 | 1, 2 | Shadow nodes |
 | `stick_dims`, `SPARSE_STICK` | `(layout) -> tuple[int, ...]`; `-1` | 1 | `StickCandidate.dims` |
-| `build_graph` | `build_graph(ir, *, capacity=None, alignment=128, divisions_committed=False, drain_plans=None, lx_relayout_plans=())` | 2 | Gains `stick_candidates=None`. Runs before `finalize_layouts` under stamps |
+| `build_graph`, `select_target` | `build_graph(ir, target, *, divisions_committed=False, drain_plans=None, lx_relayout_plans=())`; `select_target(config) -> Target` | 2 | Gains `stick_candidates=None`. Runs before `finalize_layouts` under stamps |
+| `Target`, `OpConfig` | `graph.target.ops.ops[type(node)].facts`, `graph.target.rules`, `graph.target.steps` | 1 | The facts mask in `facts_for`; `Rule.TILES_OFF_STICK`; `StepKind.RESTICKIFY` offered |
 | stick pins | `Pin(out, "stick", stick_dims(layout) or (SPARSE_STICK,), source)`, sources `"layout"`, `"graph input"`, `"pre-pass"` | 2 | `"layout"` pins are not created for free nodes |
-| `derive_port_facts` | `(port, layout) -> PortFact` | 2 | `Port.facts_for` wraps it |
+| `derive_port_facts` | `(port, layout) -> PortFact`, before the op config's mask | 2 | `facts_for` wraps and masks it |
 | `classify`, `_committed_work_split` | a deferred op's split is computed, never written | 2 | Shadow nodes; pinned ops under stamps |
-| `stick_tables`, `splits_while_stuck` | `(node, flag)` | 3 | Evaluated under stamps |
-| `check_report`, `RuleViolation` | `(graph, overrides=None) -> CheckReport` | 3 | `verify_realized` |
-| `Always.CROSS_FRAME` | tag | 3 | Hazard constraint |
+| `stick_tables`, `splits_while_stuck` | `(node, flag)`, for each flag in `node.restrictions` | 3 | Evaluated under stamps |
+| `check_report`, `RuleViolation` | `(graph) -> CheckReport` | 3 | `verify_realized` |
+| `ALWAYS`'s `cross_frame` check | its name string `"cross_frame"` tags provenance | 3, 6 | Hazard constraint |
+| `Rule.TILES_OFF_STICK` | read from `graph.target.rules` | 3 | Per-row tiling check |
 | `Sym.restick(e, row)`, `Sym.stick(n)` | Stage 4's rows | 4 | Row terms, stick binding |
 | `CostModel.objective`, `.priced_objective` | `(graph, domains)`; `(graph, domains, *, linear_only)` | 4 | Row terms |
-| `OrToolsEncoder.post` | `post(subject, rule, expr, when)` | 5 | Conditional rules |
-| `_stick_var`, `_stick_is`, `work_division_context_for_op` | private candidate index; `(port, dim)`; as Stage 5 | 5 | Table column, legality under stamps |
-| `_encode_restickifies` literal | `Sym.restick(edge)`, folded on constants | 6 | The literal only, made live, and its raise scoped |
+| `post`, in `ortools_encode.py` | `post(enc, subject, rule, expr, when)` | 5 | Conditional rules |
+| `stick_var`, `stick_is`, `work_division_context_for_op` | `(enc, port) -> IntVar`, a private candidate index; `(enc, port, dim) -> bool \| IntVar`; as Stage 5 | 5 | Table column, legality under stamps |
+| `encode_restickifies` literal | `Sym.restick(edge)`, folded on constants | 6 | The literal only, made live, and its raise scoped |
 | `build_edge_tables`, `EdgeTables`, `Gate` | as Stage 6 | 6 | Stick key on `pairs` |
 | `restickify_read_is_core_local` | `(ir, name, reader, *, plans=()) -> bool` | 6 | Hazard proof |
-| `PlacementBox`, `Model.boxes`, `Solution`, `SolveStatus`, `OrToolsEncoder.read_back` | as Stage 7 | 7 | Step box; decoding stick and `Restickify.target` |
-| `AnnealModel`, `DivisionSource`, `EdgeRelation`, `TableRelation`, `SAEncoder.read_back` | as Stage 8 | 8 | `_StickedDivisions` |
-| `SpyreOptimizer.optimize`, `.outcome`, failure flow, `select_optimizer()` | as Stage 9 | 9 | `commit=False`, `plan_sticks` |
+| `PlacementBox`, `Encoding.boxes`, `Solution`, `SolveStatus`, `OrToolsFamily.encode`, `.read_back` | as Stage 7 | 7 | Step box; decoding stick and the step's `target` |
+| `AnnealModel`, `DivisionSource`, `EdgeRelation`, `TableRelation`, `SAFamily.encode`, `.read_back` | as Stage 8 | 8 | `_StickedDivisions` |
+| `optimize`, `family_key`, `select_families`, `SolveSettings.from_config`, failure flow | `optimize(graph, family, fallback, settings)`, which reads back and checks but never commits; `family_key(config) -> str \| None`, `None` on the old path; `select_families(config) -> tuple[Family, Family \| None]` | 9 | `plan_sticks`, the old-path test |
 | `solve_decides_work_division` rule, `optimizer_pass_sources()` | false on a family; planner sources in the FX key | 9 | Turned true on a held plan; lists `sticks.py` |
-| `SpyreOptimizer.commit`, `read_commit_plan` | `commit(graph)`, runs `post_optimization_passes`; `(graph) -> CommitPlan` | 10 | Called on the held plan. Unchanged in 11a except the leftover step. Accepts realized steps in 11b |
+| `commit`, `read_commit_plan` | `commit(graph)`, runs the context-switching passes; `(graph) -> CommitPlan` | 10 | Called on the held plan. Unchanged in 11a except the leftover step. Accepts realized steps in 11b |
 | `divide_deferred_op`, `solve_decides_work_division` | #5695 | #5682 Step 1 | Leftovers on a held plan |
 | span floors inside menus | #5682 | #5682 Step 1 | Per candidate |
 | reservations for fixup passes | #5682 | #5682 Step 2 | Ported by Stages 5-7 |
@@ -727,11 +741,12 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
 | `solve_decides_work_division()` | true on a family only with a plan held, so only with the switch on | 12, 13 | final |
 | `divide_deferred_op` in `commit`, the no-plan route | see "The #5695 predicate" | 13 | final |
 | `config.lx_stick_domain_limit`, `canonical_proto` | `int`; `(model: object) -> str` | none | final |
-| `StickCandidate`, `StickPairRow`, `StickRelation`, `ShadowRow`, `OutPort.candidates`, `DataEdge.sticks`, `Port.facts_for`, `restickify_realized` | as in Design | none | final |
+| `StickCandidate`, `StickPairRow`, `StickRelation`, `ShadowRow`, `OutPort.candidates`, `DataEdge.sticks`, `restickify_realized` | as in Design | none | final |
+| `facts_for` | `(graph, port, layout) -> PortFact`, masked by the node type's `OpConfig.facts` | none | final |
 | `tentative_layouts`, `shadow_ops` | as in Design | none | final until a named follow-up has the graph own candidate layouts |
 | `solve_decides_sticks` | `(ir) -> bool` | none | final; the span-overflow clause stays until a named follow-up |
 | `stick_domain`, `build_stick_candidates`, `build_stick_relations`, `predict_shadow_ops`, `write_solved_sticks`, `rebind_graph`, `verify_realized`, `_maybe_solve_sticks` | as in Design | none | final |
-| `SpyreOptimizer.plan_sticks`, `optimize(commit=)`, `CostModel.restickify_cost` | as in Design | none | final |
+| `plan_sticks`, `CostModel.restickify_cost` | `(ir, config) -> SpyreOptimizationGraph \| None`; as in Design | none | final |
 | `restickify_cost_features`, `restickify_padding_plan`, `restickify_loop_info` | as in Design | none | final |
 | `restick_resident`, the step's `PlacementBox`, the row hazard constraint | encoder internals | none | final |
 
@@ -769,6 +784,8 @@ per compile.
   `test_banned_pair_never_chosen`, `test_forced_restickify_raises_only_without_sticks`,
   `test_hazard_on_free_edge_forces_spill_or_proof`, `test_beam_hint_is_feasible`,
   `test_uniform_fact_posted_unconditionally`, `test_conditional_fact_posted_under_literal`,
+  `test_fact_outside_op_config_is_never_posted` (a derived target whose `OpConfig.facts` drops
+  `QFP8WT`),
   `test_solver_refuses_restickify_when_it_does_not_pay`, and
   `test_solver_takes_restickify_when_it_saves_spills`: two sticks, one needs a restickify and opens
   a split that keeps a buffer resident, and the solve takes it. This is the #5665 shape.
@@ -933,9 +950,9 @@ families take the pin. Enumeration is about 88% of planning there, with a projec
 (c) Conv, exx2, topk, keep_by_index and layernormnorm, which have stick rules in
 `propagate_layouts.py` and no table in Stage 3. Resolution: pinned in this stage.
 
-**D6. `Restickify.to_stick: int` is not enough.** Factorized and constant sticks have no single dim,
-and `compute_restickify_target_layout` returns a full STL. Resolution: an unpinned step carries
-Stage 1's `Restickify.target`.
+**D6. `Step.to_stick: int` is not enough.** Factorized and constant sticks have no single dim, and
+`compute_restickify_target_layout` returns a full STL. Resolution: an unpinned `RESTICKIFY` step
+carries Stage 1's `Step.target`, which the parent's `STEP_KINDS` table does not list.
 
 **D7. `OVERLAPPING_READ` is layout-derived.** The Decisions row says in-port facts come "from the
 read itself (overlap, direct-read provenance)". The code derives overlap from `td.device_coords`
@@ -945,8 +962,10 @@ read itself (overlap, direct-read provenance)". The code derives overlap from `t
 there, so the numbers differ even when the order does not. A shadow's variables also carry another
 name. Resolution: `canonical_proto`, with decision equality as the hard gate.
 
-**D9. `optimize` commits.** Stick passes must run between `read_back` and commit, because commit
-needs final layouts. Resolution: `optimize(commit=False)` and `plan_sticks`.
+**D9. `plan_allocation` is split in two.** Stick passes must run between `optimize` and `commit`,
+because commit needs final layouts, while the parent's `plan_allocation` runs them back to back.
+Resolution: `plan_sticks` runs the first half from `_maybe_solve_sticks`, and
+`_maybe_scratchpad_planning` calls `commit(graph)` on the held plan.
 
 **D10. "One solve" holds, with one exception.** If `plan_sticks` returns `None` after a solve, the
 later position runs a second solve with sticks pinned. This is a failure path only.
