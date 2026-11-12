@@ -1,7 +1,7 @@
 # LX allocator, Stage 6: `OrToolsFamily.encode`, edge and op-op level
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2, 3, 4, 5. Needed by: Stages 7, 8, 9, 10, 11, 12, 13.
+Depends on: Stages 1, 2, 3, 4, 5. Needed by: Stages 7, 8, 9, 10, 11, 12, 13.
 
 ## Goal
 
@@ -706,7 +706,7 @@ Commits, each leaving tests green. Commits 4 to 8 each shrink the `project_today
 gated on what it adds.
 
 1. **Move candidate code.** `edge_tables.py` with the moved functions, delegates in the allocator,
-   re-pointed tests. Stage 0 harness: empty diff on proto and plans.
+   re-pointed tests. The existing suites under Tests, which guard the move, stay green.
 2. **Add row fields.** `reduction_split`, `completed_producer_cores`, the `plan` passthrough.
 3. **Tables as data.** `edge_tables.py`'s types and functions. A test compares them with the allocator's records.
 4. **Units.** `settle_tables`, prefetch tables, `merge_*` literals, relayout-group units.
@@ -747,7 +747,8 @@ Consumes:
 | `DivisionTable` | `.node`, `.entries`, `.enumerated`, `.tileable`; tables cover non-input nodes | 5 | menus |
 | `stick_of`, `read_stick` | `(port, graph)`, `(edge, graph)`; the second walks the edge's steps | 5 | `forced` |
 | `build_today`, `project_today`, `section_diff`, `replay_graph`, `lx_shadow_plugin` | Stage 5's helpers; `build_today` gains `cost_expr=None` here | 5 | gate |
-| harness | `lx_gate.sh`, tiers `intree`, `fake`, `unit-*`, `failure`, `FIXED_GRAPHS`, `corpus_coverage` | 0 | gate |
+| `CoOptimizingAllocator._solve` | `(solver, graph: GraphLowering) -> Sequence`, `allocator.py:3218` | existing | wrapped by `lx_shadow_plugin` and by the compile-backed table tests |
+| `TestBuildingBlocks` | `test_building_blocks.py:40` | existing | the compiles the live arm runs under |
 | `tests/scripts/lx_check_summary.py` | `<record file>` | 3 | rerun |
 
 Provides:
@@ -777,8 +778,10 @@ Provides:
 
 ## Tests
 
-`tests/inductor/test_lx_gate_tables.py`. Compile-backed cases use `fake` compiles of the fixed set, in
-process, with no card.
+`tests/inductor/test_lx_gate_tables.py`. Compile-backed cases run on the card. Each compiles in process,
+either a small function written in the test or a `TestBuildingBlocks` model, with
+`CoOptimizingAllocator._solve` wrapped by `mock.patch.object` to read `solver.buffers` and the
+`GraphLowering` before the legacy body runs.
 
 - `test_tables_equal_the_allocator_records`: per reader, `Gate.pairs` equals `cd_parent_matches`,
   `Gate.relayouts` equals `cd_parent_relayouts` field by field, group ids equal.
@@ -795,7 +798,8 @@ process, with no card.
   `lx_same_tile_group_relayout` on and off.
 - `test_same_tile_group_rows_scale_by_trip_count`: moved from the e2e assertion at
   `test_solver_relayout_e2e.py:864`. `test_group_ids_follow_consumer_order`.
-- `test_check_decisions_rejects_a_relayout_from_the_wrong_division`: on a `fake` graph, no tables.
+- `test_check_decisions_rejects_a_relayout_from_the_wrong_division`: on a graph from one of the compiles
+  above, no tables.
 - `test_deferred_read_rejection_rebuilds_tables`: interning restarts, `pair_costs` persists, and the
   rejected node holds a `split` pin and one entry. `test_settle_with_no_relayout_sources`: Stage 8's call.
 - `test_completed_rows_are_off_by_default` and `test_completed_rows_when_enabled`: with the flag on, a
@@ -854,12 +858,14 @@ reaches the encoder until Stage 9. `make check-all-configs` must pass.
 
 Parent plan: "Through Phase 1, and in Phase 2 wherever the rules agree with today's, the CP model stays
 byte-identical and the committed plans stay identical. Any other difference is listed by rule in its PR
-and either justified or fixed." Stage 6 has no "proven by" line of its own.
+and either justified or fixed." Stage 6 has no "proven by" line of its own. Since the review of PR #7,
+committed plans are judged by the proven optimum of the cost expression, not by identity: a different plan
+at an equal `objective_ns` is a tie. This stage solves no new model, so that check starts at Stage 7.
 
-**Production unchanged.** The Stage 0 harness between this PR's parent and tip: `intree`, the `fake` zoo
-at default and `AUTO_COARSE_TILING=1`, `unit-*` and `failure`, empty on proto, decisions and plans. Each
-commit runs `intree` and the fixed set. A model `fake` cannot reach stays card-only and is listed in the
-PR. `fake` inputs use default layouts, so this proves parity, not production plans.
+**Production unchanged.** The only production edits are the moved candidate code, with the allocator
+delegating, the row fields, and completed rows behind a flag that is off. The existing suites under Tests
+guard the move: the unit suites at each commit, and the device suites on the card at the PR tip. Nothing
+is compared across commits, because nothing is stored.
 
 **Proto gate.** There is no second comparator. Stage 5's section diff continues with a smaller drop set:
 
@@ -870,31 +876,44 @@ PR. `fake` inputs use default layouts, so this proves parity, not production pla
   `lin_max` hold `vars` inside their expressions on OR-Tools 9.15 (`exp/stage-06/fields.py`).
 - **B:** `OrToolsFamily().encode(build_graph(ir, select_target(config)))`, first-stage objective
   included, `encode_placement` posting capacity only. It runs on live compiles through `lx_shadow_plugin`, at each
-  joint solve, on the `fake` zoo at both configs and the unit suites that hold a `GraphLowering`.
+  joint solve, on the card with the plugin loaded into `test_building_blocks.py`,
+  `test_lx_planning_suite.py` and `test_solver_relayout_e2e.py`, at the default config and with
+  `AUTO_COARSE_TILING=1`, and into the unit suites that hold a `GraphLowering`.
 - **Pass:** variable strings, constraint strings and the objective are equal, lists in order, for every
-  such solve. The corpus has both priced and ladder solves. `cost_domains` also equals
-  `domains_from_buffers(solver.buffers)`.
+  such solve. `cost_domains` also equals `domains_from_buffers(solver.buffers)`.
+
+Default-config compiles take the priced path. Until #6124 merges, `AUTO_COARSE_TILING=1` compiles take the
+ladder; after it, they are priced too. So that the ladder path stays compared whichever base this lands on,
+`test_live_parity_forced_ladder` patches `predict_bundles` to raise `RuntimeError`, under every name the
+two sides import it by. Under the default `_cpsat_warn_on_cost_expr`, `allocator.py:3321-3336` and
+`priced_objective` both turn that into no expression, and both take the ladder.
+
+This is this stage's own test of the encoding. B is not solved here, so there is no plan to judge; from
+Stage 7 the pass condition for plans is the proven optimum, equal `objective_ns` at `OPTIMAL`.
 
 Stage 7 empties the drop set, and the gate becomes the whole proto.
 
-**In CI.** `test_lx_live_parity.py` extends to these sections on `fake` compiles of the fixed set, at
-default and tiling. The replay arm in `test_lx_encoder_sections.py` keeps `load_captures`,
+**In CI.** `test_lx_live_parity.py` extends to these sections on the `test_building_blocks.py` compiles
+Stage 5 names, at default and tiling, on the card, plus `test_live_parity_forced_ladder`. The replay arm
+in `test_lx_encoder_sections.py` keeps `load_captures`,
 `synthetic_graphs()` and the hand-built cases: `edge_tables_from_buffers` feeds `cd_parent_matches` and
 `cd_parent_relayouts` to `encode_read_gates` over `replay_graph`, through a test subclass's
 `settle_tables`, and stops at `encode_tile_counts`. It tests emission, not the tables, because those
 nodes have no IR. Captures are not a route to the encoder.
 
-**Reported in the PR.** Hits per `corpus_coverage` feature, restickify features included. A zero on a
-restickify reading a resident source means the hazard was not exercised. `lx_check_summary.py` is rerun
-on the `fake` records.
+**Reported in the PR.** The live arm prints, per solve, how many `RestickifyNode`s read a source that
+today's solve placed in LX. A zero over all the runs means the hazard was not exercised, and the PR says
+so. `lx_check_summary.py` is rerun on the records `SPYRE_LX_CHECK_FILE` writes while the card suites above
+run.
 
 Not byte-gated:
 
 - **Committed mode.** `plan_layout` builds a different model with no gates, so its proto cannot match an
   all-pinned graph. It goes to the Phase 2 exit, on traffic.
-- **Plans.** Nothing solves B with placement until Stage 7, so decision parity starts there.
-- **`lx_solver_completed_reduction_routes=1`.** Rule-listed difference. Run once on the corpus with
-  `check_decisions` clean. Stage 12's rollout owns the comparison.
+- **Plans.** Nothing solves B with placement until Stage 7, so plan parity, as the proven optimum,
+  starts there.
+- **`lx_solver_completed_reduction_routes=1`.** Rule-listed difference. Run once over the card suites
+  above with the flag on and `check_decisions` clean. Stage 12's rollout owns the comparison.
 
 One difference is expected and listed: where legacy printing fails on a foreign symbol it leaves helper
 variables in A, and `priced_objective` returns `None` before printing, so B lacks them. Any other is
@@ -904,8 +923,8 @@ listed by rule, or fixed.
 
 - **The graph disagrees with the buffers.** A hand port from a graph built without the allocator, in exact
   creation order, has never been compared on a real compile. Stage 5's commit 7 (P4) is the first section
-  diff on the `fake` zoo and has not been run. Node, prefetch or menu order differing there changes this
-  design before it freezes.
+  diff, on card compiles of `test_building_blocks.py`, and has not been run. Node, prefetch or menu order
+  differing there changes this design before it freezes.
 - **Proto order drift.** One helper out of place shifts every later index. Caught by the gate, by name.
 - **A ladder stage through sympy changes the proto.** Stage 4 says it does not. Caught by the gate, and
   only then does a CP copy of the terms return.
@@ -913,7 +932,7 @@ listed by rule, or fixed.
   but `rw.reads | rw.writes` and the name sets around it are not ordered by contract. Caught by running the
   gate under the hash seeds in `tests/inductor/test_scratchpad_solver.py:1009`.
 - **Fake tensors.** `Gate.residency` holds ops. Nothing keeps a table on the graph or in
-  `Encoding.provenance`, and the harness must not pickle the encoding's model. Caught by a test that
+  `Encoding.provenance`, and the live arm must not pickle the encoding's model. Caught by a test that
   pickles `Encoding` metadata and the graph.
 - **The rebase race.** Main keeps changing `_cd_parent_relayouts`. The move in commit 1 goes first so later
   fixes land in one body. `test_lx_live_parity.py` fails in CI when the model changes without the encoder.
@@ -980,6 +999,13 @@ listed by rule, or fixed.
    stays resident has no reduction split", is the card rule `Rule.RESIDENT_TILE_UNREDUCED` in the
    parent's own `Rule` list. Resolution: the guard is posted only when `graph.target.rules` holds that
    flag, and is tagged with it. `SPYRE` holds it, so the proto does not change.
+
+10. **Stage 0 is dropped (owner, PR #7, 2026-11-12).** "Production unchanged" was the Stage 0 diff
+    between this PR's parent and tip, the live arm ran on the `fake` zoo, and coverage came from
+    `corpus_coverage`. Resolution: production is held by the existing suites, unit and card. The section
+    diff runs in-process through `lx_shadow_plugin` on card compiles of `test_building_blocks.py`,
+    `test_lx_planning_suite.py` and `test_solver_relayout_e2e.py`, with a forced-ladder case. The live arm
+    prints the restickify count itself. Nothing is stored.
 
 ## Open questions
 
