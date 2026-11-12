@@ -9,8 +9,9 @@ When this PR merges, torch-spyre has one equivalence harness that records every 
 solve and every committed plan under a deterministic solve, diffs two recordings, and
 runs the regression guards from torch-spyre#5682 on a fixed graph set. Later stages call
 it instead of building their own check. Parity for an optimizing solve means the decided
-objective: both sides reach `OPTIMAL` at the same objective. A different plan at that
-objective is a tie, not a failure. Protos, decisions and commits are compared too, as
+objective: both sides reach `OPTIMAL` at the same value of the cost expression. The
+lexicographic ladder is recorded but never gated on. A different plan at that cost is a
+tie, not a failure, and a solve with no cost expression yet is compared exactly. Protos, decisions and commits are compared too, as
 diagnostics, and a uniqueness probe records whether each optimum is the only plan at its
 cost. Compiles reach the planner on a fake device
 wherever probe P1 shows they can, so those gates need no card, and the card calibrates
@@ -171,9 +172,11 @@ as absolute checks: status, size, fallback. Base-versus-change diffs run through
 committed: they are large (7-28 MB per set), tied to one base, and regenerable.
 
 **Golden.** `lx_equivalence_golden.json` holds the `intree` digests per case: status and
-objective per stage, which gate, and proto shas, a decisions sha and `uniqueness`, which
-`check-golden` reports and fails on only under `--mode exact`. A PR that moves an optimum
-runs `bless`, and the change shows in its diff. Compile tiers have no golden: names move with every pass change.
+objective per stage, proto shas, a decisions sha and `uniqueness`. The in-tree graphs have
+no cost expression, so they are `unpriced` and `check-golden` compares them exactly until
+Stage 4's `price` exists. Then the golden adds the priced cost per case, which gates, and
+the rest becomes a report. A PR that changes a plan runs `bless`, and the change shows in
+its diff. Compile tiers have no golden: names move with every pass change.
 `bless --tier fake` exists for the golden that replaces `intree` when `CpSatLayoutSolver`
 goes.
 
@@ -315,38 +318,64 @@ a change to production's own settings.
 
 ### Parity is the decided objective
 
-What a later stage must preserve is the optimum, not the plan that reaches it. A
-re-encoded model (Stage 5 on) can order variables differently. One worker then searches
-in a different order and can return a different plan at the same cost. The harness
-already saw this: `interleave_search=True` gave a different plan at equal objective on
-`mlp_swiglu_128`. So `diff` has two modes.
+What a later stage must preserve is the optimum, not the plan that reaches it, and the
+optimum is the cost expression's. The lexicographic ladder is not a measure the gate
+relies on: the parent plan moves every solve onto one expression from the target's cost
+model (Stage 4), so the ladder's stage objectives are today's search order, not the cost.
+A re-encoded model (Stage 5 on) can also order variables differently. One worker then
+searches in a different order and can return a different plan at the same cost. The
+harness already saw this: `interleave_search=True` gave a different plan at equal
+objective on `mlp_swiglu_128`. So `diff` has two modes.
 
-- **`mode="objective"`**, the default and the later-stage gate. For each CP-SAT solve,
-  every stage on both sides must be `OPTIMAL`, with the same stage count and an equal
-  objective at each stage. The ladder is lexicographic, so the vector of stage optima is
-  the objective. Where the solve is priced, `objective_ns` must also agree to a relative
-  1e-9. It is the decided objective: `_evaluate(expr, solved_bindings(buffers))` evaluated
-  on the plan that came back, not the solver's own report. A stage that stopped at the
-  budget proves no minimum, so it gives `unproven`. That is a failure on the fixed set and
-  a report elsewhere, like the `limit` guard. Different decisions at an equal proven
-  objective give `tie`, which is a report only. `proto` differences are reports too.
+- **`mode="objective"`**, the default and the later-stage gate. A solve is **priced**
+  when it has a cost expression. Both sides must be `OPTIMAL`, and `objective_ns` must
+  agree to a relative 1e-9. `objective_ns` is the decided objective:
+  `_evaluate(expr, solved_bindings(buffers))` evaluated on the plan that came back, not
+  the solver's own report. A solve that stopped at the budget proves no minimum, so it
+  gives `unproven`. That is a failure on the fixed set and a report elsewhere, like the
+  `limit` guard. Different decisions at an equal proven cost give `tie`, which is a
+  report only. `proto` differences are reports too, and so are ladder stage objectives
+  wherever a side ran the ladder.
 - **`mode="exact"`** compares every field. G1 and G2 use it at Stage 0, where any
   difference is a harness bug or nondeterminism, and so does any stage that claims an
   unchanged proto.
 
+**Unpriced solves.** At `5268ba95` a large part of the corpus has no cost expression:
+every CP-SAT tiling cell (the allocator builds none under `auto_coarse_tiling`,
+`allocator.py:3275-3299`, because today's cost model is flat in tile size and cut count
+and raises on output-tiled symbolic arguments, #3810), the 18 `intree` graphs,
+placement-only solves, and a failed build or lowering (`allocator.py:3321-3336`,
+`ilp_solver_ortools.py:886-900`). Stage 0 can price none of them, since it changes no
+production code. Two rules cover them.
+
+1. Until a cost expression prices a case, objective mode compares it **exactly**, as
+   `unpriced`, so any change to its decisions fails. This is the conservative choice:
+   with no cost there is no way to tell a tie from a regression, and the ladder is not
+   the cost. Stages 1-3 do not change the solve, so exact holds there anyway.
+2. Once a cost expression exists, `diff(price=...)` prices both sides with it.
+   `price(case, decisions)` returns ns for a recorded `BufferDecision` map, the
+   decisions being encoding-free, so a base that ran the ladder still gets a price. The
+   first stage that prices a case (Stage 4's `SpyreCostModel.objective`, which must
+   price tiling for the CP-SAT tiling cells to leave rule 1) gates on `change <= base`,
+   since the base did not minimize that expression. `improved` is reported. Later stages
+   minimize it on both sides and gate on equality, as for priced solves.
+
 | kind | objective mode | exact mode |
 |---|---|---|
-| `missing`, `stage_count`, `status`, `error`, `production_params` | fails | fails |
-| `objective`, `objective_ns`, `cost_expr` | fails | fails |
-| `unproven` (a stage below `OPTIMAL` on either side) | fails on the fixed set, else reports | not used: `status` covers it |
-| `tie` (decisions differ at an equal proven objective) | reports | fails as `decisions` |
-| `proto`, `decisions` with an unequal objective | reports, beside the `objective` failure | fails |
+| `missing`, `status`, `error`, `production_params` | fails | fails |
+| `objective_ns`, `cost_expr` on a priced solve | fails | fails |
+| `regressed` (priced by `price`, change above base) | fails | not used |
+| `improved` (priced by `price`, change below base) | reports | not used |
+| `unpriced` (no cost expression and no `price`; compared exactly) | fails on any difference | not used: each field fails by kind |
+| `unproven` (priced, below `OPTIMAL` on either side) | fails on the fixed set, else reports | not used: `status` covers it |
+| `tie` (decisions differ at an equal proven cost) | reports | fails as `decisions` |
+| `stage_count`, `objective` (ladder stages), `proto` on a priced solve | reports | fails |
 | `commit`, `snapshot`, `predicted_total` after equal decisions | fails | fails |
-| `commit`, `snapshot`, `predicted_total` after a `tie` | reports, with `cost_report` | fails |
+| `commit`, `snapshot`, `predicted_total` after a `tie` or `improved` | reports, with `cost_report` | fails |
 
 Commit and pipeline output are a function of the decisions. So with equal decisions, a
-commit difference is a real change to commit code, and it fails. After a tie it is
-expected, and `cost_report` shows whether the tied plan changed predicted runtime.
+commit difference is a real change to commit code, and it fails. After a tie or an
+improvement it is expected, and `cost_report` shows whether the tied plan changed predicted runtime.
 
 Families with no optimality proof (`sa_legacy`, `anneal`, `greedy`, `firstfit`,
 `bestfit`, `exhaustive`, and `sa` from Stage 8) have no minimum to compare. They are
@@ -354,12 +383,14 @@ seeded and repeatable, so objective mode compares them exactly, `score_ns` and d
 See Open questions.
 
 **Uniqueness is a diagnostic.** After the last stage of each CP-SAT solve, the harness
-runs the probe from `_is_unique_solution` itself, from the `_extract` hook. On the ladder
-that is the final model, with every lock in place. `lx_equivalence.probe_uniqueness` is
+runs the probe from `_is_unique_solution` itself, from the `_extract` hook. On a priced
+solve that is the cost-expression model. On the ladder it is the final model, with every
+lock in place, and only says whether the ladder's answer was the only one.
+`lx_equivalence.probe_uniqueness` is
 the same clone-and-differ model over `decision_variables()`, kept in the harness because
 the production method returns a bool that folds a tie and a stopped probe together. Like
-production, the probe copies the solver's parameters, so it inherits one worker and dtime 30, and a probe that stops there
-is `unproven`. Its `Solve` does not go through `_solve_and_record`, so it is never
+production, the probe copies the solver's parameters, so it inherits one worker and dtime 30,
+and a probe that stops there is `unproven`. Its `Solve` does not go through `_solve_and_record`, so it is never
 recorded as a stage. The result is `SolveRecord.uniqueness`: `"unique"`, `"tied"` or
 `"unproven"`. It never gates. It tells a reader how much a pass means. An equal objective
 on a `unique` case also pins the plan, so a `tie` there means the feasible set changed:
@@ -677,8 +708,8 @@ class Difference:
     index: int
     kind: str      # "missing" "stage_count" "proto" "status" "objective"
                    # "objective_used" "cost_expr" "objective_ns" "production_params"
-                   # "decisions" "tie" "unproven" "error" "commit" "snapshot"
-                   # "predicted_total"
+                   # "decisions" "tie" "unproven" "unpriced" "regressed"
+                   # "improved" "error" "commit" "snapshot" "predicted_total"
     detail: str
     first_cause: bool = True    # False for a difference downstream of an earlier stage
     rule: str | None = None     # from provenance when either side has it
@@ -689,10 +720,12 @@ def diff(
     base: str | Path, change: str | Path, *, mode: str = "objective",
     ignore: Collection[str] = (), allow_env: Collection[str] = (),
     fixed_set: Collection[str] = (),
+    price: Callable[[str, Mapping[str, BufferDecision]], float | None] | None = None,
 ) -> list[Difference]:
     """Compare two tier/cell directories. mode is "objective" or "exact"; see
     "Parity is the decided objective" for which kinds fail in each. fixed_set
-    names the cases where "unproven" fails. Raises ManifestMismatch on a required
+    names the cases where "unproven" fails. price, from Stage 4 on, prices an
+    unpriced solve's decisions on both sides; None leaves it compared exactly. Raises ManifestMismatch on a required
     key not in allow_env. ignore names kinds, plus "menu_index",
     "decision_relayouts" and "solver_names" (family, solver, allocator)."""
 
@@ -723,8 +756,8 @@ class CostRow:
     change: float | None
 
 def cost_report(base: str | Path, change: str | Path) -> list[CostRow]:
-    """Per-case cost, objective_ns where priced, else the first ladder stage's
-    objective, which is HBM traffic. Not exact; a report for non-parity stages."""
+    """Per-case cost: objective_ns where priced, else None. A report beside a
+    tie or an improvement, and for stages that move plans on purpose."""
 
 def timing_report(base: str | Path, change: str | Path) -> str:
     """Per pass and stage inclusive time, from alternating runs. Never a gate."""
@@ -997,8 +1030,10 @@ under `--noconftest` with no card.
 | `test_golden_intree` | `intree` matches `lx_equivalence_golden.json`; decisions are compared on x86_64 only, protos everywhere |
 | `test_diff_detects[kind]` | in exact mode, each `Difference.kind` fires on a record mutated in that one field, and only that kind; the test that shows `diff` can fail |
 | `test_objective_mode_reports_a_tie` | the same objectives with different decisions give one `tie` with `fails=False`, and its commit difference does not fail either |
-| `test_objective_mode_fails_on_objective` | one stage objective, or `objective_ns` beyond 1e-9 relative, changed gives a failing `objective` or `objective_ns` |
-| `test_objective_mode_unproven` | a `FEASIBLE` stage gives `unproven`, failing only for a case in `fixed_set` |
+| `test_objective_mode_fails_on_objective_ns` | on a priced solve, `objective_ns` changed beyond 1e-9 relative fails; a changed ladder stage objective alone only reports |
+| `test_objective_mode_unproven` | a priced `FEASIBLE` solve gives `unproven`, failing only for a case in `fixed_set` |
+| `test_objective_mode_unpriced_is_exact` | with no cost expression and no `price`, one changed decision fails as `unpriced` |
+| `test_price_gates_no_worse` | with a stand-in `price`, a cheaper change gives `improved` (report), a dearer one `regressed` (fail) |
 | `test_commit_fails_after_equal_decisions` | equal decisions with a changed `CommitRecord` fail in objective mode |
 | `test_tie_on_unique_is_suspect` | a tie where one side recorded `"unique"` has `suspect=True` |
 | `test_uniqueness_probe[case]` | on in-tree graphs chosen as one of each: `probe_uniqueness` gives `"unique"`, `"tied"` and, at dtime 0, `"unproven"`; it agrees with `_is_unique_solution` wherever that returns True |
@@ -1067,7 +1102,7 @@ met as follows, with "device-free" narrowed by Deviations 2.
 | G0 probe | P1 recorded | all models | every model reached, or in `CARD_ONLY` with a reason |
 | G1 stability | the Stage 0 tree recorded at `PYTHONHASHSEED=0` against the same tree at `1`, in fresh processes, `--allow-env PYTHONHASHSEED` | all tiers except `zoo` and `real` | `diff --mode exact` empty |
 | G2 no production change | the Stage 0 branch against its merge-base | all tiers | `diff --mode exact` empty, and `git diff --stat` shows no path under `torch_spyre/` |
-| G3 sensitivity | `test_diff_detects[*]`, `test_objective_mode_*`, `test_guard_fires[*]`, and one real mutation: a throwaway commit changing one coefficient in `spill_cost`, run through `lx_gate.sh` | `intree`, `fake` subset | gate fails in objective mode, reporting `objective` |
+| G3 sensitivity | `test_diff_detects[*]`, `test_objective_mode_*`, `test_guard_fires[*]`, and one real mutation: a throwaway commit changing one coefficient in `spill_cost`, run through `lx_gate.sh` | `intree`, `fake` subset | gate fails in objective mode: `unpriced` on `intree`, which has no cost expression, and `objective_ns` on a priced `fake` case through a second throwaway commit that scales one term of the cost expression the allocator builds after `allocator.py:3299`, since the cost path never reads `spill_cost` |
 | G4 guards | `check_guards` | `intree` (hard), fixed set (hard), the rest (report) | no `fallback`, no `solve_error`, no `limit` on the fixed set |
 | G5 coverage | `corpus_coverage` | all tiers | `restickify_op`, `beam_restickify`, `fixup_copy` and `restickify_reads_resident_source` each have a case; `relayout_before_restickify` is report-only; any other feature has a case, or the PR says why not |
 | G6 suites | plain pytest on the unit suites from the parent plan's Verification, plus the new tests; `pre-commit run --files <changed>`; `make check-all-configs` | | pass |
@@ -1133,9 +1168,14 @@ time is unmeasured.
   harder half. Recording time is measured per tier with the probe on at calibration. If it
   is too slow, the probe runs on the fixed set only, and `uniqueness` stays `None`
   elsewhere.
-- **An objective is a proxy.** Two plans that tie on every ladder stage can still differ
-  in predicted runtime, because the ladder does not price everything. Objective mode
-  accepts them. `cost_report` on each `tie` is how a reviewer sees it.
+- **Much of the corpus is unpriced until Stage 4.** Every CP-SAT tiling cell and all of
+  `intree` have no cost expression at this base, so objective mode compares them exactly,
+  and a tie there fails. That is the price of not trusting the ladder. It ends where
+  Stage 4's cost model prices them, which for tiling means pricing tile size and cut
+  count and not raising on output-tiled arguments (#3810).
+- **The cost expression is a proxy.** Two plans at an equal cost can still differ in
+  predicted runtime. Objective mode accepts them. `cost_report` on each `tie` is how a
+  reviewer sees it.
 - **Exhaustive matrix cells run away.** `ExhaustiveSearchSolver` is a DFS, and whether the
   eight models finish is unknown, because the old `same_plans` results were not kept. The
   1200 s timeout bounds a case, and a timeout is recorded the same way on both sides, so a
@@ -1195,10 +1235,14 @@ time is unmeasured.
 7. **Parity is the optimum, not the bytes.** The parent plan's Stages section says the CP
    model "stays byte-identical and the committed plans stay identical" through Phase 1
    and wherever Phase 2's rules agree. The owner set the criterion in review of this PR
-   (2026-11-12): the solver must reach an optimal objective minimum, and uniqueness is a
-   diagnostic. **Resolution:** objective mode is the gate. Exact mode stays for Stage 0's
-   G1 and G2, and for a stage that claims an unchanged proto. The parent plan and the
-   Stage 1-13 plans still say byte-identical, and are updated to this rule separately.
+   (2026-11-12): the solver must reach an optimal objective minimum, that objective is
+   the cost expression, not the lexicographic ladder, and uniqueness is a diagnostic.
+   **Resolution:** objective mode is the gate, on `objective_ns`. Solves the cost
+   expression does not price yet are compared exactly, and from Stage 4 they are priced
+   through `diff(price=...)`. Exact mode stays for Stage 0's G1 and G2, and for a stage
+   that claims an unchanged proto. The parent plan and the Stage 1-13 plans still say
+   byte-identical, and Stage 4's plan still ports the ladder as `CostModel.ladder`. They
+   are updated to this rule separately.
 
 ## Open questions
 
