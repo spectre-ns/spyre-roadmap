@@ -8,7 +8,11 @@ Depends on: none. Needed by: Stages 1-13.
 When this PR merges, torch-spyre has one equivalence harness that records every LX
 solve and every committed plan under a deterministic solve, diffs two recordings, and
 runs the regression guards from torch-spyre#5682 on a fixed graph set. Later stages call
-it instead of building their own check. Compiles reach the planner on a fake device
+it instead of building their own check. Parity for an optimizing solve means the decided
+objective: both sides reach `OPTIMAL` at the same objective. A different plan at that
+objective is a tie, not a failure. Protos, decisions and commits are compared too, as
+diagnostics, and a uniqueness probe records whether each optimum is the only plan at its
+cost. Compiles reach the planner on a fake device
 wherever probe P1 shows they can, so those gates need no card, and the card calibrates
 that device at Stages 0, 9 and 12. The in-tree graphs, the status and size guards and one
 forced failure run in CI on every PR.
@@ -38,8 +42,16 @@ run the ladder.
 
 The ladder mutates one model. Each stage adds a lock whose right-hand side is the
 previous stage's solved objective (`ilp_solver_ortools.py:1471`, `:1498`, `:1509`,
-`:1521`). So the proto of stage n depends on the solver's answer at stage n-1, and an
-identical proto at stage 2 needs an identical solve at stage 1.
+`:1521`). So the proto of stage n depends on the objective found at stage n-1, not on
+which plan reached it. Two sides that tie at stage 1 still build the same stage 2.
+
+**Uniqueness.** `_is_unique_solution` (`ilp_solver_ortools.py:794`) clones the model, adds
+a clause that at least one decision variable (residency, merges, served relayouts,
+division; not placement) differs from the solution, and solves again with the same
+parameters and no wall clock. `INFEASIBLE` means unique. `OPTIMAL` at a worse rounded
+objective also means unique. Anything else means a tie or not proven. Production runs it
+only on the cost path (`:879`), only with `enable_uniqueness_check` (`config.py:470`, off),
+and only logs a warning.
 
 `SolveError` is raised at two sites: `:872` (cost path) and `:1436` (ladder). Both format
 `solver.WallTime()`, which raises `RuntimeError` if `Solve` never ran. A harness that
@@ -158,9 +170,10 @@ as absolute checks: status, size, fallback. Base-versus-change diffs run through
 `tools/lx_planning/lx_gate.sh` because CI has no base recording. Pickles are never
 committed: they are large (7-28 MB per set), tied to one base, and regenerable.
 
-**Golden.** `lx_equivalence_golden.json` holds the `intree` digests per case: proto shas,
-status, objective and a decisions sha. A PR that changes the model runs `bless`, and the
-change shows in its diff. Compile tiers have no golden: names move with every pass change.
+**Golden.** `lx_equivalence_golden.json` holds the `intree` digests per case: status and
+objective per stage, which gate, and proto shas, a decisions sha and `uniqueness`, which
+`check-golden` reports and fails on only under `--mode exact`. A PR that moves an optimum
+runs `bless`, and the change shows in its diff. Compile tiers have no golden: names move with every pass change.
 `bless --tier fake` exists for the golden that replaces `intree` when `CpSatLayoutSolver`
 goes.
 
@@ -230,6 +243,7 @@ All hooks are process-local monkeypatches installed by `install()` and restored 
 | target | wrapper |
 |---|---|
 | `CpSatLayoutSolver._solve_and_record` (`ilp_solver_ortools.py:1325`) | On the first stage of a solve, read the production parameters into the record. Apply `SolveParams`, or dtime 0 if a `ForcedFailure` matches. Take `str(model.proto)` before the solve. Call the original. Record the stage. |
+| `CpSatLayoutSolver._extract` (`ilp_solver_ortools.py:1811`, called once at `:1525` on both paths) | Before the original, unless `probe_uniqueness=False`: `probe_uniqueness(last_model, solver, tensors)` on the model the last stage solved, recorded as `uniqueness`. Skipped when the last stage is not `OPTIMAL` |
 | `plan_layout` and `plan_layout_and_core_divisions`, for each class in `MemoryPlanSolver.__subclasses__()` (recursively) that defines them in `vars(cls)` | Outermost call only, tracked with a depth counter, because `ExhaustiveSearchSolver` calls an inner solver once per leaf. Run `on_solve_begin`; open a solve; write a capture if asked; call the original; close the solve with decisions read from the returned buffers. An exception closes the solve with `error` set and is re-raised unchanged. |
 | `ScratchpadAllocator._solve` (`allocator.py:1090`), `CoOptimizingAllocator._solve` (`:3218`) | Remember the allocator and graph, so `on_solve_begin` can pass them. Both are `None` on a solver-only run. |
 | `ScratchpadAllocator._push_allocation` (`allocator.py:2036`) | Before: observers, op names, `self._get_spill_reasons(graph, buffers)`. Call the original. After: `graph_snapshot(graph)`, build the `CommitRecord`, observers. |
@@ -262,15 +276,18 @@ A snapshot that fails in plugin mode (`test_coarse_tiling` calls `_push_allocati
 directly on stand-in graphs, `tests/inductor/test_coarse_tiling.py:9813`) records
 `snapshot_error` and the test continues. In compile mode `snapshot_error` fails the case.
 
-### What "byte-identical" takes
+### Determinism
 
-"Byte-identical" means `str(model.proto)` compares equal. That text is the only stable
-form OR-Tools 9.15 offers, and it is cheap.
+Determinism makes a recording repeatable: the same tree gives the same record, so G1 and
+G2 can demand an exact match and a later difference has a cause. It is not the parity
+criterion for later stages (see "Parity is the decided objective"). "Byte-identical" means
+`str(model.proto)` compares equal. That text is the only stable form OR-Tools 9.15 offers,
+and it is cheap.
 
 | source of nondeterminism | status | handling |
 |---|---|---|
 | Worker races, wall clock | real | `num_search_workers=1`, `max_time_in_seconds=inf`, `max_deterministic_time=30`, `random_seed=0`, set just before every `Solve` |
-| Ladder locks depend on the previous answer | real, by design | Determinism above makes it reproducible. `diff` reports only the first differing stage of a solve as the cause and marks later ones as downstream |
+| Ladder locks depend on the previous objective | real, by design | Determinism above makes it reproducible. A tie does not propagate, because a lock holds the objective, not the plan. `diff` reports only the first differing stage of a solve as the cause and marks later ones as downstream |
 | A budget that is too small | real, and worst | At dtime 10, three captures reach `UNKNOWN` at a later ladder stage. A compile would then record greedy plans on both sides and report parity on nothing. Default is 30, and `check_guards` flags any solve error outside the `failure` tier |
 | `PYTHONHASHSEED`, Python sets | not observed in the solver or printer; not tested through the allocator | Every run pins `PYTHONHASHSEED=0`. The gate records one second time at `PYTHONHASHSEED=1` (G1). Any difference is a production bug to report, not something to hide |
 | Sympy ordering | not observed. `Add`/`Mul` args sort deterministically, and the printer's one `free_symbols` iteration feeds a check that needs exactly one owner (`cpsat_expr_printer.py:872-879`) | Covered by the hash-seed runs |
@@ -295,6 +312,60 @@ Calibration measures this on the current zoo, and `DEFAULT_DTIME` moves if a gua
 says nothing about which plan a many-worker production portfolio picks on a given run. So
 `production_params` is recorded before the override and compared, or the harness would hide
 a change to production's own settings.
+
+### Parity is the decided objective
+
+What a later stage must preserve is the optimum, not the plan that reaches it. A
+re-encoded model (Stage 5 on) can order variables differently. One worker then searches
+in a different order and can return a different plan at the same cost. The harness
+already saw this: `interleave_search=True` gave a different plan at equal objective on
+`mlp_swiglu_128`. So `diff` has two modes.
+
+- **`mode="objective"`**, the default and the later-stage gate. For each CP-SAT solve,
+  every stage on both sides must be `OPTIMAL`, with the same stage count and an equal
+  objective at each stage. The ladder is lexicographic, so the vector of stage optima is
+  the objective. Where the solve is priced, `objective_ns` must also agree to a relative
+  1e-9. It is the decided objective: `_evaluate(expr, solved_bindings(buffers))` evaluated
+  on the plan that came back, not the solver's own report. A stage that stopped at the
+  budget proves no minimum, so it gives `unproven`. That is a failure on the fixed set and
+  a report elsewhere, like the `limit` guard. Different decisions at an equal proven
+  objective give `tie`, which is a report only. `proto` differences are reports too.
+- **`mode="exact"`** compares every field. G1 and G2 use it at Stage 0, where any
+  difference is a harness bug or nondeterminism, and so does any stage that claims an
+  unchanged proto.
+
+| kind | objective mode | exact mode |
+|---|---|---|
+| `missing`, `stage_count`, `status`, `error`, `production_params` | fails | fails |
+| `objective`, `objective_ns`, `cost_expr` | fails | fails |
+| `unproven` (a stage below `OPTIMAL` on either side) | fails on the fixed set, else reports | not used: `status` covers it |
+| `tie` (decisions differ at an equal proven objective) | reports | fails as `decisions` |
+| `proto`, `decisions` with an unequal objective | reports, beside the `objective` failure | fails |
+| `commit`, `snapshot`, `predicted_total` after equal decisions | fails | fails |
+| `commit`, `snapshot`, `predicted_total` after a `tie` | reports, with `cost_report` | fails |
+
+Commit and pipeline output are a function of the decisions. So with equal decisions, a
+commit difference is a real change to commit code, and it fails. After a tie it is
+expected, and `cost_report` shows whether the tied plan changed predicted runtime.
+
+Families with no optimality proof (`sa_legacy`, `anneal`, `greedy`, `firstfit`,
+`bestfit`, `exhaustive`, and `sa` from Stage 8) have no minimum to compare. They are
+seeded and repeatable, so objective mode compares them exactly, `score_ns` and decisions.
+See Open questions.
+
+**Uniqueness is a diagnostic.** After the last stage of each CP-SAT solve, the harness
+runs the probe from `_is_unique_solution` itself, from the `_extract` hook. On the ladder
+that is the final model, with every lock in place. `lx_equivalence.probe_uniqueness` is
+the same clone-and-differ model over `decision_variables()`, kept in the harness because
+the production method returns a bool that folds a tie and a stopped probe together. Like
+production, the probe copies the solver's parameters, so it inherits one worker and dtime 30, and a probe that stops there
+is `unproven`. Its `Solve` does not go through `_solve_and_record`, so it is never
+recorded as a stage. The result is `SolveRecord.uniqueness`: `"unique"`, `"tied"` or
+`"unproven"`. It never gates. It tells a reader how much a pass means. An equal objective
+on a `unique` case also pins the plan, so a `tie` there means the feasible set changed:
+`diff` marks such a tie `suspect`. `corpus_coverage` counts unique cases per tier.
+`install(probe_uniqueness=False)` skips the probe for timing runs, which install no hooks
+anyway, and for local loops.
 
 ### Interleaved search stays off
 
@@ -463,6 +534,8 @@ class SolveRecord:
     bindings: dict[str, float]    # solved_bindings, by symbol name
     sizes: SolveSizes
     decisions: dict[str, BufferDecision]
+    uniqueness: str | None        # "unique" | "tied" | "unproven"; None when not
+                                  # probed (no proto, last stage not OPTIMAL, or off)
     error: str | None             # type and normalized message
 
 @dataclass
@@ -588,6 +661,7 @@ def install(
     out: str | Path, *, tier: str, cell: str, params: SolveParams = SolveParams(),
     force_failure: ForcedFailure | None = None, capture_dir: str | Path | None = None,
     allow_snapshot_errors: bool = False, optional: Collection[str] = OPTIONAL_TARGETS,
+    probe_uniqueness: bool = True,
 ) -> Recorder:
     """Patch the targets. A missing target raises AttributeError unless it is in
     optional, so a stage that removes one moves the hook in the same PR."""
@@ -603,18 +677,31 @@ class Difference:
     index: int
     kind: str      # "missing" "stage_count" "proto" "status" "objective"
                    # "objective_used" "cost_expr" "objective_ns" "production_params"
-                   # "decisions" "error" "commit" "snapshot" "predicted_total"
+                   # "decisions" "tie" "unproven" "error" "commit" "snapshot"
+                   # "predicted_total"
     detail: str
     first_cause: bool = True    # False for a difference downstream of an earlier stage
     rule: str | None = None     # from provenance when either side has it
+    fails: bool = True          # False for a report-only kind in this mode
+    suspect: bool = False       # a tie where either side's uniqueness is "unique"
 
 def diff(
-    base: str | Path, change: str | Path, *, ignore: Collection[str] = (),
-    allow_env: Collection[str] = (),
+    base: str | Path, change: str | Path, *, mode: str = "objective",
+    ignore: Collection[str] = (), allow_env: Collection[str] = (),
+    fixed_set: Collection[str] = (),
 ) -> list[Difference]:
-    """Compare two tier/cell directories exactly. Raises ManifestMismatch on a
-    required key not in allow_env. ignore names kinds, plus "menu_index",
+    """Compare two tier/cell directories. mode is "objective" or "exact"; see
+    "Parity is the decided objective" for which kinds fail in each. fixed_set
+    names the cases where "unproven" fails. Raises ManifestMismatch on a required
+    key not in allow_env. ignore names kinds, plus "menu_index",
     "decision_relayouts" and "solver_names" (family, solver, allocator)."""
+
+def probe_uniqueness(
+    model: "cp_model.CpModel", solver: "cp_model.CpSolver",
+    tensors: Mapping[str, object],
+) -> str:
+    """"unique", "tied" or "unproven", by the probe's status: the logic of
+    CpSatLayoutSolver._is_unique_solution, with the two False cases kept apart."""
 
 class ManifestMismatch(Exception):
     """Two recordings differ in identity or environment, so a diff means nothing."""
@@ -719,8 +806,8 @@ FAKE_DIVERGES: Mapping[str, str]   # model -> why its fake snapshot differs from
 ```text
 python3 tests/inductor/lx_corpus.py record  --tier T --out DIR [--cells ...] [--models ...]
                                             [--device D] [--observer M:F ...] [--timing-only]
-python3 tests/inductor/lx_corpus.py diff    BASE CHANGE [--ignore KIND ...] [--allow-env K ...]
-                                            [--report F]
+python3 tests/inductor/lx_corpus.py diff    BASE CHANGE [--mode objective|exact]
+                                            [--ignore KIND ...] [--allow-env K ...] [--report F]
 python3 tests/inductor/lx_corpus.py guards  DIR --tier T
 python3 tests/inductor/lx_corpus.py timing  BASE_TREE CHANGE_TREE [--rounds N] [--tier T]
 python3 tests/inductor/lx_corpus.py check-golden [--tier T]
@@ -745,7 +832,7 @@ Each guard in the issue maps to one piece of this harness.
 | guard in the issue | here |
 |---|---|
 | Fixed graph set | `FIXED_GRAPHS`, at both levels, and the `real` tier for the real model |
-| Plan-equivalence check | `diff` over `intree`, `unit-*`, `fake`, `matrix`. Stronger than the issue asks: proto and commit, not only split, residency, address and objective |
+| Plan-equivalence check | `diff` over `intree`, `unit-*`, `fake`, `matrix`. The proven optimum gates; split, residency, address, proto and commit are compared and reported, and fail when the decisions match but the commit does not |
 | Solve-status check | `check_guards`: `fallback` and `solve_error` on any tier but `failure`; `limit` on any status other than `OPTIMAL`, a failure on the fixed set and a report elsewhere. A budget stop elsewhere still shows up as a `status` difference when it changes |
 | Solver-size counters | `check_guards` `size`, per buffer, as `test_frontend_work_bounds.py` bounds per op |
 | Compile-time report | `timing_report` over `TORCH_SPYRE_TIMING=1` records. Never a gate |
@@ -853,6 +940,7 @@ lands.
 | `snapshot_commit` | see Harness API | 10 | final |
 | `add_observer`, `Observer` | see Harness API | 2, 4, 5, 8 | final |
 | `diff`, `Difference`, `ManifestMismatch` | see Harness API | 1-13, through `lx_gate.sh` | final |
+| `probe_uniqueness`, `SolveRecord.uniqueness` | see Harness API | 1-13, in `report.md` | final; a diagnostic, never a gate |
 | `check_guards`, `GuardViolation` | see Harness API | 2, 12; 1-13 through `lx_gate.sh` | final |
 | `cost_report`, `CostRow` | see Harness API | none yet; for a stage that changes plans on purpose | final |
 | `timing_report`, `timing` CLI | see Harness API | 5, 8, 12 | final |
@@ -907,7 +995,14 @@ under `--noconftest` with no card.
 | `test_second_solve_in_process_is_identical` | two recordings of `intree` in one process, `diff` empty |
 | `test_hash_seed_does_not_change_recording` | subprocess `record --tier intree` at `PYTHONHASHSEED=0` and `1`, `diff` empty |
 | `test_golden_intree` | `intree` matches `lx_equivalence_golden.json`; decisions are compared on x86_64 only, protos everywhere |
-| `test_diff_detects[kind]` | each `Difference.kind` fires on a record mutated in that one field, and only that kind; the test that shows `diff` can fail |
+| `test_diff_detects[kind]` | in exact mode, each `Difference.kind` fires on a record mutated in that one field, and only that kind; the test that shows `diff` can fail |
+| `test_objective_mode_reports_a_tie` | the same objectives with different decisions give one `tie` with `fails=False`, and its commit difference does not fail either |
+| `test_objective_mode_fails_on_objective` | one stage objective, or `objective_ns` beyond 1e-9 relative, changed gives a failing `objective` or `objective_ns` |
+| `test_objective_mode_unproven` | a `FEASIBLE` stage gives `unproven`, failing only for a case in `fixed_set` |
+| `test_commit_fails_after_equal_decisions` | equal decisions with a changed `CommitRecord` fail in objective mode |
+| `test_tie_on_unique_is_suspect` | a tie where one side recorded `"unique"` has `suspect=True` |
+| `test_uniqueness_probe[case]` | on in-tree graphs chosen as one of each: `probe_uniqueness` gives `"unique"`, `"tied"` and, at dtime 0, `"unproven"`; it agrees with `_is_unique_solution` wherever that returns True |
+| `test_uniqueness_probe_is_not_a_stage` | with the probe on, the stage count and protos equal a run with it off |
 | `test_diff_marks_downstream_stages` | a change at stage 0 gives one `first_cause=True` and later stages `False` |
 | `test_diff_ignores_time_fields` | changing `wall_s`, `timing_path` and `after N.NNs` gives no difference |
 | `test_diff_refuses_other_environment[key]` | each required manifest key raises `ManifestMismatch`, unless in `allow_env` |
@@ -970,9 +1065,9 @@ met as follows, with "device-free" narrowed by Deviations 2.
 | gate | compared | corpus | pass |
 |---|---|---|---|
 | G0 probe | P1 recorded | all models | every model reached, or in `CARD_ONLY` with a reason |
-| G1 stability | the Stage 0 tree recorded at `PYTHONHASHSEED=0` against the same tree at `1`, in fresh processes, `--allow-env PYTHONHASHSEED` | all tiers except `zoo` and `real` | `diff` empty |
-| G2 no production change | the Stage 0 branch against its merge-base | all tiers | `diff` empty, and `git diff --stat` shows no path under `torch_spyre/` |
-| G3 sensitivity | `test_diff_detects[*]`, `test_guard_fires[*]`, and one real mutation: a throwaway commit changing one coefficient in `spill_cost`, run through `lx_gate.sh` | `intree`, `fake` subset | gate fails, reporting `proto` |
+| G1 stability | the Stage 0 tree recorded at `PYTHONHASHSEED=0` against the same tree at `1`, in fresh processes, `--allow-env PYTHONHASHSEED` | all tiers except `zoo` and `real` | `diff --mode exact` empty |
+| G2 no production change | the Stage 0 branch against its merge-base | all tiers | `diff --mode exact` empty, and `git diff --stat` shows no path under `torch_spyre/` |
+| G3 sensitivity | `test_diff_detects[*]`, `test_objective_mode_*`, `test_guard_fires[*]`, and one real mutation: a throwaway commit changing one coefficient in `spill_cost`, run through `lx_gate.sh` | `intree`, `fake` subset | gate fails in objective mode, reporting `objective` |
 | G4 guards | `check_guards` | `intree` (hard), fixed set (hard), the rest (report) | no `fallback`, no `solve_error`, no `limit` on the fixed set |
 | G5 coverage | `corpus_coverage` | all tiers | `restickify_op`, `beam_restickify`, `fixup_copy` and `restickify_reads_resident_source` each have a case; `relayout_before_restickify` is report-only; any other feature has a case, or the PR says why not |
 | G6 suites | plain pytest on the unit suites from the parent plan's Verification, plus the new tests; `pre-commit run --files <changed>`; `make check-all-configs` | | pass |
@@ -999,8 +1094,11 @@ row for that stage.
 | 12 | its own lanes | calibrates on the card |
 | 13 | fixed set per commit, all at the PR tip | |
 
-A non-empty `diff` fails. Stages allowed to differ list each `Difference` by rule in the PR
-and pass the accepted kinds through `--ignore` or a reviewed report. After a rebase, the
+`lx_gate.sh` runs `diff` in objective mode. A `Difference` with `fails=True` fails the
+gate. Report-only kinds (`tie`, `proto`, and commits after a tie) go in `report.md` with
+each case's `uniqueness`, and a `suspect` tie is listed first. Stages allowed to move an
+optimum list each failing `Difference` by rule in the PR and pass the accepted kinds
+through `--ignore` or a reviewed report. After a rebase, the
 recording is redone only at the last rebase before merge.
 
 **What this gate does not show.** It shows an unchanged compiler is measured as unchanged,
@@ -1027,8 +1125,17 @@ time is unmeasured.
   restickify. A hard feature with no case stops the PR at G5 until a graph is found.
 - **The allocator depends on hash order.** The solver-level result says nothing about it.
   Caught by G1 and `test_compile_twice_is_identical`.
-- **Golden churn.** A PR changing the model, or an OR-Tools bump that moves a tied
-  optimum, has to run `bless`. Decisions are compared on x86_64 only, where CI runs.
+- **Golden churn.** A PR that moves an optimum has to run `bless`. An OR-Tools bump that
+  only picks another tied plan no longer does, since objectives gate and decisions report.
+  Decisions are compared on x86_64 only, where CI runs.
+- **The uniqueness probe costs a second solve.** It has no wall clock and inherits dtime
+  30, so a hard case can double its recording time, and proving `INFEASIBLE` can be the
+  harder half. Recording time is measured per tier with the probe on at calibration. If it
+  is too slow, the probe runs on the fixed set only, and `uniqueness` stays `None`
+  elsewhere.
+- **An objective is a proxy.** Two plans that tie on every ladder stage can still differ
+  in predicted runtime, because the ladder does not price everything. Objective mode
+  accepts them. `cost_report` on each `tie` is how a reviewer sees it.
 - **Exhaustive matrix cells run away.** `ExhaustiveSearchSolver` is a DFS, and whether the
   eight models finish is unknown, because the old `same_plans` results were not kept. The
   1200 s timeout bounds a case, and a timeout is recorded the same way on both sides, so a
@@ -1085,9 +1192,23 @@ time is unmeasured.
    Stage 13 want a diff per commit. **Resolution:** the tier table in Parity and gates, and
    one re-recording at the last rebase before merge.
 
+7. **Parity is the optimum, not the bytes.** The parent plan's Stages section says the CP
+   model "stays byte-identical and the committed plans stay identical" through Phase 1
+   and wherever Phase 2's rules agree. The owner set the criterion in review of this PR
+   (2026-11-12): the solver must reach an optimal objective minimum, and uniqueness is a
+   diagnostic. **Resolution:** objective mode is the gate. Exact mode stays for Stage 0's
+   G1 and G2, and for a stage that claims an unchanged proto. The parent plan and the
+   Stage 1-13 plans still say byte-identical, and are updated to this rule separately.
+
 ## Open questions
 
-None.
+1. **Families with no optimality proof.** SA, greedy, first-fit, best-fit and exhaustive
+   search prove no minimum, so objective parity does not apply to them. The plan compares
+   them exactly (`score_ns` and decisions), since they are seeded and repeatable. The
+   alternative is to gate on `score_ns` alone, which lets Stage 8 change how SA draws
+   from its RNG. Exact is the recommendation, unless Stage 8 needs that freedom.
+2. **Whether a `tie` on a `unique` case fails.** The plan marks it `suspect` and reports it.
+   Failing it is stricter, but a stopped probe on the other side makes it noisy.
 
 ## Out of scope
 
