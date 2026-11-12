@@ -1,7 +1,7 @@
 # LX allocator, Stage 4: Cost model
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2, with Stage 3's Phase 1 exit closed.
+Depends on: Stages 1, 2, with Stage 3's Phase 1 exit closed.
 Needed by: Stages 5, 6, 7, 8, 9, 10, 11, 12, 13.
 
 ## Goal
@@ -11,9 +11,12 @@ When this PR merges, `SpyreCostModel`, `Sym` and the objective types exist,
 printer can lower them by name. The cost model
 produces, from the graph plus the encoder's domains, the same sympy expression
 `CoOptimizingAllocator._solve` builds today, and the same terms as each stage of
-`CpSatLayoutSolver._run`'s lexicographic ladder. A shadow check proves that solve for
-solve. Nothing in production reads `graph.target.cost_model` yet: the planner, every CP
-model, every SA score and every committed plan stay as they were.
+`CpSatLayoutSolver._run`'s lexicographic ladder, which runs only on the fallback,
+placement-only and buffer-level paths. A shadow check in this PR's own tests proves the
+first on the same graph, solve for solve: the expressions are equal, and both evaluate to
+the same `objective_ns` at the `OPTIMAL` plan today's solve returns. Nothing in production
+reads `graph.target.cost_model` yet: the planner, every CP model, every SA score and every
+committed plan stay as they were.
 
 ## Today
 
@@ -556,7 +559,9 @@ the code in that row is called as it stands.
 
 ### Printer changes
 
-Each keeps the proto byte-identical on the legacy path.
+Each is a refactor that leaves the legacy path's proto unchanged. The printer tests
+below compare protos directly, as this stage's own unit tests; plans are judged by the
+optimum (G1).
 
 1. **Prefixes come from `Sym`.** `_is_split_sym`, `_evaluate_candidates`,
    `_inv_log_sym` and `_print_Symbol` use the constants, and `_is_split_sym` calls
@@ -685,10 +690,10 @@ items below matter.
    charges as a plain list of `(is_lx getter, selector getters, dict)`. The numbers above
    give the reason. Nothing changes here, since SA gets no offers.
 7. **A size guard.** `objective_size(expr) -> ObjectiveSize(terms, tree, dag)`, in
-   `lx_allocator/cost.py`. This stage extends Stage 0's gate report with the three
-   counters, read from the shadow plug-in's output, so the record format is unchanged. A
-   test fails if the rewritten tree exceeds 2.5x the raw tree (measured maximum 1.71x),
-   which is what the 39,948-term shape would trip.
+   `lx_allocator/cost.py`. The shadow computes the three counters per solve and
+   `test_lx_cost_shadow.py` prints them per compile; nothing stores them. A test fails if
+   the rewritten tree exceeds 2.5x the raw tree (measured maximum 1.71x), which is what
+   the 39,948-term shape would trip.
 
 Not in this stage: a memoizing `_rewrite`. The tree-to-dag ratio is 5x on
 granite_micro.3, and rewrite is 91% of its lowering, so it looks like the largest
@@ -728,11 +733,12 @@ tuple tables, same objective 64/64.
 | `tests/inductor/test_lx_cost_model.py` | new |
 | `tests/inductor/test_lx_cost_printer.py` | new |
 | `tests/inductor/test_lx_cost_parity.py` | new |
-| `tests/inductor/lx_objective_shadow.py` | new: the shadow check as a Stage 0 `Observer` |
+| `tests/inductor/lx_objective_shadow.py` | new: the shadow check, a context manager that wraps `CoOptimizingAllocator._solve` and `ScratchpadAllocator._solve` with `mock.patch.object` and runs G1 to G3 per solve |
+| `tests/inductor/test_lx_cost_shadow.py` | new: runs named `TestBuildingBlocks` compiles under the shadow, on the card |
 | `tests/configs/torch_spyre_tests/inductor/test_lx_cost_*_config.yaml` | new shard configs, one per test file; `make check-all-configs` |
 | `docs/source/compiler/cost_model.md` | a short section on `SpyreCostModel`, the target that holds it, and `Sym` |
 
-Commits, each green with `intree` and the fixed set unchanged:
+Commits, each green with the device-free tests and the existing suites under Tests:
 
 1. `Sym` and its tests; `plan_solver` symbol properties delegate.
 2. `SplitKeyedCharge`, `NodeDomain`, `RelayoutOffer`, `CostDomains`,
@@ -746,7 +752,8 @@ Commits, each green with `intree` and the fixed set unchanged:
    with replay parity on the fixtures.
 7. `SpyreCostModel.bundle_terms`, `objective`, `priced_objective`, with stubbed-op tests;
    the `CostModel` protocol, `COST_MODELS`, and `select_target` attaching it.
-8. Shadow plug-in, corpus parity test, `objective_size` guard.
+8. Shadow helper, `test_lx_cost_parity.py`, `test_lx_cost_shadow.py`, `objective_size`
+   guard.
 9. Bulk `Add` in the allocator, on its own so it can be reverted alone.
 10. Docs.
 
@@ -767,12 +774,13 @@ Consumes:
 | `OpNode.size` | `int`, equal to `mem_usage[name]["size"]`, -1 kept | 1, filled by 2 | `spill_cost`, `cut_traffic` |
 | `OpNode.read_count`, `.first_use_is_read` | properties over `OpNode.uses` and `runs`, equal to `LifetimeBoundBuffer.read_count` and `.first_use_is_read` | 1, filled by 2 | `spill_cost`, `cut_traffic` |
 | `OpNode.runs`, `OpNode.graph_output` | `bool` | 1 | the boundary, computed in `cost.py` |
-| `Observer.on_solve_begin` | `(allocator, solver, ir, buffers, cost_expr)`, at every solve of either allocator; `allocator` and `ir` are `None` on a solver-only run | 0 | G1, `traffic_sizes` test |
-| `Observer.on_solve_end` | `(solver, buffers, cost_expr, record)` | 0 | G3 |
-| `record_compile` | `(name, cell, out, *, device="fake", observers=(), force_failure=None) -> Path` | 0 | the shadow on `fake` compiles |
-| `load_solves`, `replay_intree`, `replay_capture` | `(path) -> dict[str, SolveRecord]`; `(case, *, arm)`; `(path, *, case)` | 0 | G2 |
-| `SolveRecord` stages | one `StageRecord` per `_solve_and_record`; text at `protos/<sha256>.txt.gz` by `proto_sha` | 0 | G2 |
-| corpus tiers | `intree`, `fake`, `unit-*`, `failure`, fixed set | 0 | gates |
+| `CoOptimizingAllocator._solve`, `ScratchpadAllocator._solve` | `(solver, graph: GraphLowering) -> Sequence`, `allocator.py:3218`, `:1090` | existing | the shadow wraps them to reach the solver, its buffers and the `GraphLowering`; the device-free test calls the first directly |
+| `plan_layout_and_core_divisions`, `plan_layout` | `(cost_expr=None)`, `ilp_solver_ortools.py:699`, `sa_cooptimizer.py:778`; `plan_layout` `ilp_solver_ortools.py:687` | existing | the shadow reads `cost_expr` and the returned buffers |
+| `_solve_and_record`, `last_solve_stats` | `ilp_solver_ortools.py:1325-1355`; `status`, `objective_used` | existing | G1 status and priced path, G2 stage objectives |
+| `_minimize_cost_expr` | `(model, solver, tensors, cost_expr)`, `ilp_solver_ortools.py:830` | existing | strict sweep |
+| `solved_bindings`, `_evaluate` | `(buffers) -> dict`, `(expr, bindings) -> float \| None`, `plan_solver.py:542`, `:567` | existing | `objective_ns` in G1 |
+| `load_captures`, `synthetic_graphs` | `cooptimization_capture_loader.py:100`, `synthetic_cooptimization_graphs.py:269` | existing | G2 on buffer-level graphs |
+| `TestBuildingBlocks` | `test_building_blocks.py:40` | existing | the compiles the shadow runs under |
 
 Provides:
 
@@ -851,7 +859,7 @@ What each later stage does with these:
 | `test_ladder_stages_and_skips` | untiled joint and tiled joint: stage names and order match `_run`'s branches and `_solve_stage` strings |
 | `test_traffic_only_has_no_expression` | `priced_objective` returns `None` whatever the config, and `ladder` is `residency` alone |
 | `test_traffic_only_matches_plan_layout_objective` | on placement-only fixtures, the stage's coefficients equal `plan_layout`'s objective proto |
-| `test_traffic_sizes_match_placement_buffers` | on a live `ScratchpadAllocator` solve, `traffic_sizes` equals `{b.name: b.size}` |
+| `test_traffic_sizes_match_placement_buffers` | on a live `ScratchpadAllocator` solve, reached by wrapping `ScratchpadAllocator._solve` in the test, `traffic_sizes` equals `{b.name: b.size}`; it needs a compile, so it runs inside `test_shadow_placement_only` on the card |
 | `test_ladder_folds_single_candidates` | a one-candidate node gives an integer core and shape term |
 | `test_ladder_covers_relayout_copies` | each copy has a `residency` term, as `hbm_terms` does |
 | `test_priced_withheld_only_for_linear_families` | tiling on: `None` for `linear_only=True`, an expression for False |
@@ -883,37 +891,66 @@ What each later stage does with these:
 
 | test | asserts |
 |---|---|
-| `test_ladder_equals_recorded_stage_objectives` | G2 on `cooptimization_captures*.json` and the synthetic graphs, using fixture nodes built from buffers |
-| `test_score_equals_legacy_score_fn` | G3 on the same, in integers |
-| `test_shadow_on_a_real_allocator_solve` | G1 on the `staged_transport_graph` fixture (`test_restickify_cost_model.py:385`), which `:556` already drives through the real allocator with no device |
+| `test_ladder_equals_stage_objectives` | G2 on `cooptimization_captures*.json` and the synthetic graphs, using fixture nodes built from buffers. These are buffer-level graphs with no cost expression, so today's solve takes the ladder on them |
+| `test_score_equals_legacy_score_fn` | G3 on the `staged_transport_graph` fixture with `SaCoOptimizingSolver`, in integers |
+| `test_shadow_on_a_real_allocator_solve` | G1 on the `staged_transport_graph` fixture (`test_restickify_cost_model.py:385`), calling `allocator._solve(solver, graph)` directly as `:556` already does, through the real allocator with no device |
+| `test_strict_lowering_on_a_real_allocator_solve` | the strict sweep on the same fixture |
+
+`tests/inductor/test_lx_cost_shadow.py`, on the card. Each case resets dynamo, runs under
+`torch._inductor.config.patch(force_disable_caches=True)` so every solve runs, as
+`test_building_blocks.py:1015` does, and calls `TestBuildingBlocks(name).debug()`
+inside `objective_shadow()`, so the compile, the run and the existing numerical check
+are the existing test's own:
+
+| test | asserts |
+|---|---|
+| `test_shadow_priced[name]` | G1 and the strict sweep on every solve, at the defaults (`layout_solver="cpsat"`, co-optimizing on, `auto_coarse_tiling` off), for `name` in `test__simple_attn` (softmax), `test_mlp` (swiglu), `test_rms_norm`, `test_flash_attention`, `test_sdpa_lk_uses_for_each_tile` |
+| `test_shadow_sa[name]` | G1 and G3 on the same names with `layout_solver="simulated_annealing"` |
+| `test_shadow_placement_only[name]` | G2 against `SpyreCostModel(traffic_only=True)` and `test_traffic_sizes_match_placement_buffers`'s assertion, with co-optimizing off |
+| `test_shadow_leaves_the_solve_alone[name]` | G4: at the defaults, a capture-only spy and the full shadow give `OPTIMAL` and equal `objective_ns` on every solve |
+| `test_shadow_saw_a_priced_solve` | the shadow counted at least one priced CP-SAT solve across the default cases, so G1 is not vacuous |
+
+Each case prints `objective_size` per solve. No case stores a plan, an objective or a
+proto.
 
 Existing suites, run serially: `test_scratchpad_solver`, `test_solver_relayout_decision`,
 `test_cooptimization_types`, `test_cost_expr_dump`, `test_restickify_cost_model`,
 `test_sa_cooptimizer`, `test_coarse_tiling`, `test_work_division*`,
 `test_scratchpad_patterns`, `test_perm_layout_solver`, `test_scratchpad_use`,
 `test_solver_auto_coarse_tiling`, plus `test_solver_cost_model`,
-`test_cost_model_decode`, `test_cost_model_loop_operands`. The parent plan requires no
-device suite after this stage, and none is planned: no production path changes.
+`test_cost_model_decode`, `test_cost_model_loop_operands`. On the card,
+`test_building_blocks` stays green on its own as well as under the shadow. No
+production path changes, so no other device suite is added.
 
-G1 and G2 on the Stage 0 corpus prove the parent plan's claim.
+G1 on the default-config compiles, with the device-free fixture as the share that needs
+no card, proves the parent plan's claim. G2 covers the ladder where it still runs.
 
 ## Parity and gates
 
 The parent plan's gate: "Proven by: on the Stage 0 corpus, the objective equals today's,
-solve for solve." Verification adds the Stage 0 diff against the parent commit.
+solve for solve." Stage 0 is dropped (Deviation 8), so this stage proves it directly: on
+the same graph, `SpyreCostModel.objective` equals the expression `_solve` builds, and the
+two give the same `objective_ns` at the plan today's solve returns. Parity means the
+proven optimum of the cost expression. No plan, proto or objective is stored.
 
 No new encoder exists, so the check runs beside today's solve, not instead of it.
-`lx_objective_shadow.py` is a Stage 0 `Observer`. Tiers at the PR tip: `intree`, the `fake`
-zoo at both configs, `unit-*` and `failure`. Per commit: `intree` and the fixed set. A
-model `fake` cannot reach stays card-only. `fake` uses default layouts on fake inputs, so
-it proves parity, not production plans. No gate here needs a card otherwise.
+`lx_objective_shadow.objective_shadow()` is a context manager in this PR's tests. It
+wraps `CoOptimizingAllocator._solve` and `ScratchpadAllocator._solve`
+(`allocator.py:3218`, `:1090`) with `mock.patch.object`, so each call hands it the
+solver, `solver.buffers` and the live `GraphLowering`. Inside, it wraps that solver
+instance's `plan_layout_and_core_divisions` or `plan_layout` to read `cost_expr` and the
+returned buffers, and `_solve_and_record` (`ilp_solver_ortools.py:1325`) to read
+`last_solve_stats` and each stage's objective. Two callers use it:
+`test_lx_cost_shadow.py` on real compiles from `test_building_blocks.py`, on the card,
+and `test_lx_cost_parity.py` on the `staged_transport_graph` fixture, device-free, which
+calls `allocator._solve(solver, graph)` directly.
 
-**G1, priced expression.** In `on_solve_begin(allocator, solver, ir, buffers, cost_expr)`,
-on the joint allocator:
+**G1, priced expression.** In the wrapped `CoOptimizingAllocator._solve`, before the
+legacy body runs:
 
 ```python
 graph = build_graph(ir, select_target(config))
-domains = domains_from_buffers(buffers)
+domains = domains_from_buffers(solver.buffers)
 new = graph.target.cost_model.priced_objective(
     graph, domains, linear_only=solver.linear_cost_only()
 )
@@ -923,22 +960,32 @@ new = graph.target.cost_model.priced_objective(
 rejects, which is branch 3 of `priced_objective` reached earlier. Otherwise it resolves
 `new`'s keyed charges with `index_charge`, taking keys from `NodeDomain.selector_values`
 over each source's menu, and requires `==` and equal `srepr` against `cost_expr`. This
-needs no CP model. It covers every solve that
-reaches `_solve`, in every `layout_solver` × `co_optimizing_lx_planning` combination that
-builds an expression, including the forced failure.
+needs no CP model.
 
-The check is structural because equal expressions make everything downstream equal by
-construction: lowering, proto, lambdify source, and the value Stage 0 records as
-`objective_ns`, which G1 therefore does not re-evaluate. It needs a live `GraphLowering`,
-since pickled captures hold none, so the `fake` tier carries it. `test_lx_cost_parity.py`
-carries the share CI runs.
+After the legacy solve returns, on CP-SAT: `last_solve_stats["status"]` is `OPTIMAL`,
+`objective_used` is true, so the priced model ran and not the ladder, and
+`_evaluate(resolved_new, solved_bindings(result))` equals
+`_evaluate(cost_expr, solved_bindings(result))` (`plan_solver.py:542`, `:567`) to a
+relative 1e-9. That is the parent's claim in its own unit, `objective_ns`, at the proven
+optimum. The structural check makes it hold by construction, so the evaluation guards
+the check itself. On SA, which proves no optimum, the same evaluation is compared at the
+returned plan.
 
-**G2, ladder.** For each ladder stage in a Stage 0 record, take the stored proto's
-objective, translate var names by the table below, and compare the `{name: coefficient}`
-map and the offset with `ObjectiveStage.terms`, after substituting known constants. A
-placement-only solve compares with `SpyreCostModel(traffic_only=True)`. This is exact linear
-equality over all assignments, not agreement at the solved point, and it replays from
-recorded protos.
+G1 runs on every solve that reaches `_solve` at the defaults (`layout_solver="cpsat"`,
+co-optimizing on, `auto_coarse_tiling` off) and with `layout_solver="simulated_annealing"`.
+A failed build or lowering is covered by `test_failed_build_falls_back_or_raises`, which
+makes the build raise with `monkeypatch`.
+
+**G2, ladder.** The ladder is not the production path: it runs on a failed build or
+lowering, on placement-only `plan_layout`, and on buffer-level test graphs, which carry no
+expression. G2 compares it in-process. For each `_solve_and_record` call the spy copies
+`model.proto.objective` before `Solve`, translates var names by the table below, and
+compares the `{name: coefficient}` map and the offset with that stage's
+`ObjectiveStage.terms`, after substituting known constants. The graphs are
+`cooptimization_captures*.json` through `load_captures` and `synthetic_graphs()`, both
+of which take the ladder. A placement-only compile, with co-optimizing off, compares with
+`SpyreCostModel(traffic_only=True)`. This is exact linear equality over all assignments,
+not agreement at the solved point.
 
 | proto var | `Sym` |
 |---|---|
@@ -956,12 +1003,19 @@ A maximize is compared after the proto's sign and `scaling_factor`.
 strict=True)` equals `solver._score_fn` on the seed state and on 32 states drawn from
 the seeded RNG, in integers, and the two-part score equals `_score()` under tiling.
 
-**G4, no change.** The Stage 0 diff between the parent commit and this PR is empty on the
-tiers above: proto, status, objective, decisions and committed plan, with `strict=False`
-on the legacy path.
+**G4, no change.** No production path reads the new code, and the legacy edits are
+refactors (the printer, `bind_division_owner`, `Sym` delegation) plus the bulk `Add`.
+They are held by the existing suites under Tests, by the printer tests that compare protos
+with `strict=False`, and by `test_bulk_add_equals_left_fold`. That the shadow does not
+disturb the solve is checked in-process: at the defaults, a capture-only spy and the full
+shadow both give `OPTIMAL` and equal `objective_ns` on every solve of the same compile. A
+different plan at an equal objective is a tie and passes.
 
-**Strict sweep.** On every priced CP-SAT solve, lowering `new` with `strict=True` on
-`model.clone()` inside `_minimize_cost_expr` raises nothing.
+**Strict sweep.** On every priced CP-SAT solve, the shadow wraps `_minimize_cost_expr`
+(`ilp_solver_ortools.py:830`) and lowers `new` with `strict=True` on `model.clone()`;
+it raises nothing.
+
+`_is_unique_solution` is not called by any gate. A test may log it as a diagnostic.
 
 Pass: all of the above, with no exceptions. No rule changes in this stage, so a difference
 is a bug in this PR. It is fixed, not listed.
@@ -969,7 +1023,8 @@ is a bug in this PR. It is fixed, not listed.
 ## Risks
 
 - **Names drift between `Sym` and the buffers.** Proto order would move with no plan
-  change at first. Caught by `test_sym_equals_buffer_symbols` and G4.
+  change at first. Caught by `test_sym_equals_buffer_symbols` and the printer tests that
+  compare protos.
 - **`Add` differs from the left fold on float coefficients.** I reasoned they match,
   since `Add.flatten` folds in sequence, and they matched on all 47 captures for charges.
   Bundle sums were not checked, because captures hold only the total. Caught by G1 and
@@ -996,15 +1051,15 @@ is a bug in this PR. It is fixed, not listed.
   and it should be rare. It belongs in Stage 6's list of justified proto differences.
 - **The shadow disturbs the solve.** `project_transport_read_copies` and feature
   extraction are non-mutating by their tests (`test_restickify_cost_model.py:593-595`),
-  and sympy's cache affects time only. G4 would show otherwise, since it compares a run
-  with the shadow off against one with it on.
+  and sympy's cache affects time only. G4 would show otherwise, since it compares a
+  capture-only spy against the full shadow on the same compile.
 - **The captures are stale.** Sizes are from October and lack the decode term. The size
-  guard re-reads real sizes on the Stage 0 corpus, and the 2.5x threshold can move with
-  evidence.
+  guard re-reads real sizes on the compiles in `test_lx_cost_shadow.py`, and the 2.5x
+  threshold can move with evidence.
 - **#5695 lands first.** `bundle_terms` avoids `mem_usage_by_buf` and passes explicit
   work slices, and that PR reports identical dumps. `traffic_sizes` does call it, which
-  needs a committed split, so it stays on committed mode only. Baselines are re-recorded
-  on rebase.
+  needs a committed split, so it stays on committed mode only. Nothing is recorded, so a
+  rebase only reruns the tests.
 - **`test_cut_traffic_matches_companions` and G3 need `torch_spyre._C`.** It is not in
   this snapshot, so I have not run them. They need a built tree.
 - **Copies in the ladder.** Forgetting them would pass a decision-level check, since
@@ -1025,7 +1080,9 @@ is a bug in this PR. It is fixed, not listed.
    holding `spill_cost`, `cut_traffic` and cores. The ladder stays through Stage 12: it is
    the only CP-SAT objective with `AUTO_COARSE_TILING=1`, because the cost model cannot
    score tile size or cut count (`allocator.py:3280-3290`). `traffic_only` runs its
-   `residency` stage for committed mode.
+   `residency` stage for committed mode. The torch-spyre stack #6121-#6126 (open) prices
+   tiling, and #6124 removes the `auto_coarse_tiling` bypass, so that reason goes once it
+   merges. See Open question 1.
 
 2. **`objective(graph)` also needs domains, and `cut_traffic(node)` too.** The split
    symbols, the delivery estimate, the transport projection and the relayout table
@@ -1058,7 +1115,7 @@ is a bug in this PR. It is fixed, not listed.
    `priced_objective` keeps today's fallback for a foreign symbol.
 
 6. **The gate is met by a shadow check.** It cannot compare two encoders, because the
-   second does not exist. Resolution: G1 to G4.
+   second does not exist. Resolution: G1 to G4, run in this PR's own tests (Deviation 8).
 7. **`SPYRE` does not hold the cost model.** The parent builds `SPYRE` with
    `cost_model=SpyreCostModel()` in `graph/target.py`, but the `graph/` boundary test forbids
    that module importing `cost.py`. Resolution: `SPYRE.cost_model` stays `None`, `cost.py`
@@ -1066,9 +1123,30 @@ is a bug in this PR. It is fixed, not listed.
    `COST_MODELS.get(target.name)`, so every compiled graph still reads its cost model from
    `graph.target.cost_model`.
 
+8. **Stage 0 is dropped (owner, PR #7, 2026-11-12).** The parent's proof named the Stage 0
+   corpus, the shadow was a Stage 0 `Observer`, G2 replayed Stage 0 recordings, and G4 was
+   the Stage 0 diff against the parent commit. Resolution: `lx_objective_shadow.py`
+   patches `CoOptimizingAllocator._solve` and `ScratchpadAllocator._solve` in the test.
+   G1 compares the expression and `objective_ns` at today's `OPTIMAL` plan on
+   `test_building_blocks.py` compiles on the card and on the `staged_transport_graph`
+   fixture. G2 reads the ladder's stage objectives in-process on the buffer-level graphs.
+   G4 is the existing suites plus a capture-only spy against the full shadow. Nothing is
+   stored.
+
 ## Open questions
 
-None.
+1. **Should `CostModel.ladder` still be ported in full?** The defaults solve one
+   cost-expression model, and the ladder runs only on the fallback (a failed build or
+   lowering), placement-only `plan_layout`, auto tiling and buffer-level test graphs.
+   Once #6124 merges, auto tiling leaves that list. Two consumers remain: Stage 6 lowers
+   each ladder stage when `priced_objective` returns `None` or lowering raises, and Stage 9's
+   committed mode runs `traffic_only`'s `residency` stage. Recommendation: port it as
+   planned in this stage, since both consumers need it and G2 proves it in-process at
+   little cost, but stop treating it as the parent's proof, which is G1 alone. Whether
+   the fallback can become a hard failure, which would leave only `residency`, is decided
+   at Stage 12 or 13 with #6121-#6126 merged, not here. Branch 1 of `priced_objective`
+   follows whichever base this stage lands on: if #6124 is in, branch 1 and
+   `test_priced_withheld_only_for_linear_families` go with it.
 
 ## Out of scope
 
