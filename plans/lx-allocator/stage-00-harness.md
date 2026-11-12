@@ -346,7 +346,20 @@ every CP-SAT tiling cell (the allocator builds none under `auto_coarse_tiling`,
 and raises on output-tiled symbolic arguments, #3810), the 18 `intree` graphs,
 placement-only solves, and a failed build or lowering (`allocator.py:3321-3336`,
 `ilp_solver_ortools.py:886-900`). Stage 0 can price none of them, since it changes no
-production code. Two rules cover them.
+production code.
+
+The tiling gap is being closed outside this plan, by the torch-spyre stack #6121 to
+#6126 (open as of 2026-11-12). #6123 prices tile height, and #6124 removes the
+`auto_coarse_tiling` bypass and the `linear_cost_only` capability that keyed it, so
+CP-SAT ranks tiling, division and residency by `cost_expr` in one model. #6126 lowers
+the expression by direct evaluation instead of the symbolic rewrite. The ladder stays
+only as the fallback when the expression cannot be built or lowered. Nothing in the
+harness depends on which side of the stack a base is on: a solve is priced exactly when
+its record has a `cost_expr_sha`. If the stack merges before Stage 0, the CP-SAT tiling
+cells are priced on both sides and leave rule 1 below, and `intree`, placement-only and
+the build or lowering fallback stay unpriced. If it merges after Stage 0, the stage that
+takes it gates the tiling cells under rule 2, with the stack's own cost expression as
+`price`. Two rules cover what stays unpriced.
 
 1. Until a cost expression prices a case, objective mode compares it **exactly**, as
    `unpriced`, so any change to its decisions fails. This is the conservative choice:
@@ -355,8 +368,8 @@ production code. Two rules cover them.
 2. Once a cost expression exists, `diff(price=...)` prices both sides with it.
    `price(case, decisions)` returns ns for a recorded `BufferDecision` map, the
    decisions being encoding-free, so a base that ran the ladder still gets a price. The
-   first stage that prices a case (Stage 4's `SpyreCostModel.objective`, which must
-   price tiling for the CP-SAT tiling cells to leave rule 1) gates on `change <= base`,
+   first stage that prices a case (the stack's merge for the tiling cells; Stage 4's
+   `SpyreCostModel.objective` for the rest) gates on `change <= base`,
    since the base did not minimize that expression. `improved` is reported. Later stages
    minimize it on both sides and gate on equality, as for priced solves.
 
@@ -1168,11 +1181,16 @@ time is unmeasured.
   harder half. Recording time is measured per tier with the probe on at calibration. If it
   is too slow, the probe runs on the fixed set only, and `uniqueness` stays `None`
   elsewhere.
-- **Much of the corpus is unpriced until Stage 4.** Every CP-SAT tiling cell and all of
-  `intree` have no cost expression at this base, so objective mode compares them exactly,
-  and a tie there fails. That is the price of not trusting the ladder. It ends where
-  Stage 4's cost model prices them, which for tiling means pricing tile size and cut
-  count and not raising on output-tiled arguments (#3810).
+- **Part of the corpus is unpriced.** At `5268ba95` every CP-SAT tiling cell and all of
+  `intree` have no cost expression, so objective mode compares them exactly, and a tie
+  there fails. That is the price of not trusting the ladder. The tiling cells are priced
+  once #6121-#6126 merge, and `intree` and placement-only once Stage 4 provides `price`.
+- **The #6121-#6126 stack moves the base.** It edits `allocator.py`,
+  `ilp_solver_ortools.py`, `cpsat_expr_printer.py` and the SA and greedy solvers, so the
+  line references and the measurements in Today are for `5268ba95`. If it merges before
+  Stage 0 is built, the plan's code base moves to that merge and the references and the
+  dtime 10/30 tiling measurements are redone, since those were ladder solves. No hook
+  target is removed by the stack; `linear_cost_only`, which it removes, is not hooked.
 - **The cost expression is a proxy.** Two plans at an equal cost can still differ in
   predicted runtime. Objective mode accepts them. `cost_report` on each `tie` is how a
   reviewer sees it.
@@ -1242,7 +1260,8 @@ time is unmeasured.
    through `diff(price=...)`. Exact mode stays for Stage 0's G1 and G2, and for a stage
    that claims an unchanged proto. The parent plan and the Stage 1-13 plans still say
    byte-identical, and Stage 4's plan still ports the ladder as `CostModel.ladder`. They
-   are updated to this rule separately.
+   are updated to this rule separately. Tiling's place in the cost expression comes from
+   torch-spyre #6123 and #6124, not from Stage 4.
 
 ## Open questions
 
