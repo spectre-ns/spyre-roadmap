@@ -1,15 +1,16 @@
 # LX allocator, Stage 8: `SAFamily`, today's SA co-optimizer as a family
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2, 3, 4, 5, 6, 7. Needed by: Stages 9, 10, 11, 12, 13.
+Depends on: Stages 1, 2, 3, 4, 5, 6, 7. Needed by: Stages 9, 10, 11, 12, 13.
 
 ## Goal
 
 When this PR merges, the graph can be solved end to end by a second family with no CP-SAT in
 it: `SAFamily.encode` builds an `AnnealModel`, inside an `Encoding`, from a
 `SpyreOptimizationGraph`, `SAFamily.solve` anneals it with today's moves, and
-`SAFamily.read_back` decodes the plan onto the graph. With seed 0 the plan equals what
-`SaCoOptimizingSolver` chooses on the same graph, apart from one listed tiling refusal.
+`SAFamily.read_back` decodes the plan onto the graph. With seed 0, in one process, the plan
+and the score equal what `SaCoOptimizingSolver` chooses on the same graph, apart from one
+listed tiling refusal.
 Nothing in production calls the family yet: `select_allocator` is untouched,
 `LAYOUT_SOLVER=simulated_annealing` still runs the old path, and Stage 9 wires the family
 in. The one production change is mechanical: the search moves out of `sa_cooptimizer.py`
@@ -494,7 +495,7 @@ inputs. Each item below is compared by the model diff in the gate.
 5. `space.axes`, ascending `factor_domain` and `tiling_options` come from the same
    `OpSplitSpace`. `build_tiling_space` is called with the same readers, because
    `_unit_tile_breaks_a_reader` changes the count lists. The tiling filter is the one change,
-   and the gate's baseline applies it too.
+   and the dual run's old side applies it too.
 6. Relation type per edge is identical. `TableRelation` and `ViewRelation` pick different
    representatives on purpose (`:623-630`).
 7. Sizes, uses, `first_use_is_read` and `in_place_parents` order are identical, because
@@ -554,34 +555,37 @@ Paths below `.../sa/` are under `torch_spyre/_inductor/scratchpad/lx_allocator/f
 | `torch_spyre/_inductor/scratchpad/sa_cooptimizer.py` | reduced to the solver class, aliases and buffer-side helpers |
 | `torch_spyre/_inductor/config.py` | `"sa"` in the `layout_solver` literal, comment |
 | `docs/source/compiler/sa_co_optimization.md` | the family, plus corrected seed and float statements |
-| `tests/inductor/test_sa_family.py` | new |
-| `tests/inductor/test_lx_live_parity.py` | extended with the SA dual run |
-| `tests/inductor/lx_shadow_plugin.py` | `sa_dual_run`, the observer factory behind the dual run |
+| `tests/inductor/test_sa_family.py` | new, with the trace probe `sa_trace` |
+| `tests/inductor/test_sa_family_live.py` | new, the dual run on the card |
 | `tests/configs/torch_spyre_tests/inductor/test_sa_family_config.yaml` | new, mirrors `test_sa_cooptimizer_config.yaml` |
-| `tests/inductor/lx_equivalence.py`, `tests/inductor/lx_corpus.py` | SA trace fields and hooks, `SCHEMA_VERSION` bump, `OPTIONAL_TARGETS` |
+| `tests/configs/torch_spyre_tests/inductor/test_sa_family_live_config.yaml` | new |
 
 Ordered commits, each leaving the suite green:
 
-1. **Record SA traces.** Harness only, no production change. Adds `rng_digest`, `score_digest`
-   and `steps_run` and bumps `SCHEMA_VERSION`. `sa_cooptimizer.rnd` is the stdlib module, so the
-   hook rebinds the name `rnd` in `sa_cooptimizer` and never touches `random.Random` itself. The
-   one `rnd.Random` call there (`sa_cooptimizer.py:795`) stays on `SaCoOptimizingSolver`, so
+1. **A trace probe in the tests.** No production change. `sa_trace`, a context manager in
+   `test_sa_family.py`, gives `rng_digest`, `score_digest` and `steps_run` for each solve run
+   inside it. `sa_cooptimizer.rnd` is the stdlib module, so the probe rebinds the name `rnd` in
+   `sa_cooptimizer` with `monkeypatch` and never touches `random.Random` itself. The one
+   `rnd.Random` call there (`sa_cooptimizer.py:795`) stays on `SaCoOptimizingSolver`, so
    commit 3 does not move this target. `SAFamily.solve` is the only other place a generator
-   is built, so `family/sa/family.py` imports `random as rnd` and is the second target, through
-   `OPTIONAL_TARGETS`. The hook patches `_score` on `SaCoOptimizingSolver`, which also holds
-   after `_score` moves to `AnnealSearch`, and, optionally, on `_ModelSearch`. A harness test
-   fails on an SA solve with an empty digest, so a stale target cannot silently cover nothing.
+   is built, so `family/sa/family.py` imports `random as rnd` and the probe rebinds that name
+   too once it exists. The probe patches `_score` on `SaCoOptimizingSolver`, which also holds
+   after `_score` moves to `AnnealSearch`, and on `_ModelSearch` once it exists. A test fails on
+   an SA solve with an empty digest, so a stale target cannot silently cover nothing.
 2. **Move sources and relations** to `divisions.py`, with aliases. No logic change.
-3. **Move the search** to `AnnealSearch`, with `SaCoOptimizingSolver` inheriting it. Traces
-   from commit 1 must be unchanged.
-4. **Extract scoring** into `score.py`. The old methods become wrappers. Traces unchanged.
+3. **Move the search** to `AnnealSearch`, with `SaCoOptimizingSolver` inheriting it.
+   `test_sa_cooptimizer` passes unchanged, including `GoldenSolveTest`, `DeterminismTest` and
+   `CrossProcessDeterminismTest`.
+4. **Extract scoring** into `score.py`. The old methods become wrappers. The same check as
+   commit 3.
 5. **Add `AnnealModel`, `_ModelSearch`, `AnnealSolution` and `SAFamily.solve`,** tested
-   with an `Encoding` built from synthetic buffers. Includes the deadline path.
+   with an `Encoding` built from synthetic buffers against `SaCoOptimizingSolver` on the same
+   buffers, in one process. Includes the deadline path.
 6. **Add `SAFamily.encode`** and the model diff against `SaCoOptimizingSolver`'s
    `_sources`, `_relations` and `_score_fn`.
 7. **Add `SAFamily.read_back`** with comparison against `decode_todays_plan`.
-8. **Register `SAFamily` in `FAMILIES`,** add the config value, and extend
-   `test_lx_live_parity.py`.
+8. **Register `SAFamily` in `FAMILIES`,** add the config value, and add
+   `test_sa_family_live.py` with its shard config.
 9. **Docs.**
 
 ## Interfaces
@@ -590,8 +594,6 @@ Consumes:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| `Recorder`, `install`, `Observer.on_solve_begin`, `record_compile`, `OPTIONAL_TARGETS`, `lx_corpus.py`, `lx_gate.sh`, `SA_CELL`, `SA_TILING_CELL`, `fake` tier | Stage 0 API; `on_solve_begin(allocator, solver, ir, buffers, cost_expr)`; `begin_solve(*, family, solver)`; `install(optional=...)`; `record_compile(observers=...)` | 0 | baselines, dual run |
-| `test_lx_live_parity.py`, `lx_shadow_plugin` | Stage 5 live arm, on the fixed set | 5 | CI arm of the dual run |
 | `SpyreOptimizationGraph`, `DataEdge`, `Pin`, `Step`, `StepKind`, `STEP_KINDS`, `WorkSplit`, `Restriction`, the eleven flags, `Rule`, `Optimization` | parent plan | 1 | everything |
 | `Target`, `SPYRE`, `SPYRE_OPS`, `OpFactory.with_type`, `OpNode.restrictions` | parent plan; `restrictions` set by `OpFactory.make` | 1 | class vars, domains, derived-target tests |
 | `select_target` | `(config) -> Target` | 2 | dual run |
@@ -607,8 +609,8 @@ Consumes:
 | `check_decisions`, `RuleViolation`, `ALWAYS` | `(graph) -> list[Violation]`; `in_place_conditions` and `tiles_line_up` in physical form | 3 | gate |
 | `residency_reason` | `(node, graph, *, decides_relayouts: bool, tileable: bool) -> str \| None` | 3 | pins |
 | `decode_todays_plan` | `(graph, allocation, accepted_relayouts) -> list[Mismatch]`, called with `()` | 3 | parity gate |
-| `decisions`, `NodeDecision` | `(graph) -> dict[str, NodeDecision]` | 3 | recording, comparison |
-| `lx_check_summary.py` | CLI | 3 | gate |
+| `decisions`, `NodeDecision` | `(graph) -> dict[str, NodeDecision]` | 3 | comparison |
+| `lx_check_summary.py` | CLI over `SPYRE_LX_CHECK_FILE` records | 3 | level 4 |
 | `CostModel.priced_objective` | `(graph, domains, *, linear_only: bool) -> sympy.Expr \| None`, `==` today's `cost_expr` on SA's domains | 4 | score |
 | `CostDomains`, `NodeDomain` | `CostDomains(nodes, relayouts=())` | 4 | score |
 | `CostModel.spill_cost` | `(node, *, boundary_known=True, clamp_unsized=False, size=None) -> int`, called with `clamp_unsized=True` | 4 | memory-only objective |
@@ -624,7 +626,6 @@ Consumes:
 | `residency_edge` | `(gate) -> ResidencyEdge \| None`, in `family/edge_tables.py` | 6 | `ViewRelation` |
 | `edge_match_pairs` | `(gate) -> tuple[tuple[int, int], ...]`, in `family/edge_tables.py` | 6 | `table_relation` |
 | `PlacementBox`, `Encoding.boxes`, `Encoding.capacity`, `Family`, `Solution`, `SolveStatus`, `SolveSettings`, `FAMILIES` | Stage 7; `Encoding.capacity` in alignment units | 7 | protocol, solution base, registry |
-| `buffer_decision` | `(decision: NodeDecision, alignment: int) -> BufferDecision` | 7 | recording |
 
 Provides:
 
@@ -647,9 +648,14 @@ Provides:
 
 `tests/inductor/test_sa_family.py`, device-free:
 
-- `test_solve_reproduces_the_golden_solves`: an encoding built from `multi_region` and
-  `k_split_consumers` gives `GoldenSolveTest`'s divisions, addresses and score, with
-  `offset * alignment` equal to today's address.
+- `test_solve_matches_today_on_synthetic_graphs`: for every graph in `synthetic_graphs()`, at
+  the capacities `_capacities` gives in `test_sa_cooptimizer.py`, an encoding built from its
+  buffers gives the same divisions, addresses, `best_score` and `sa_trace` digests as
+  `SaCoOptimizingSolver` on a deep copy of the same buffers, in the same process, with
+  `offset * alignment` equal to today's address. `multi_region` and `k_split_consumers` at
+  `GoldenSolveTest`'s capacities are among them.
+- `test_trace_repeats`, `test_trace_is_not_empty`: two `SaCoOptimizingSolver` runs give equal
+  digests, and a run gives a non-empty one.
 - `test_compile_objective_matches_build_score_fn`: equal integers on sampled states over the
   op-features corpus.
 - `test_unknown_symbol_warns_and_goes_memory_only`, `test_unknown_symbol_raises_when_strict`,
@@ -681,18 +687,25 @@ Provides:
 - `test_family_holds_no_state`: two encodings from one `SAFamily` solve independently, and
   `read_back` decodes the encoding its solution carries.
 
-`tests/inductor/test_lx_live_parity.py` gains the dual run on `fake` compiles of the fixed set
-at both cells, so CI holds parity after this PR merges.
+`tests/inductor/test_sa_family_live.py`, on the card:
+
+- `test_dual_run[case, tiling]`: the dual run under Parity and gates, over `test_softplus`,
+  `test__simple_attn`, `test_mlp`, `test_rms_norm` and `test_flash_attention` from
+  `tests/inductor/test_building_blocks.py`, with `LAYOUT_SOLVER=simulated_annealing`, at default
+  config and at `AUTO_COARSE_TILING=1`. Each case runs the existing test in-process as
+  `TestBuildingBlocks(case).debug()`, so the compile and its numerical check are the suite's
+  own. It stays in CI after this PR merges, so a change to one SA path without the other fails
+  there.
 
 Existing suites run serially: the parent's unit list, plus `test_simulated_annealing` and
 `test_sa_cooptimizer` with `SA_COOPT_LARGE_CAPTURES=1`. Device suites on the card, per the
 parent, run with `LAYOUT_SOLVER=simulated_annealing` so they cover the moved engine.
-`pre-commit run --files <changed>` as usual. Planning time: `lx_corpus.py timing` with
-alternating processes (ABAB) on live compiles at `SA_CELL`, because this PR moves the SA
-inner loop and SA cannot replay.
+`pre-commit run --files <changed>` as usual. Planning time is reported, not gated
+(Deviation 12).
 
-What proves the claim: commits 1 to 4 prove the move changed nothing, the model diff proves
-`encode` feeds the same inputs, and the dual run proves the plan.
+What proves the claim: the unchanged `test_sa_cooptimizer` suite proves the move changed
+nothing on its graphs, the model diff proves `encode` feeds the same inputs, and the dual run
+proves the plan.
 
 ## Parity and gates
 
@@ -700,25 +713,31 @@ The parent's gate: "on the Stage 0 corpus with the same seed, the plans equal to
 `SaCoOptimizingSolver` plans wherever the rules agree, and `check_decisions` passes on every
 one."
 
-**Corpus.** At the PR tip: `intree`, the `fake` zoo at `SA_CELL` and `SA_TILING_CELL`, `unit-*`
-and `failure`. A commit-level check is `intree` and the fixed set. A model `fake` cannot reach
-stays card-only. `fake` uses default input layouts, so it proves parity, not production plans.
-The zoo arm has to be live, because a pickled capture runs menus only (see Today); `intree`
-still covers the moved engine, on menus. The PR reports hits per coverage feature, restickify
-features included. `lx_gate.sh` runs HEAD's harness over the base tree, so both sides have the
-new fields. It passes no dual-run observer, so its diff shows the old path unchanged.
+Stage 0 is dropped (Deviation 13). SA proves no minimum, so parity here is not an optimum. It
+is today's exact, seeded behaviour: in one process, on the same input, `SAFamily` and
+`SaCoOptimizingSolver` give the same trace, the same score and the same decisions. Nothing is
+stored between runs.
 
-**Dual run.** `sa_dual_run` is an `Observer` factory in `lx_shadow_plugin.py`, passed as
-`lx_corpus.py record --observer lx_shadow_plugin:sa_dual_run`. Its `on_solve_begin` runs
-`build_graph(ir, select_target(config))`, encodes and solves through
-`SAFamily.from_config(config)` with `SolveSettings(deterministic=True)`, and reads back onto that
-graph, then lets the old solver run. Order matters, because the old solver mutates buffers and
-appends to menus. The family
-solve is recorded with `Recorder.begin_solve(family="sa", solver="SAFamily")`, no stages,
-then `end_solve` over `buffer_decision` of each entry of `decisions(graph)`, with the solution's
-`score_ns()` and `off_expression_ns()`. Under tiling the observer also rebuilds the old
-`division_space` of every site step 6 of `encode` refuses, with
+**Cases.** Five `test_building_blocks` compiles on the card, in `test_sa_family_live.py`, with
+`LAYOUT_SOLVER=simulated_annealing`, at default config and at `AUTO_COARSE_TILING=1`. They
+have to be live, because a pickled capture runs menus only (see Today). The buffer-level
+tests in `test_sa_family.py` still cover the moved engine, on menus. Device tests run on card
+runners; there is no device-free compile.
+
+**Dual run.** Each case installs two patches with `monkeypatch`:
+
+- `CoOptimizingAllocator._solve` (`allocator.py:3218`), to keep the `GraphLowering` it is
+  called with;
+- `SaCoOptimizingSolver.plan_layout_and_core_divisions` (`sa_cooptimizer.py:778`), which the
+  allocator calls with today's `cost_expr` (`allocator.py:3352`).
+
+The second wrapper runs `build_graph(ir, select_target(config))`, encodes and solves through
+`SAFamily.from_config(config)` with `SolveSettings(deterministic=True)`, and reads back onto
+that graph, then calls the original. Order matters, because the old solver mutates buffers and
+appends to menus. Both solves run inside `sa_trace`. Under tiling the wrapper also rebuilds the
+old `division_space` of every site step 6 of `encode` refuses, with
 `build_op_split_space(op, graph.target.cores, tiling=None)`, so the comparison stays exact.
+The wrapper lets every exception propagate, so a failure in the family fails the case.
 
 Compared, in order, with the first difference reported:
 
@@ -733,11 +752,10 @@ Compared, in order, with the first difference reported:
    with `accepted_relayouts=()` puts today's plan on a second graph, and `decisions` on the
    two graphs must match.
 4. **Check.** `check_decisions` on the read-back graph, then `lx_check_summary.py` over the
-   SA records.
+   records the cases write with `SPYRE_LX_CHECK_FILE` set.
 
-**Pass:** zero differences at all four levels on every entry, at both cells, and no entry in
-`Recorder.observer_errors`, because an observer's exception is stored, never raised. Stage 9
-makes zero level 4 reports at tiling an entry condition.
+**Pass:** zero differences at all four levels on every case, at both configs. Stage 9 makes
+zero level 4 reports at tiling an entry condition.
 
 Level 4 can be zero for these reasons. At default config I found nothing in `ALWAYS` or the
 rule tables that today's SA breaks, given pinned sticks and Stage 3's `cross_frame` as view
@@ -757,14 +775,14 @@ encoding in three ways, and Stage 3's physical rules admit all three:
 Elsewhere SA is stricter: `_read_across_a_tiling_boundary`, no `via_full` exemption, and
 `untiled_bar` as a hard pin. The partial-reduction cut guard (`Rule.RESIDENT_TILE_UNREDUCED`)
 holds because a reduction-split producer is never compatible. Not verified: no real tiled
-compile ran here, so which of the three occur on the corpus is unknown, and the "at most one"
+compile ran here, so which of the three occur on the live cases is unknown, and the "at most one"
 half of `in_place_conditions` for a parent with two children, which needs lifetime overrides,
 was not checked.
 
 **A difference** is a bug, which is fixed. The tiling filter is not one, because the old side
 applies it too. The PR lists every graph where the filter fired, and each must pass a quality
-check against an old run with no observer: over five seeds, the median predicted cost is no
-worse, since `sa_co_optimization.md` warns that one seed proves nothing.
+check against an old run without the dual-run patches: over five seeds, the median predicted
+cost is no worse, since `sa_co_optimization.md` warns that one seed proves nothing.
 
 `SimulatedAnnealingLayoutSolver` is not a baseline here.
 
@@ -773,15 +791,21 @@ worse, since `sa_co_optimization.md` warns that one seed proves nothing.
 - **Stage 4 returns an equal-valued but not structurally equal objective.** The trajectory
   diverges at the first rounding tie. Caught by level 1 of the gate, which names the first
   differing subexpression.
-- **`srepr` round trip in a harness.** `_decode_delivery_price` is an implemented function
+- **`srepr` round trip in a test.** `_decode_delivery_price` is an implemented function
   (`cost_model.py:1426-1450`), and its `_imp_` does not survive text. Comparing or replaying
   a parsed expression fails at call time. The dual run compares live objects.
-- **A pickled corpus entry sneaks in.** Parity would hold on menus and say nothing about
-  generated sources. `test_enumerated_op_generates_at_default_config` and a harness assertion
-  that view relations exist on live entries catch it.
+- **A pickled capture stands in for a live case.** Parity would hold on menus and say nothing
+  about generated sources. `test_enumerated_op_generates_at_default_config` and an assertion in
+  the live cases that view relations exist catch it.
 - **Encode cost doubles on fallback.** The second family rebuilds tables and the objective.
-  Caught by `lx_corpus.py timing`. Stage 9 can share a table cache later.
-- **`check_decisions` raises on a fallback plan.** The compile dies. Level 4 at both cells
+  Seen in the planning-time report (Deviation 12), not gated. Stage 9 can share a table cache
+  later.
+- **A move changes the search where only live compiles reach.** Both sides of the dual run
+  share `AnnealSearch` from commit 3 on, so the dual run cannot see a change the move itself
+  made. `test_sa_cooptimizer` holds the move on synthetic graphs and captures, which run menus
+  only, and the device suites under `LAYOUT_SOLVER=simulated_annealing` check results, not
+  plans. Open question 1.
+- **`check_decisions` raises on a fallback plan.** The compile dies. Level 4 at both configs
   guards this.
 - **A tile's address reuse overlaps a child by one tick.** `read_back` leaves `in_place` false
   there, so `boxes_fit_lx` must use Stage 3's nest-aware lifetime. Caught by level 4.
@@ -850,11 +874,27 @@ worse, since `sa_co_optimization.md` warns that one seed proves nothing.
 
 12. **Planning time does not replay.** The plan replays zoo captures in one process after this
     stage. SA cannot replay a capture's trajectory, and two trees cannot share a process.
-    Resolution: `lx_corpus.py timing` with alternating processes on live compiles at `SA_CELL`.
+    Resolution: the PR reports the time of `test_sa_cooptimizer` with
+    `SA_COOPT_LARGE_CAPTURES=1` and of `test_sa_family_live.py`, run on its parent and on its
+    tip in alternating processes. It is a report, not a gate, and nothing is stored.
+
+13. **Stage 0 is dropped (owner, PR #7, 2026-11-12).** The plan's corpus, recordings, cells and
+    observer go. The dual run is now `test_sa_family_live.py`: five `test_building_blocks`
+    compiles on the card, with the allocator and `SaCoOptimizingSolver.plan_layout_and_core_divisions`
+    patched in the test, comparing model, trace, score and decisions in one process. The trace
+    digests come from `sa_trace`, a test helper, not from recordings. Commits 2 to 4 are held by
+    the existing `test_sa_cooptimizer` suite. `buffer_decision` is not used.
 
 ## Open questions
 
-None.
+1. **Do commits 2 to 4 need a check across trees?** Without recordings, nothing compares the
+   search before the move with the search after it on a live compile, where generated sources
+   and view relations run. `test_sa_cooptimizer` compares it only on menus.
+   - Recommended: no gate. The commits are pure moves, reviewed as such, and
+     `test_sa_cooptimizer` with `GoldenSolveTest` passes unchanged. In addition, the author
+     runs `sa_trace` over the five live cases on the PR's parent, with the test file copied
+     into that tree, and on commit 4, and attaches the two digest lists to the PR. Nothing is
+     committed.
 
 ## Out of scope
 
