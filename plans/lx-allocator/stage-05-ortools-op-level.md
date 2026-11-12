@@ -1,7 +1,7 @@
 # LX allocator, Stage 5: `OrToolsFamily.encode`, op level
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2, 3, 4. Needed by: Stages 6, 7, 8, 9, 11, 13.
+Depends on: Stages 1, 2, 3, 4. Needed by: Stages 6, 7, 8, 9, 11, 13.
 
 ## Goal
 
@@ -16,7 +16,7 @@ and nothing else. `Encoding`, `OrToolsFamily`, `DivisionTable` and `build_divisi
 exist and have tests. Nothing in a compile calls them yet: `CpSatLayoutSolver` still builds
 and solves every production model, and the allocator changes are extractions that leave
 protos, decisions and plans unchanged. `test_lx_live_parity.py` holds `ortools_encode.py` to
-`CpSatLayoutSolver` in CI from here on. The Stage 5 model is not a complete model and is
+`CpSatLayoutSolver` in CI from here on, on real compiles from `test_building_blocks.py`. The Stage 5 model is not a complete model and is
 never solved in production.
 
 ## Today
@@ -668,7 +668,7 @@ changes `div_n`'s domain and is a real rule disagreement, which the gate reports
 | `AGENTS.md` | one line: a change to how `CpSatLayoutSolver` posts its model must change `ortools_encode.py` in the same PR |
 | `tests/inductor/lx_sections.py` | new test helper: build today's model, project, diff |
 | `tests/inductor/lx_replay_graph.py` | new test helper: a graph and tables from buffers |
-| `tests/inductor/lx_shadow_plugin.py` | new pytest plugin and `Observer`: live comparison at each solve |
+| `tests/inductor/lx_shadow_plugin.py` | new pytest plugin, loaded with `-p lx_shadow_plugin`, whose fixture wraps `CoOptimizingAllocator._solve` with `mock.patch.object`: live comparison at each solve |
 | `tests/inductor/test_lx_family_base.py`, `test_lx_division_table.py`, `test_lx_ortools_encoder_op.py`, `test_lx_encoder_sections.py`, `test_lx_live_parity.py`, `test_work_division_recording.py` | new |
 | `tests/configs/torch_spyre_tests/inductor/test_lx_*_config.yaml`, `test_work_division_recording_config.yaml` | one per new test file, labels `[unit, regression, trunk]`, `unlisted_test_mode: mandatory_success` |
 
@@ -678,9 +678,11 @@ Commits:
 
 1. `base.py`, and `begin`, `OrToolsState`, `post`, `post_in`, `post_table`, `symbol` and
    `tag` in `ortools_encode.py`, with unit tests on a bare `Encoding`. Nothing calls them.
-2. The three allocator extractions. Stage 0 harness diff must be empty.
+2. The three allocator extractions. The existing suites under Tests stay green, and
+   `test_table_equals_enumerate_core_divisions` holds the moved code to the method.
 3. Recording in `work_division.py` and `work_division_constraints.py`, with
-   `test_work_division_recording.py`. Stage 0 harness diff must be empty.
+   `test_work_division_recording.py`. The existing suites stay green, and
+   `test_recorder_does_not_change_candidates` holds the candidate lists.
 4. `division_table.py`, tested on hand-built graphs and on mock ops as
    `tests/inductor/test_work_division.py` builds them.
 5. `OrToolsFamily.encode` and the op-level functions: S1 to S4, residency, symbols, cost
@@ -688,8 +690,8 @@ Commits:
 6. Sticks and flags, with the free-stick path solved in a unit test.
 7. `lx_sections.py`, `lx_replay_graph.py`, `test_lx_encoder_sections.py`,
    `lx_shadow_plugin.py`, `test_lx_live_parity.py`, the `AGENTS.md` line, and the gate.
-   This commit is probe P4: run the live arm on the `fake` zoo at both configs before Stage
-   6's design freezes. A hand port from a graph built without the allocator has never been
+   This commit is probe P4: run the live arm on the card over `test_building_blocks.py` at
+   both configs before Stage 6's design freezes. A hand port from a graph built without the allocator has never been
    compared on a real compile, so the first section diff shows whether node order, prefetch
    order and menus line up, which Stage 6's and Stage 7's whole-proto claims depend on.
    P4 has not been run.
@@ -700,7 +702,10 @@ Consumes.
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| equivalence harness | `lx_gate.sh`, `lx_corpus.py timing`, tiers `intree`, `fake`, `unit-*`, `failure`; `record_compile(name, cell, out, *, device, observers)`, `Observer.on_solve_begin(allocator, solver, ir, buffers, cost_expr)`, `Recorder.begin_solve`, `.record_stage(..., provenance=)`, `proto_text`, `provenance_record`, `corpus_coverage`, `FIXED_GRAPHS`, `DEFAULT_CELL`, `TILING_CELL`, `CARD_ONLY` | 0 | gates |
+| `CoOptimizingAllocator._solve` | `(solver, graph: GraphLowering) -> Sequence`, `allocator.py:3218` | existing | the live arm wraps it to reach `solver.buffers` and the `GraphLowering` |
+| `TestBuildingBlocks` | `test_building_blocks.py:40` | existing | the compiles the CI arm runs under the live arm |
+| `load_captures`, `synthetic_graphs` | `cooptimization_capture_loader.py:100`, `synthetic_cooptimization_graphs.py:269` | existing | replay arm |
+| `config.timing`, `config.timing_out` | `TORCH_SPYRE_TIMING`, `TORCH_SPYRE_TIMING_OUT`, `config.py:261-271`, `timing_recorder.py:23-24` | existing | planning-time check |
 | `SpyreOptimizationGraph` | `target`, `nodes`, `pins_on(target, what)`, `pin(target, what, value, source)` | 1 | everything |
 | `Target` | `cores`, `lx_bytes`, `alignment` (bytes), `rules`, `optimizations`; `SPYRE`, `SPYRE_OPS`, `OpFactory.with_type(node_type, **changes)`, derived with `dataclasses.replace` | 1 | core budget, capacity, rules, axes; derived targets in tests and the replay arm |
 | `Rule`, `Optimization` | flag sets, as Stage 1 | 1 | `RULES`, `OPTIMIZATIONS`, the axes that are off |
@@ -734,7 +739,7 @@ Provides.
 | symbol | signature | for Stages | stability |
 |---|---|---|---|
 | `Encoding` | `model`, `provenance`, `pruned`, `symbols`, `ortools` | 6-9, 13 | final; Stage 7 adds `boxes`, `capacity`, Stage 8 widens `model` |
-| `Provenance`, `Outcome`, `Pruned`, `PRUNED_SAMPLE` | above | 0, 6, 7, 8 | final |
+| `Provenance`, `Outcome`, `Pruned`, `PRUNED_SAMPLE` | above | 6, 7, 8 | final |
 | `OrToolsFamily` | `encode(graph) -> Encoding`; `ENCODES` (all eleven flags), `RULES`, `STEPS` (empty), `OPTIMIZATIONS` | 6, 7, 9, 11 | final; Stage 6 adds rules, step kinds and axes, Stage 7 adds `placement`, `solve`, `read_back` |
 | `OrToolsState` | `graph`, `capacity_units`, `tables`, `edges`, `ops`, `units`, `columns`, `tile_terms`; reached as `enc.ortools` | 6, 7, 10, 11 | final; Stage 6 adds `copies`, `relayout_literals`, `incoming`, `objective_stages`, Stage 7 adds `horizon`, `offsets`, `roof`, `placer` |
 | `begin`, `build_tables`, `encode_ops` | `(graph) -> Encoding`; `(enc) -> None`, no variables; `(enc) -> None` | 6, 7 | final |
@@ -790,8 +795,9 @@ Provides.
 - `test_rules_leave_a_pinned_entry`, `test_fact_and_always_rows_apply`,
   `test_pruned_sample_is_bounded`.
 - `test_per_core_units_match_the_graph_helper`: equal to Stage 1's on op tables.
-- `test_skip_set_is_empty_on_spyre`: on the corpus graphs, no node of a `SPYRE` graph skips a
-  constraint function or check.
+- `test_skip_set_is_empty_on_spyre`: on the mock ops from `tests/inductor/test_work_division.py`,
+  no node of a `SPYRE` graph skips a constraint function or check. The live arm asserts the
+  same on every compiled graph.
 - `test_core_split_off_gives_one_fixed_entry`: a target without `Optimization.CORE_SPLIT`
   gives every node the `_fixed_core_division` entry, `enumerated` false.
 - `test_coarse_tiling_off_tries_no_tiling`, `test_sizes_come_from_the_target`: core budget
@@ -819,7 +825,8 @@ Provides.
 - `test_post_folds_without_touching_the_proto`: for each of `when=False`, `expr=True`,
   `str(proto)` unchanged, and no constant variable appears.
 - `test_post_false_adds_no_variable`, `test_post_records_index_and_writes_no_name`.
-- `test_every_constraint_has_one_provenance`: on the corpus graphs.
+- `test_every_constraint_has_one_provenance`: on the `load_captures` and `synthetic_graphs()`
+  replay graphs. The live arm asserts it on every compiled graph.
 - `test_pinned_flags_add_nothing_to_the_proto`: with and without flags.
 - `test_pinned_stick_prunes_and_records`: a tightened `factors` removes entries, a `Pruned`
   record names the flag, and `div_n`'s domain shrinks.
@@ -841,13 +848,21 @@ Provides.
   the first differing constraint with its `Provenance`.
 
 `tests/inductor/test_lx_live_parity.py`
-- `test_live_parity[<fixed graph>-<cell>]`: a `fake` `record_compile` with the shadow
-  observer, for `FIXED_GRAPHS` minus `CARD_ONLY`, at `DEFAULT_CELL` and `TILING_CELL`. At
-  least one solve is seen, and its report has no section diff and no menu mismatch.
+- `test_live_parity[<name>-<config>]`, on the card: inside the live arm,
+  `TestBuildingBlocks(name).debug()` under
+  `torch._inductor.config.patch(force_disable_caches=True)`, for `name` in
+  `test__simple_attn` (softmax), `test_mlp` (swiglu), `test_rms_norm`, `test_flash_attention`
+  and `test_sdpa_lk_uses_for_each_tile`, at the default config and with `auto_coarse_tiling`
+  on. At least one solve is seen, and its report has no section diff and no menu mismatch.
 - `test_shadow_report_flags_a_changed_menu`: so the test above can fail.
 
-The parent plan's unit suites run serially. Its device suites run the old paths here,
-because no compile reaches `OrToolsFamily.encode`.
+Existing suites that stay green, run serially: `test_work_division`,
+`test_work_division_hint`, `test_frontend_work_bounds`, `test_scratchpad_solver`,
+`test_scratchpad_patterns`, `test_scratchpad_use`, `test_cooptimization_types`,
+`test_coarse_tiling`, `test_coarse_tile_split`, `test_solver_auto_coarse_tiling`,
+`test_solver_relayout_candidates`, `test_solver_relayout_decision`, `test_sa_cooptimizer`,
+and on the card `test_building_blocks` and `test_solver_relayout_e2e`. They run the old paths
+here, because no compile reaches `OrToolsFamily.encode`.
 
 What proves the claim: Gate 2 below, supported by
 `test_every_constraint_has_one_provenance` and `test_pinned_flags_add_nothing_to_the_proto`.
@@ -860,12 +875,13 @@ rules agree." A whole-proto diff is impossible here, because today's model has e
 placement content that does not exist until Stages 6 and 7 (Deviation 1). The gate below is
 what "empty" means until then.
 
-**Gate 1, production unchanged.** `lx_gate.sh` between this PR's parent and this PR: proto,
-status, objective, decisions and committed plan all identical. At the PR tip the tiers are
-`intree`, `fake` at both configs, `unit-*` and `failure`. At a commit they are `intree` and
-the fixed set. Any difference blocks the PR, because no production path should change. The
-PR reports `corpus_coverage` hits per feature, restickify features included. `fake` proves
-parity on default-layout inputs, not production plans.
+**Gate 1, production unchanged.** No production path reaches the new code. The only
+production edits are the three allocator extractions, with the methods delegating, and the
+recording in `work_division.py`, which does not change a candidate list. The existing suites
+under Tests stay green, on the card for the device ones, and
+`test_table_equals_enumerate_core_divisions` and `test_recorder_does_not_change_candidates`
+hold the moved code to the old behaviour. Nothing is compared across commits, because
+nothing is stored. Any failure blocks the PR, because no production path should change.
 
 **Gate 2, section diff.** `build_today(buffers, limit, alignment)` subclasses
 `CpSatLayoutSolver`, overrides the phase methods to record `(len(variables),
@@ -883,7 +899,9 @@ It then renumbers `vars`, `literals` and `enforcement_literal` in the constraint
 the kept order. Pass means `[str(v) for v in enc.model.proto.variables]` and the constraint
 strings are equal to the projection, lists in order, for every solve. Those are the only
 reference fields in kept ranges. Comparison is on text because the 9.15 `CpModelProto`
-wrapper has no `SerializeToString`, so "byte-identical" here means `proto_text`-identical.
+wrapper has no `SerializeToString`, so identity here means equal `str()` per variable and
+constraint. This is this stage's own unit test of the encoding. The Stage 5 model is never
+solved, so there is no plan to judge by the optimum until Stage 7.
 Stage 6 reuses `build_today` and `project_today` with a smaller drop set and writes no
 second comparator. At Stage 7 the drop set is empty.
 
@@ -902,20 +920,22 @@ that slot from `prefetch_menu`, the patch goes. `replay_table(buffer, limit)` ma
   `SPYRE` derived with `lx_bytes=limit` and `alignment=alignment`. `replay_encode` takes
   `tables`, so `build_division_tables` does not run. It covers `load_captures`,
   `synthetic_graphs()` and the hand-built cases. This tests emission, not the table.
-- **Live arm**, `lx_shadow_plugin`, a `pytest -p` plugin that is also an `Observer` factory
-  for `record_compile`. At `on_solve_begin` on a compile's joint solve it runs
+- **Live arm**, `lx_shadow_plugin`, a `pytest -p` plugin. Its fixture, also usable as a
+  context manager, wraps `CoOptimizingAllocator._solve` (`allocator.py:3218`) with
+  `mock.patch.object`, so it runs on every joint solve of whatever suite it is loaded into.
+  Before the legacy body runs, it runs
   `build_graph(ir, select_target(config))` and `replay_encode(graph, prefetches)`, with
   `prefetches` keyed by the graph's `InputNode`s in `graph.nodes` order, so prefetch order
   is compared. It then checks `table.entries ==
   buffer.core_divisions` for each op (with the rule's `Pruned` records on a mismatch) and
-  the section diff against `build_today(solver.buffers, solver.limit, solver.alignment)`.
-  It writes one report row per solve, and passes `enc.provenance` to `record_stage` under
-  an `LX_EQUIV_DIR` of its own, because a section model is not comparable with a base
-  recording. It runs on the `fake` zoo at both configs and on `unit-*`. This tests the
-  table, pins, flags and residency.
-- **CI arm**, `test_lx_live_parity.py`: the live arm on `fake` compiles of the fixed set at
-  both configs, labels `[unit, regression, trunk]`. It is what fails when a later main
-  commit changes `CpSatLayoutSolver` and not `ortools_encode.py`. Stages 6, 7 and 8 extend it, and
+  the section diff against `build_today(solver.buffers, solver.limit, solver.alignment)`,
+  and asserts the provenance invariant and an empty skip set on the compiled graph.
+  It prints one report row per solve, with the first differing constraint's `Provenance`,
+  and stores nothing. For P4 it is loaded into `test_building_blocks.py` on the card at
+  both configs. This tests the table, pins, flags and residency.
+- **CI arm**, `test_lx_live_parity.py`: the live arm around named `test_building_blocks.py`
+  compiles at both configs, on the card, labels `[unit, regression, trunk]`. It is what fails
+  when a later main commit changes `CpSatLayoutSolver` and not `ortools_encode.py`. Stages 6, 7 and 8 extend it, and
   Stage 13 removes it.
 
 A prototype of the replay arm passes on this snapshot, with a stand-in encoder reading
@@ -936,10 +956,13 @@ corpus has zero tiled entries. The live arm is the first comparison from a real 
 is listed by rule in the PR and justified or fixed.
 
 **Gate 4, parent's verification items.** Device suites pass on the card. Planning time:
-`lx_corpus.py timing BASE_TREE CHANGE_TREE --tier fake` alternates cold processes on live
-compiles and shows no growth beyond noise; only the delegates are on the production path.
-`build_today` against `encode` time is reported, not gated. The guards from #5682 live in
-Stage 0 and are reused as they are.
+`test_building_blocks.py` with `TORCH_SPYRE_TIMING=1` and `TORCH_SPYRE_TIMING_OUT` set, on
+this PR's parent and on this PR, alternating cold processes, shows no growth beyond noise;
+only the delegates are on the production path. The numbers go in the PR and are not
+stored. `build_today` against `encode` time is reported by the live arm, not gated. Stage 0
+carried the #5682 guards. This stage changes no production solve, so status, size and
+predicted runtime should not move, and the existing suites are where a move would show
+(Deviation 11).
 
 ## Risks
 
@@ -962,12 +985,12 @@ Stage 0 and are reused as they are.
   Gate 3 reports it by rule.
 - **#5695 lands first.** It changes when `_fixed_core_division` has a value and adds
   `divide_deferred_op` on pinned paths. The extractions conflict textually in
-  `_enumerate_core_divisions`. Rebase and re-record per the parent plan; the
+  `_enumerate_core_divisions`. Rebase; the
   `test_table_equals_enumerate_core_divisions` test and Gate 1 catch semantic drift. Stage
   2's pin values must come after the same call.
 - **OR-Tools behaviour differs off the pinned version.** Interning and `.index` were checked
   on 9.15.6755 only. `pyproject.toml` allows `ortools>=9.0`. The gate runs on the pinned
-  version, and baselines are per environment.
+  version. Nothing is recorded, so no baseline depends on the environment.
 - **A private rename breaks `build_today`.** It raises or skips a checkpoint, and
   `test_sections_match_today` fails.
 
@@ -1001,12 +1024,13 @@ Stage 0 and are reused as they are.
    identity.** Code: `plan_layout` uses `_LifetimeBufferWithCpVars`, with a constant footprint
    and no division (`ilp_solver_ortools.py:304`, `allocator.py:1542`). "Every division pinned"
    (Stage 13) would add the one-entry constants, so the protos cannot be identical.
-   Resolution: Gate 2 covers the joint path only. Gate 1 covers the rest. Committed mode has
+   Resolution: Gate 2 covers the joint path only. Gate 1, the existing suites, covers the rest. Committed mode has
    its own bar in Stage 9. Also not covered is `ExhaustiveSearchSolver`'s `prune=True`, which
    never reaches CP-SAT.
 7. **Plan: "replay the zoo captures on base and change, in one process and interleaved."**
    Code: two trees cannot share a process, and a capture cannot reach the graph layer.
-   Resolution: `lx_corpus.py timing`, alternating cold processes on live compiles.
+   Resolution: `TORCH_SPYRE_TIMING` records from `test_building_blocks.py`, alternating
+   cold processes on the two trees (Gate 4).
 8. **Plan: "the table entries each rule pruned are recorded."** The rejected combinations
    per op are unmeasured (menus reach 164 on the zoo, and the raw product is larger), and
    tiling multiplies them. Resolution: counts for all, entries up to `PRUNED_SAMPLE`, and
@@ -1019,6 +1043,13 @@ Stage 0 and are reused as they are.
     The encoding functions take the `Encoding` and no family, and Stages 6 and 7 post from
     their own functions. Resolution: `post`, `post_in`, `post_table`, `symbol` and `tag` are
     functions in `ortools_encode.py` that take the `Encoding` first.
+11. **Stage 0 is dropped (owner, PR #7, 2026-11-12).** Gate 1 was `lx_gate.sh` between the
+    parent commit and this PR, the live arm was a Stage 0 `Observer` on `fake` compiles of the
+    fixed set, and planning time came from `lx_corpus.py timing`. Resolution: Gate 1 is the
+    existing suites plus the two tests that hold the extractions. The live arm patches
+    `CoOptimizingAllocator._solve` itself and runs on card compiles from
+    `test_building_blocks.py`. Timing uses `TORCH_SPYRE_TIMING`. Gate 2's section diff stays
+    as this stage's own unit test of the encoding. Nothing is stored.
 
 ## Open questions
 
