@@ -1,7 +1,7 @@
 # LX allocator, Stage 9: `plan_allocation` and `optimize`
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2, 3, 4, 5, 6, 7, 8. Needed by: Stages 10, 11, 12, 13.
+Depends on: Stages 1, 2, 3, 4, 5, 6, 7, 8. Needed by: Stages 10, 11, 12, 13.
 
 All `file:line` citations are under `torch_spyre/_inductor/` unless they start with
 `tests/`, `docs/` or `torch/` (torch 2.13), or name a file at the repo root.
@@ -13,10 +13,11 @@ the whole new path end to end: `plan_allocation` selects the target and builds t
 `optimize` encodes, solves, reads back and runs `check_report`, and `plan_allocation`
 commits through a temporary bridge into today's commit code. The Failure decision of the
 parent plan holds on that path, and the Phase 2 exit gate has passed for the OR-Tools and
-SA families. The planner's source files reach the FX
-cache key, so every user recompiles once. The default stays `cpsat`, and with any existing
-`layout_solver` value the old path's plans are unchanged: same allocator, same CP model,
-same plans, same `SolveError` re-plan. No old code is deleted.
+SA families. Parity there means the proven optimum of the cost expression, tested in one
+process against the old path on the same compile, not identical plans. The planner's source
+files reach the FX cache key, so every user recompiles once. The default stays `cpsat`, and
+with any existing `layout_solver` value the old path runs unchanged: same allocator, same CP
+model and so the same optimum, same `SolveError` re-plan. No old code is deleted.
 
 ## Today
 
@@ -233,7 +234,7 @@ There is no optimizer object: each call builds its families and graph and keeps 
 ```python
 @dataclass
 class PlanOutcome:
-    """How one planning call ended, for logs, the timing record and the harness."""
+    """How one planning call ended, for logs, the timing record and the arm tests."""
     family: str                  # FAMILIES key whose solve decided the outcome
     status: str                  # that Solution.status.name
     first_status: str | None     # the primary's status name when fell_back
@@ -297,8 +298,8 @@ def optimize(graph, family, fallback, settings):
   rules that raised while being judged.
 - `_key_of(family)` is the `FAMILIES` key of `type(family)`.
 - `last_outcome()` returns the outcome of the most recent `plan_allocation` in this
-  process, as `last_cost_report` does for the cost report. Logs, the timing record, the
-  harness and #5682's Solve-status guard read it.
+  process, as `last_cost_report` does for the cost report. Logs, the timing record and
+  the arm tests read it. The arm tests' `fell_back` check is #5682's Solve-status check.
 
 `_solve_with(family, graph, settings, first_status=None)` runs one attempt and returns a
 private `_Solved(key, family, encoding, solution, first_status)`:
@@ -412,8 +413,8 @@ Stage 13 removes `SolveError`. Both raises then become `RuntimeError`, and an em
   ```
 
   This is deliberately louder than today's INFO: #5682 notes that a slow solve only shows
-  up as a worse plan. `outcome.fell_back` and `first_status` record it, and #5682's
-  Solve-status guard reads `last_outcome()`.
+  up as a worse plan. `outcome.fell_back` and `first_status` record it, and the arm tests
+  read `last_outcome()` for #5682's Solve-status check.
 
 ### `check_report` and `RuleViolation` in production
 
@@ -657,12 +658,11 @@ nothing until a caller sets its inputs.
 | `torch_spyre/ops/warning_types.py` | `LxPlanningWarning` |
 | `tests/inductor/test_spyre_optimizer.py` | New, device-free |
 | `tests/inductor/test_optimizer_bridge.py` | New, device-free, temporary |
-| `tests/inductor/test_spyre_optimizer_e2e.py` | New, device suite |
+| `tests/inductor/test_spyre_optimizer_e2e.py` | New, device suite: the failure-flow cases and the arm tests of Gates 2 to 4 |
 | `tests/inductor/lx_traffic.py` | New: `committed_hbm_traffic` |
+| `tests/inductor/lx_arms.py` | New: `run_arm`, `run_arms`, `ArmRun`, `ArmSolve`, `objective_on_old_expr` |
 | `tests/configs/torch_spyre_tests/inductor/test_{spyre_optimizer,optimizer_bridge,spyre_optimizer_e2e}_config.yaml` | New shards, per AGENTS.md "Tests must be selected" |
 | `tests/inductor/test_scratchpad_use.py`, `test_solver_auto_coarse_tiling.py` and others | Old-path spies patch `lx_route_to_families=False` |
-| `tests/inductor/lx_equivalence.py` | `hbm_traffic_bytes` and `outcome` in the committed-plan record, `SCHEMA_VERSION` bump, `decisions_from_graph`, `install` rows that open and close family solves, SA baseline patch |
-| `tests/inductor/lx_corpus.py` | `ortools` and `sa` cells, the arm comparison |
 | `docs/source/compiler/scratchpad_planning.md`, `co_optimizer.md` | Optimizer path and failure flow, and a link to it |
 | `AGENTS.md` | `FALLBACK_SOLVER`, `SPYRE_LX_ROUTE_TO_FAMILIES` in the env table |
 
@@ -675,18 +675,15 @@ suite green. Nothing calls the new code until commit 4.
 3. **Add the commit bridge.** Tested on mock graphs in the style of
    `tests/inductor/test_work_division.py:3590`.
 4. **Add `plan_allocation` and route `scratchpad_planning` to it.** Adds `family_key`,
-   `select_families`, `_greedy_replan`, `_context_switching_passes`. An empty Stage 0 diff
-   proves the default.
+   `select_families`, `_greedy_replan`, `_context_switching_passes`.
+   `test_old_values_never_reach_plan_allocation` and the unchanged old-path suites prove
+   the default.
 5. **Put the planner's sources in the FX key.**
 6. **Add committed mode.** The bridge branch, `divisions_committed` and the derived
    target `plan_allocation` builds.
-7. **Extend the harness.** Traffic, record fields with a `SCHEMA_VERSION` bump,
-   `decisions_from_graph`, cells, the SA baseline patch and the arm comparison. `install`
-   gains three rows, all in `OPTIONAL_TARGETS`: `SAFamily.solve` calls
-   `begin_solve(family="sa", solver="SAFamily")`; `OrToolsFamily.read_back` and
-   `SAFamily.read_back` then call `end_solve(decisions_from_graph(graph), ...)`; and
-   `_solve_with` closes the solve with its status when `not solution.ok`.
-   Without these an `ortools` or `sa` cell records nothing and `diff` compares nothing.
+7. **Add the arm helpers.** `lx_traffic.py` and `lx_arms.py`, with host tests of
+   `objective_on_old_expr` on hand-built buffers: index rebinding, an unfired copy, and
+   `None` for a division the old menu lacks.
 8. **Pin old-path spies with `lx_route_to_families=False`,** from the first run on each arm.
 9. **Add the device e2e suite.**
 10. **Document the optimizer path.**
@@ -697,9 +694,6 @@ suite green. Nothing calls the new code until commit 4.
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| Harness, corpus, regression guards | `install`, `ForcedFailure`, `Recorder`, `SCHEMA_VERSION`, `Cell`, `FIXED_GRAPHS`, `lx_zoo.MODELS`, `CARD_ONLY`; tiers `intree`, `fake`, `zoo`, `matrix`, `unit-*`, `failure`; `lx_gate.sh` | 0 | Every comparison. Extended, as stated in Changes |
-| `install` patching `SolveSettings.from_config` | `SolveSettings(DEFAULT_DTIME, workers=1, deterministic=True)` | 0, 7 | Deterministic arms |
-| Family recording | `OrToolsFamily.solve` harness rows, per ladder stage; `buffer_decision(decision, alignment) -> BufferDecision` | 7 | `decisions_from_graph`, forced failures |
 | `SpyreOptimizationGraph` | `.nodes`, `.data_edges`, `.pins`, `.target`, `.divisions_committed`, `.pins_on(target, what)`, `.step(node)` | 1, 2 | Everywhere |
 | `Target`, `select_target` | `Target` frozen, with `.alignment` and `.cost_model`; `select_target(config) -> Target` | 1, 2, 4 | `plan_allocation`, bridge addresses |
 | `OpNode` | `.name` equal to `op.get_name()`; `.op`; `.size`; `.work_split`; `.resident`; `.offset` in alignment units | 1 | Bridge |
@@ -713,9 +707,9 @@ suite green. Nothing calls the new code until commit 4.
 | `no_overlap` | `(graph) -> list[Violation]` | 3 | Bridge, staged outputs |
 | `RuleViolation` | `RuleViolation(violations)`, subclass of `Exception`, not of `SolveError` | 3 | `optimize` |
 | `coverage`, `Coverage` | `(family, target) -> Coverage(gaps, unused)`; only `gaps` refuses | 3 | `plan_allocation`, at config time |
-| `decisions`, `NodeDecision` | `(graph) -> dict[str, NodeDecision]` | 3 | `decisions_from_graph` |
-| `decode_todays_plan` | `(graph, allocation, accepted_relayouts) -> list[Mismatch]` | 3 | Baseline arms |
+| `decode_todays_plan` | `(graph, allocation, accepted_relayouts) -> list[Mismatch]` | 3 | `test_bridge_records_equal_todays_records` |
 | `SpyreCostModel` | `(params=ALLOCATOR_COST_PARAMS, *, traffic_only=False)`; `select_target` attaches `COST_MODELS.get(target.name)`, a `SpyreCostModel()` on `SPYRE`. With `traffic_only=True`, `priced_objective` returns `None` and `ladder` is `residency` alone, with no `cut_traffic`, as `plan_layout` prices it | 4 | Committed mode's derived target |
+| `priced_objective` equals today's | `priced_objective(graph, domains)` `==` today's `cost_expr` on the same domains | 4 | Gate 2 prices both arms with today's expression |
 | Objective degrade | `encode` handles an unusable objective internally, as flows 5, 6: ladder, relayouts pinned out, re-raise when `_cpsat_warn_on_cost_expr` is false | 4, 6, 7 | `optimize` stays one path |
 | `Family`, `Encoding` | `encode(graph) -> Encoding`, reading `graph.target.cost_model`; `solve(encoding, settings) -> Solution`; `read_back(solution, graph)`. `encode` does not mutate the IR, and added pins go through `graph.pin`. `encode` raises `Unsupported` for no legal division, as `allocator.py:3801` | 5, 7 | `optimize`, flow 13 |
 
@@ -723,7 +717,7 @@ suite green. Nothing calls the new code until commit 4.
 | `SolveStatus`, `Solution` | `.status: SolveStatus` (`OPTIMAL`, `FEASIBLE`, `INFEASIBLE`, `NO_PLAN`, `NO_PACKING`, `INVALID`); `.ok: bool`, holds a plan; `.objective` | 7 | `optimize` |
 | Solve contract | A later ladder stage that fails gives `NO_PLAN` and loses the earlier plan. A roof-induced infeasibility in packing mode is `NO_PACKING`. Only a model proven infeasible as posted reports `INFEASIBLE` | 7 | The flow table |
 | `SolveSettings` | `SolveSettings(time_limit, workers, deterministic)`; `from_config(config)`: `cpsat_time_limit_seconds`, `get_cpu_count()` workers, at least 2 interleaved under `deterministic` | 7 | `plan_allocation` |
-| `SAFamily` | `SAFamily.from_config(config)` is `SAFamily(seed=0)`. `status` is `SolveStatus.FEASIBLE`, never `ok=False` from search. Seed trouble is handled in seeding | 8 | Fallback, SA arm |
+| `SAFamily` | `SAFamily.from_config(config)` is `SAFamily(seed=0)`. `status` is `SolveStatus.FEASIBLE`, never `ok=False` from search. Seed trouble is handled in seeding. Its `Solution` has `score_ns()`, today's `best_score` at the same seed | 8 | Fallback, SA arm |
 | SA level 4 | Zero check reports at default and `AUTO_COARSE_TILING=1`; the tiling filter is a listed rule difference | 8 | Entry condition |
 
 ### Provides
@@ -733,7 +727,7 @@ suite green. Nothing calls the new code until commit 4.
 | `plan_allocation` | `(ir, config) -> SpyreOptimizationGraph`, in `lx_allocator/optimizer.py`: `select_families`, `select_target`, `coverage`, `build_graph`, `optimize`, then commit when `outcome.decided` | 10, 11, 12, 13 | final; Stage 10 replaces the bridge call with `commit(graph)` |
 | `optimize` | `(graph, family, fallback, settings) -> PlanOutcome`; never touches the IR | 10, 11 | final |
 | `_context_switching_passes` | `() -> list[ScratchpadOptimizationPass]`, run by the bridge, and by `commit` from Stage 10 | 10, 13 | final |
-| `PlanOutcome`, `last_outcome` | Fields above; `.status` holds `SolveStatus.name`; `last_outcome() -> PlanOutcome \| None`, the latest `plan_allocation` in the process | 11, 12; recorded by the harness | final |
+| `PlanOutcome`, `last_outcome` | Fields above; `.status` holds `SolveStatus.name`; `last_outcome() -> PlanOutcome \| None`, the latest `plan_allocation` in the process | 11, 12; read by the arm tests | final |
 | `_fall_back`, `_return_infeasible` | `(graph, fallback, settings, first) -> _Solved`; `(graph, solved) -> PlanOutcome` | 13 | final; Stage 13 changes `_fall_back`'s raises |
 | `solve_decides_work_division()` rule | false wherever `family_key(config)` is not `None` | 11, 13 | final; Stage 11 turns it true on a held plan |
 | `family_key` | `(config) -> str \| None`, in `lx_allocator/optimizer.py`; `None` sends the compile to the old path | 11, 12, 13 | final; `None` return removed in Stage 13 |
@@ -746,10 +740,7 @@ suite green. Nothing calls the new code until commit 4.
 | `_greedy_replan` | `(graph, error, post_passes) -> None` | 13 | temporary, removed in Stage 13 |
 | `records_from_graph`, `_CommitBridge`, `_commit_via_bridge` | Above | 10 | temporary, removed in Stage 10 |
 | `committed_hbm_traffic` | `tests/inductor/lx_traffic.py`, `(graph: GraphLowering) -> int` | 10, 11, 12 | final |
-| `hbm_traffic_bytes`, `outcome` | Committed-plan record fields, with a `SCHEMA_VERSION` bump | 10, 11, 12 | final |
-| `decisions_from_graph` | `(graph) -> dict[str, BufferDecision]`, in `lx_equivalence.py`, over Stage 3's `decisions` and Stage 7's `buffer_decision` | 10, 12 | final |
-| `ortools` and `sa` cells | `Cell(layout_solver="ortools")`, `Cell(layout_solver="sa")` in `lx_corpus.py` | 10, 12, 13 | final |
-| SA baseline patch | `LxContextSwitchingPass` in `select_allocator`'s SA branch, test-side in `lx_equivalence.py` | 12 | temporary, removed in Stage 13 |
+| Arm helpers | `tests/inductor/lx_arms.py`: `run_arm(case, *, new_path, **config_patch) -> ArmRun`, `run_arms(case, **config_patch) -> (old, new)`, `objective_on_old_expr(old, records) -> float \| None`; one process, nothing stored | 10, 12 | final until Stage 13 removes the old arm |
 | Gate 3 protocol, Gate 4 report | Parity and gates | 12 | final |
 | CI wiring | `_test_matrix.yaml` inputs `lx_route_to_families` and `layout_solver`, exporting `SPYRE_LX_ROUTE_TO_FAMILIES` and `LAYOUT_SOLVER`, unset when empty; dispatch-only `lx_planner_compare.yaml` | 12, 13 | temporary; Stage 13 removes `lx_route_to_families`, and the rest goes with the lane, whichever of Stage 13 and 12c lands last |
 | Timing stages `lx:encode`, `lx:solve`, `lx:read_back`, `lx:check` | `timing_recorder.stage` names, with `family` | 12 | final |
@@ -786,6 +777,7 @@ Stage 1 types. Tests that need commit drive `plan_allocation` with the bridge pa
 | `test_debug_greedy_shaped_family_runs_the_normal_path` | A registered family whose `encode` returns a bare `Encoding` and whose `Solution` is `FEASIBLE` with nothing resident goes through check and commit, as primary and as fallback |
 | `test_family_key_routes_family_keys` | Replaces Stage 7's `test_select_allocator_rejects_ortools_until_routed`: `"ortools"` reaches `plan_allocation` |
 | `test_family_key_is_none_for_old_values` | Every value of `layout_solver` not in `FAMILIES` |
+| `test_old_values_never_reach_plan_allocation` | Every old `layout_solver` value × `co_optimizing_lx_planning`, routing off: `plan_allocation` is never called, and `select_allocator()` returns today's class and post passes |
 | `test_routing_maps_only_the_two_legacy_values` | `greedy`, `firstfit`, `bestfit` stay on the old path |
 | `test_family_is_built_from_config` | `FAMILIES[key].from_config(config)`: `auto_coarse_tiling` reaches the family |
 | `test_ortools_absent_promotes_the_fallback` | `ImportError`: fallback becomes primary, warning once |
@@ -837,6 +829,26 @@ softmax and MLP cases of `test_scratchpad_use.py`:
   an LX-resident buffer, using the op in `tests/inductor/test_lx_context_switching.py:85`,
   gets dump and restore clones on the SA family.
 
+The arm tests of Gates 2 to 4 run over the arm cases in Parity and gates:
+
+- `test_joint_arm_reaches_todays_optimum[case]`: OR-Tools, tiling off, Gate 2's joint rule.
+- `test_joint_tiling_arm_compiles[case]`: OR-Tools at `AUTO_COARSE_TILING=1`, numerics and
+  no fallback only, until #6124.
+- `test_sa_joint_arm_scores_as_today[case, tiling]`: Gate 2's SA rule.
+- `test_committed_arm_traffic[ortools, sa]`: Gate 2's committed bands, over all cases in one
+  test, since the geomean and the seed median need them all.
+- `test_bridge_records_equal_todays_records[case]`: on the old joint arm only, a wrapper of
+  `CoOptimizingAllocator._finalize_lx_relayout_allocation` (`allocator.py:3453`), the
+  first step after the solve and before any IR edit, calls the original, then builds the
+  graph, puts today's plan on it with `decode_todays_plan(graph, allocation, accepted)`,
+  and compares `records_from_graph(graph)` with `allocation`: the same names in the same
+  order, and per name the address, spill reason, the chosen division's splits,
+  `reduction_syms` and tiling, and `chosen_relayouts` keys and addresses. The compile then
+  goes on unchanged. This is the direct test of the bridge on real graphs, at equal
+  decisions, compared in process.
+- `test_planning_time_report`: Gate 3. Skipped unless `TORCH_SPYRE_TIMING=1`.
+- `test_forced_timeout_fallback_report`: Gate 4.
+
 ### Existing suites
 
 Unit, serial, on every commit: `test_scratchpad_solver`, `test_solver_relayout_decision`,
@@ -850,9 +862,10 @@ Device suites: `test_scratchpad_use`, `test_work_division`, `test_solver_relayou
 shards, and the new e2e file.
 
 **What proves the claim.** `test_spyre_optimizer.py`, one test per row of the flow table,
-plus the forced-timeout e2e tests, prove the failure flow. An empty Stage 0 diff on commit
-4 proves the default path. The two source-key tests prove the FX key. The gate below proves
-the Phase 2 exit.
+plus the forced-timeout e2e tests, prove the failure flow.
+`test_old_values_never_reach_plan_allocation` and the old-path suites above, unchanged,
+prove the default path. The two source-key tests prove the FX key. The gates below prove
+the Phase 2 exit. Nothing here has been run.
 
 ## Parity and gates
 
@@ -862,24 +875,34 @@ device suites pass; HBM traffic is no worse than today's on the suites and the z
 mode (every division pinned); planning time on the zoo stays within run-to-run noise of
 today's."
 
-### Tiers and entry conditions
+Parity on a priced solve means the proven optimum of the cost expression, not an identical
+plan or proto. Both arms reach `OPTIMAL` at an equal `objective_ns`, which is
+`_evaluate(expr, solved_bindings(buffers))` (`plan_solver.py:567`, `:542`) on the plan that
+came back, the value `cost_expr_record` writes (`:574`). A different plan at an equal cost
+is a tie and passes. The uniqueness probe (`_is_unique_solution`,
+`ilp_solver_ortools.py:794`) is a diagnostic and never gates. No plan or objective is
+stored: every comparison runs both arms in one process and compares there.
 
-Every gate runs HEAD's harness over the base tree, through `lx_gate.sh`.
+### Where each check runs
 
-- **Commit level:** `intree` and the fixed set.
-- **PR tip:** all tiers, including `matrix`, with `zoo` once on the card as calibration.
-  Numeric device suites stay on the card. Fake inputs use default layouts, so `fake` proves
-  parity, not production plans. A model `fake` cannot reach stays card-only and is listed.
-  The PR reports hits per coverage feature, including the restickify features.
+- **Commit level:** the device-free files, `test_spyre_optimizer.py` and
+  `test_optimizer_bridge.py`, and the unit list under Tests.
+- **PR tip:** Gates 1 to 4 on a card runner, where CI test jobs run. Gate 1 by dispatch of
+  `lx_planner_compare.yaml`. Gates 2 to 4 are the arm tests in
+  `test_spyre_optimizer_e2e.py`.
 - **Entry conditions:** Stage 8's level 4 reports are zero at default and at
   `AUTO_COARSE_TILING=1`, because any report is fatal on this path. P3 has run (Committed
   mode).
 
 ### Default path
 
-Stage 0 harness, parent of this PR against this PR, default config and every
-`layout_solver` × `co_optimizing_lx_planning` combination of the old values. Empty diff in
-proto, decisions and committed plans. Any difference blocks.
+With any old `layout_solver` value, `family_key` returns `None` and `scratchpad_planning`
+runs today's code, with only `_greedy_replan` and `_context_switching_passes` extracted. The
+old path keeps today's allocator and CP model, so it keeps today's optimum. The direct test
+is `test_old_values_never_reach_plan_allocation`, over every `layout_solver` ×
+`co_optimizing_lx_planning` value. `TestSelectAllocator`, `TestSolveErrorFallback` and
+`TestCpSatTimeoutFallback` (`tests/inductor/test_scratchpad_use.py:1617`, `:1567`, `:1473`)
+and the suites under Tests stay green without edits, apart from the spies of commit 8.
 
 ### Arms
 
@@ -895,8 +918,72 @@ one build, and deeptools differences cannot enter.
 | SA, joint, tiling | same, `AUTO_COARSE_TILING=1` | same | same |
 | SA, committed | same, `CO_OPTIMIZING_LX_PLANNING=0` | same | `ScratchpadAllocator` + `SimulatedAnnealingLayoutSolver` |
 
-Joint SA baselines are run with `LxContextSwitchingPass` patched into the SA branch of
-`select_allocator` (Deviations).
+Joint SA arms are compared on the score before commit, which `LxContextSwitchingPass` does
+not change, so the SA baseline needs no patch (Deviation 6).
+
+### How an arm test runs
+
+`tests/inductor/lx_arms.py` holds the helpers.
+
+```python
+@dataclass
+class ArmSolve:
+    status: str                  # SolveStatus name, or today's StatusName
+    objective_ns: float | None   # today's cost_expr on this arm's plan
+    score_ns: float | None       # SA arms only
+
+@dataclass
+class ArmRun:
+    solves: list[ArmSolve]       # in solve order
+    fell_back: bool              # a greedy re-plan or a family fallback ran
+    traffic: list[int]           # committed_hbm_traffic per graph, in order
+
+def run_arm(case: Callable[[], None], *, new_path: bool, **config_patch) -> ArmRun: ...
+def run_arms(case: Callable[[], None], **config_patch) -> tuple[ArmRun, ArmRun]: ...
+def objective_on_old_expr(old: OldSolve, records: list[CoreDivisionBuffer]) -> float | None: ...
+```
+
+- `case` is an existing test body. It keeps its own assertions against CPU, so every arm
+  run also checks values.
+- `run_arm` patches `force_disable_caches=True`, as `test_scratchpad_use.py:254` does, and
+  `lx_route_to_families=new_path`, so a case that patches `layout_solver` itself still
+  lands on the arm's family. It calls `torch.compiler.reset()` before and after.
+  `run_arms` runs the old arm, then the new one.
+- **Old arm.** A wrapper of `CpSatLayoutSolver.plan_layout_and_core_divisions`
+  (`ilp_solver_ortools.py:699`), or of `SaCoOptimizingSolver`'s (`sa_cooptimizer.py:778`),
+  keeps an `OldSolve`: the `cost_expr` argument, the returned buffers,
+  `last_solve_stats["status"]` (`ilp_solver_ortools.py:1347-1354`) and, for SA,
+  `score_ns()` (`sa_cooptimizer.py:1418`). Its `objective_ns` is
+  `_evaluate(cost_expr, solved_bindings(result))`. A greedy re-plan is counted on
+  `GreedyLayoutSolver.plan_layout`, as `test_scratchpad_use.py:1495-1509` does.
+- **New arm.** A wrapper of `optimizer_bridge.records_from_graph` keeps the records the
+  bridge commits, and a wrapper of `SAFamily.solve` keeps `score_ns()`. `last_outcome()`
+  gives `status` and `fell_back` after each solve.
+- **`objective_on_old_expr`** gives the new arm's `objective_ns`: the paired old solve's
+  `cost_expr` under `solved_bindings(records)`, with two corrections. Each
+  `division_<name>` is rebound to the position of that record's division in the old
+  solve's `core_divisions` for the same name, matched by splits, `reduction_syms` and
+  tiling, because the bridge writes index 0. An old buffer with no record binds `is_lx`
+  to 0, which is an unfired relayout copy. A missing name that is not a copy, a division
+  the old menu lacks, or a symbol left unbound gives `None`, and the test fails on it.
+  Stage 4 makes `priced_objective` equal to today's `cost_expr` on the same domains, so
+  this is also the new path's own objective, and both arms are priced by one expression.
+- **Traffic.** A pass appended after the pre-scheduling list, through
+  `CustomPreSchedulingPassesWithOurPasses` and `pre_scheduling_iterating_pass`
+  (`test_scratchpad_use.py:221`, `:283`), calls `committed_hbm_traffic(graph)` on the
+  final IR.
+- **Pairing.** Solves pair by order within one case. Both arms compile the same function
+  after a reset with caches off, so buffer names agree, as `test_scratchpad_use.py:1004`
+  states. A different solve count fails.
+
+**Arm cases.** The bodies of `test__simple_attn`, `test_mlp`, `test_rms_norm`,
+`test_flash_attention` and `test_sdpa_lk_uses_for_each_tile` in
+`tests/inductor/test_building_blocks.py` (`:76`, `:103`, `:130`, `:319`, `:378`), each run
+on a fresh `TestBuildingBlocks` instance, and the softmax and MLP factories of
+`ParameterizedScratchpadUsage` (`test_scratchpad_use.py:526-547`), compiled and checked as
+its `run_case` does. They need a card. No buffer-level graph is used:
+`plan_allocation` needs a live `GraphLowering`, which `cooptimization_capture_loader.py` and
+`synthetic_cooptimization_graphs.py` do not have.
 
 ### Gate 1: suites
 
@@ -918,11 +1005,11 @@ Joint SA baselines are run with `LxContextSwitchingPass` patched into the SA bra
   `test_solver_auto_coarse_tiling.py`. The full list goes in the PR, and each exclusion
   needs an equivalent test on the new path or a line saying why none applies.
 
-### Gate 2: HBM traffic
+### Gate 2: the optimum, and HBM traffic
 
-**Metric.** `committed_hbm_traffic(graph)` runs at the end of the pre-scheduling pass list
-on the final `GraphLowering`, so both arms are judged by the same code from what was
-actually committed, not by anything a solver reports:
+**Traffic metric.** `committed_hbm_traffic(graph)` runs at the end of the pre-scheduling
+pass list on the final `GraphLowering`, so both arms are judged by the same code from what
+was actually committed, not by anything a solver reports:
 
 ```python
 total = 0
@@ -936,34 +1023,35 @@ for op in all_ops(graph.operations):
 The byte size is the one `compile_and_collect_mem_usage` uses
 (`tests/inductor/test_scratchpad_use.py:315`). `measure_hbm_transfers` counts each HBM
 buffer once however often it is read, so it is not reused. Context-switch dumps, copy-outs
-and LX prefetches are charged. Symbolic trip counts count as 1 and are flagged. The harness
-stores the value as `hbm_traffic_bytes` in the committed-plan record.
+and LX prefetches are charged. Symbolic trip counts count as 1 and are flagged. The arm
+tests compute it on each arm's IR in the same process and keep nothing.
 
-**Corpus.** Suites: the `unit-*` tiers. Zoo: the `fake` tier, every model of
-`lx_zoo.MODELS` not in `CARD_ONLY`. Both need a live `GraphLowering`, which is why captures
-cannot serve here. Granite is reported if available and does not gate.
+**Corpus.** The arm cases above, which stand for the parent's "suites and the zoo" (Open
+questions).
 
-**Settings.** Stage 0's deterministic settings on both sides: `install` patches
-`SolveSettings.from_config`, so OR-Tools gets one worker, seed 0 and the same deterministic
-budget, with no wall-clock limit. SA uses its fixed seed, and seeds 0 to 4, set test-side,
-on the committed arm.
+**Settings.** No determinism patch. The joint rule compares proven optima, which do not
+depend on worker count or search order. A priced solve that stops short of `OPTIMAL` on
+either arm fails the test, because it proves nothing; the fix is a larger
+`cpsat_time_limit_seconds` for that case in the test, not a looser rule. SA runs at its
+fixed seed, and the committed SA arm at seeds 0 to 4, set test-side.
 
-**Pass rule.** Records pair by (test id or model, solve index). An unpaired solve fails.
+**Pass rule.**
 
 | arm | pass |
 |---|---|
-| Joint, both families, with and without tiling | Identical plans (clones, relayouts, addresses, divisions). A non-identical plan is a failure even if traffic falls. On SA at tiling, a difference from Stage 8's listed tiling filter goes in the PR instead |
-| OR-Tools committed | Per solve, the traffic objective is no worse when both sides are `OPTIMAL`. `hbm_traffic_bytes` against baseline: up to 1.001 ok, up to 1.04 with a reason, above that fail. Geomean at most 1.000 |
-| SA committed | Per corpus, total `hbm_traffic_bytes`, median over five seeds, no higher than the baseline's. A changed plan is accepted as a listed plan change at Stage 13 C4 |
+| OR-Tools joint, tiling off | Per solve, both `OPTIMAL`, `objective_ns` equal to a relative 1e-9, and neither arm fell back. A different plan at that cost is a tie and passes |
+| OR-Tools joint, tiling on | Today `auto_coarse_tiling` withholds the cost expression from CP-SAT (flow 7) and the ladder ranks plans, on both arms, so there is no optimum to compare. Numerics and no fallback only. When the torch-spyre stack #6121-#6126 lands, #6124 removes that bypass, CP-SAT ranks tilings by `cost_expr`, and the row above applies |
+| SA joint, tiling off and on | Per solve, equal `score_ns()` at seed 0, and neither arm fell back. SA proves no optimum, so its parity is Stage 8's: the same score at the same seed (Open questions). `objective_ns` is reported. On SA at tiling, a difference from Stage 8's listed tiling filter goes in the PR instead |
+| OR-Tools committed | Both arms `OPTIMAL`. `committed_hbm_traffic` against the old arm, per case: up to 1.001 ok, up to 1.04 with a reason, above that fail. Geomean over the cases at most 1.000. Committed mode has no cost expression on either arm: the old arm is the placement-only ladder (`ilp_solver_ortools.py:687`), so the measure is traffic from the committed IR, not a ladder objective |
+| SA committed | Total `committed_hbm_traffic` over the cases, median over five seeds, no higher than the old arm's. A changed plan is accepted as a listed plan change at Stage 13 C4 |
 
 A failure is fixed, or justified by rule in the PR, as the parent's Stages preamble
-requires, and a justified one needs the owner's sign-off. A `status` other than `OPTIMAL`
-on either side is listed, because it means the comparison ran into a budget. The bands are
-Stage 12's, so Phase 2 exit and the flip read one number.
+requires, and a justified one needs the owner's sign-off. The bands are Stage 12's, so
+Phase 2 exit and the flip read one number.
 
 **Report, not gating.** Predicted total from `SPYRE_DUMP_COST=1`
-(`last_cost_report.total_us`), read from the final IR for both arms, with any increase over
-0.1% listed, the threshold in `sa-vs-cpsat-REPORT.md`.
+(`last_cost_report.total_us`), read from the final IR of both arms in the same process,
+with any increase over 0.1% listed, the threshold in `sa-vs-cpsat-REPORT.md`.
 
 **Expected on committed arms.** Neither is measured. `#5676`'s 80/80 "same plans" result
 predates its priced pinned menus and does not carry over. SA is the weakest arm: the
@@ -975,22 +1063,24 @@ until then.
 ### Gate 3: planning time
 
 The parent's Verification says to replay captures. That cannot time `build_graph`,
-`check_report` or the bridge, so this gate uses live `fake` compiles (Deviations).
+`check_report` or the bridge, so this gate times live compiles of the arm cases on a card
+runner (Deviations). It is `test_planning_time_report`, skipped unless
+`TORCH_SPYRE_TIMING=1`, and it prints its table for the PR.
 
-- **Run:** on the zoo, in one process per model, interleaved `A B B A` over
-  `torch.compiler.reset()`, three rounds, caches off, `TORCH_SPYRE_FRONTEND_ONLY=1`,
-  `TORCH_SPYRE_TIMING=1`. Separate processes vary by up to 25% per model (feasibility
-  report), which is why the arms share a process.
+- **Run:** in one process per case, interleaved `A B B A` over `torch.compiler.reset()`,
+  three rounds, caches off, `TORCH_SPYRE_TIMING=1`. Separate processes vary by up to 25%
+  per model (feasibility report), which is why the arms share a process. Compiles run in
+  full, because the cases run their kernels; the events measured exclude the backend.
 - **Measure:** `pass_loop_ns`, the `inclusive_ns` of
   `stage:CustomPreSchedulingPasses:pass_loop` (`passes.py:614`), plus the `lx:*` stages on
   the new path. If #5695 has landed, the new path runs `_distribute_work` and the old one
   does not, so a single pass's event would miss that work.
-- **Noise:** defined by the data, from the two `A` runs of each round: the per-model A/A
+- **Noise:** defined by the data, from the two `A` runs of each round: the per-case A/A
   spread and the total A/A spread.
 - **Pass:** median total on the arm ≤ median baseline total × (1 + total A/A spread).
-- **Listed, not failed:** a model whose median is over its own baseline by more than the
-  90th percentile of per-model A/A spread. A threshold on a quantile of the null flakes on
-  a no-op change. Models under 0.2 s are excluded per model, as the feasibility study did.
+- **Listed, not failed:** a case whose median is over its own baseline by more than the
+  90th percentile of per-case A/A spread. A threshold on a quantile of the null flakes on
+  a no-op change. Cases under 0.2 s are excluded per case, as the feasibility study did.
 - **Reported separately:** search time, since Stages 5 to 8 give the same model, and
   non-search time (`build`, `encode`, `read_back`, `check`, bridge), which is what this PR
   adds. If the gate fails, the Stage 3 check is the first place to look.
@@ -999,26 +1089,33 @@ The parent's Verification says to replay captures. That cannot time `build_graph
 
 ### Gate 4: failure flow on real graphs
 
-Not in the parent's exit, but it is what this stage adds, and Stage 0's corpus has one
-forced failure for it.
+Not in the parent's exit, but it is what this stage adds. It is
+`test_forced_timeout_fallback_report`.
 
-- `ForcedFailure` on the `fake` zoo, default config, `FALLBACK_SOLVER=sa`: every
-  model compiles, `check_report` reports nothing, `outcome.fell_back` is true.
-- Traffic of the SA fallback against the greedy re-plan (`fallback_solver=""`) per
-  model. **Report only** (Open questions), attached to the PR. Stage 12 needs it.
-- Reused #5682 guards: plan equivalence is Gate 2's joint rule, and the Solve-status check
-  fails any unforced run with `outcome.fell_back`.
+- The forced timeout of `test_forced_timeout_falls_back` (`_zero_solver_timeout`, as
+  `tests/inductor/test_scratchpad_use.py:1477`) over the arm cases, default config,
+  `FALLBACK_SOLVER=sa`: every case compiles and matches CPU, `check_report` reports
+  nothing, `outcome.fell_back` is true.
+- Traffic of the SA fallback against the greedy re-plan (`fallback_solver=""`) per case,
+  both in one process. **Report only** (Open questions), attached to the PR. Stage 12
+  needs it.
+- #5682's guards: plan equivalence is Gate 2's joint rule, on the optimum, and the
+  Solve-status check is the arm tests' assertion that no unforced run has
+  `outcome.fell_back` or a greedy re-plan.
 
 ## Risks
 
 - **A plan differs only through the bridge.** Record order or copy-group numbering changes
-  clone order or names. Caught by the plan comparison in Gate 2 on identical protos, and
-  group numbering by `test_two_slot_spellings_are_one_group`. A pure renumbering of
-  relayout clones on one source is a listed difference, not a failure.
+  clone order or names. Caught by `test_bridge_records_equal_todays_records`, which
+  compares the bridge's records with today's at equal decisions, and group numbering by
+  `test_two_slot_spellings_are_one_group`. A renamed copy also leaves an old copy's symbol
+  unbound in `objective_on_old_expr`, which fails Gate 2. A pure renumbering of relayout
+  clones on one source is a listed difference, not a failure.
 
 - **A node exists with no matching record.** Stage 2 may build a node for an op that
   today's allocator leaves out of the solve. `commit_divisions` would then commit a split
-  today's path never touched. Caught by divisions in the committed-plan diff.
+  today's path never touched. Caught by the name comparison in
+  `test_bridge_records_equal_todays_records`.
 
 - **Check false positive in production.** A compile that worked now raises. Bounded by the
   Phase 1 exit and Gate 1, and the new path is opt-in until Stage 12.
@@ -1026,7 +1123,8 @@ forced failure for it.
 
 - **A user's deterministic run differs between arms.** Today it means one worker
   (`ilp_solver_ortools.py:1399-1403`), and `SolveSettings.from_config` gives at least 2
-  interleaved. `install` patches that away, so no gate sees it. Stage 7 chose this.
+  interleaved. Gate 2 compares proven optima, which do not depend on it, so no gate sees
+  it. Stage 7 chose this.
 
 - **`#5695` lands after this PR.** Its predicate must learn `family_key`. Caught by
   its agreement test, once extended.
@@ -1067,9 +1165,10 @@ forced failure for it.
    Plan: "`LxContextSwitchingPass` stays a separate pass" after commit. Code:
    `allocator.py:5432-5435` omits it while `enable_lx_context_switching` turns the guard
    off, a bug on main.
-   Resolution: the pass runs for every family. Joint SA baselines are run with it patched
-   in, so the extra dumps are not read as a traffic regression. The old path is left
-   unchanged, as this stage must leave it, and the plan assumes no upstream fix.
+   Resolution: the pass runs for every family. Joint SA arms are compared on the score
+   before commit, which the pass does not change, so the baseline needs no patch. The old
+   path is left unchanged, as this stage must leave it, and the plan assumes no upstream
+   fix.
 7. **Selecting a family with `layout_solver` alone cannot run the suites.**
    Plan: "with each new family selected in turn". Code: tests patch `layout_solver`
    (35 sites to the two solvers).
@@ -1079,7 +1178,8 @@ forced failure for it.
 8. **Planning time cannot use replayed captures.**
    Plan's Verification: replay zoo captures. Code: `build_graph` and the bridge need a live
    `GraphLowering`.
-   Resolution: live `fake` compiles, interleaved in one process.
+   Resolution: live compiles of the arm cases on a card runner, interleaved in one
+   process.
 9. **`_stage_collective_outputs` runs after the check.**
    Plan: "a single solver-free check judges every plan". Code: it gives a spilled buffer an
    address and moves no chosen one, after the solve (`allocator.py:3525-3646`).
@@ -1093,6 +1193,15 @@ forced failure for it.
     report exists. The parent's entry point reads `FAMILIES[config.fallback_solver]`
     unconditionally; here an empty value gives no fallback family, and a solve with no
     plan raises `SolveError` to the greedy re-plan.
+11. **Stage 0 is dropped (owner, PR #7, 2026-11-12).**
+    Plan: every stage runs the Stage 0 harness; this stage's gates ran on its tiers through
+    `lx_gate.sh`, with a card calibration and the `matrix` tier for the default path.
+    Resolution: no harness, golden or recording. The default path is proven by
+    `test_old_values_never_reach_plan_allocation` and the old-path suites, unchanged. Gates
+    2 to 4 are arm tests in this PR: each existing test body runs on both arms in one
+    process on a card, and the test compares the proven optimum of today's cost expression
+    (`objective_ns`), SA's score at the same seed, or committed traffic, and stores nothing.
+    `test_bridge_records_equal_todays_records` tests the bridge at equal decisions.
 
 ## Open questions
 
@@ -1101,6 +1210,16 @@ forced failure for it.
    planner relayouts and SA does not. Recommendation: a report, since a fallback is rare and
    SA searches divisions. If it is a gate, Stage 12's flip also needs SA fallback traffic no
    worse than greedy, and `fallback_solver` may stay `""` longer.
+2. **Do the arm cases stand for the parent's "the zoo"?** The Phase 2 exit names the zoo for
+   traffic and planning time, and with Stage 0 dropped there is no zoo copy in torch-spyre.
+   Recommendation: yes, the building-block and `test_scratchpad_use` cases in Parity and
+   gates. If the owner wants the zoo too, run it by hand once on a card with `run_arms`
+   and attach objectives and times to the PR as a report, not a gate.
+3. **What is parity where no optimum is proven?** SA never proves one, and committed mode
+   has no cost expression on either arm, so the old arm is the ladder. Recommendation: SA
+   joint arms pass on equal `score_ns()` at seed 0, which is Stage 8's claim; committed
+   arms pass on `committed_hbm_traffic` with Gate 2's bands. Neither gates on a ladder
+   objective.
 
 ## Out of scope
 
