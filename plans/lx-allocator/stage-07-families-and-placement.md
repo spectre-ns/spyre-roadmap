@@ -1,7 +1,7 @@
 # LX allocator, Stage 7: Families and placement
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2, 3, 4, 5, 6. Needed by: Stages 8, 9, 10, 11, 12, 13.
+Depends on: Stages 1, 2, 3, 4, 5, 6. Needed by: Stages 8, 9, 10, 11, 12, 13.
 
 ## Goal
 
@@ -10,9 +10,10 @@ solves and reads back, and satisfies the `Family` protocol. Its `encode` records
 placement box in the `Encoding`. Its `solve` places them in one of two modes, set by its
 `placement` field, `no_overlap` (what today does) or `pack` (new), runs the objective stages
 and returns a `Solution`. Its `read_back` decodes that solution onto the graph. `FAMILIES`
-maps a `config.layout_solver` value to the family. In `no_overlap` mode the whole model is
-compared with today's for the first time, and every solve in the sequence must be
-byte-identical. Nothing in production calls the family yet. `select_allocator`,
+maps a `config.layout_solver` value to the family. In `no_overlap` mode, on real compiles from
+the existing suites, the family and `CpSatLayoutSolver` both reach `OPTIMAL` at an equal
+cost-expression value, and a unit test compares the whole model's text with today's for the
+first time. Nothing in production calls the family yet. `select_allocator`,
 `scratchpad_planning` and every existing solver are unchanged, and `config.layout_solver`
 still defaults to `"cpsat"`.
 
@@ -179,7 +180,7 @@ bytes multiplies by `graph.target.alignment` at the edge. A relayout step's `sou
 
 ### Native posting stays in encode order
 
-A `solve` that posts offsets and the no-overlap cannot give a byte-identical proto, because today's `off_`
+A `solve` that posts offsets and the no-overlap cannot give today's proto, because today's `off_`
 variables sit among the buffer variables and the no-overlap sits before the residency gates. Canonicalizing the
 diff would not settle it: shuffling the order the buffers are visited changed decisions on 21 of 30 tied toy
 models at one worker, seed 0. So the family posts at today's positions during `encode`, through a placer:
@@ -376,18 +377,13 @@ exactly what today solves, and an `Encoding` is single-use, as a solver instance
 runs only after a `"cost"` stage that returned OPTIMAL, when the family's `uniqueness_check` field is set, so `solve` does not
 read config.
 
-### Under the harness
+### Where tests reach in
 
-Stage 0's stage hook sits on `CpSatLayoutSolver._solve_and_record`, which the family never calls, so this stage adds a row to
-`install` in `tests/inductor/lx_equivalence.py`. The record format does not change.
-
-| target | wrapper |
-|---|---|
-| `OrToolsFamily._run_stages` | Open the solve with `begin_solve(family="ortools", solver="OrToolsFamily")`. At each stage, through its one solve call `_solve_stage`, apply `SolveParams`, or dtime 0 if a `ForcedFailure` matches, take `proto_text` before the solve, and call `record_stage` after it with `provenance_record` of each `Provenance`. |
-| `SolveSettings.from_config` | Return `SolveSettings(DEFAULT_DTIME, workers=1, deterministic=True)`. |
-
-The parity plugin closes the solve with `end_solve`, building each `BufferDecision` with `buffer_decision(decision, alignment)`
-over Stage 3's `decisions(graph)`. A `ForcedFailure` gives `UNKNOWN`, which `_run_stages` returns as `NO_PLAN`.
+`_solve_stage` is the family's one solve call and has the signature of `CpSatLayoutSolver._solve_and_record`
+(`ilp_solver_ortools.py:1325`). A test that needs each solve's proto, parameters or status patches both methods with
+`monkeypatch` and reads them before calling through. A test that needs a stage to fail patches `_solve_stage` to return
+`cp_model.UNKNOWN` at that stage, which `_run_stages` returns as `NO_PLAN`. A test that needs deterministic settings
+passes a `SolveSettings` it builds. Nothing in the family reads test state.
 
 ### `SolveSettings`
 
@@ -418,7 +414,7 @@ class SolveSettings:
 | `cp_model_presolve` | False above threshold | same | same | same |
 
 The default column equals today's non-deterministic parameters field for field, and a test compares them. The field stays
-`num_search_workers`, since existing tests and the harness read that one. The presolve
+`num_search_workers`, since existing tests read that one. The presolve
 threshold is an `OrToolsFamily` field read from config, and `solve` compares it with
 `len(enc.ortools.relayout_literals)`, so `SolveSettings` stays free of CP-SAT terms.
 
@@ -426,8 +422,9 @@ threshold is an `OrToolsFamily` field read from config, and `solve` compares it 
 results across identical runs on all 6 instances tested, while one worker without it repeated exactly, and two or more
 workers with it repeated exactly and agreed across 2, 4 and 8 workers. The agreement across worker counts held only where the
 solve reached OPTIMAL: my attempts to cut it with a budget overshot (budget 0.5, deterministic time 1.6 to 3.5), so it is
-unverified under a binding budget. `from_config` uses at least 2 interleaved workers for that reason. Stage 0's `install` gives
-the "deterministic, 1 worker" column, which matches `SolveParams`.
+unverified under a binding budget. `from_config` uses at least 2 interleaved workers for that reason. Nothing in production
+reaches the "deterministic, 1 worker" column. A test that wants it builds `SolveSettings(limit, workers=1, deterministic=True)`
+itself.
 
 ### `Solution`
 
@@ -612,8 +609,7 @@ integer `PlacementBox`es, and it registers `"sa"`. SA also has no use for `_Plac
 | `lx_allocator/family/base.py` | `Family`; `Encoding.boxes`, `.capacity` |
 | `lx_allocator/family/ortools_family.py` | `OrToolsFamily` fields, `from_config` and `__post_init__`; `encode` sets `enc.ortools.placer`; `solve`; `read_back`, with `solution` typed `Solution`; `CpSatSolution`, `_NativePlacer`, `_PackPlacer`, `_x_interval` |
 | `lx_allocator/family/ortools_encode.py` | `OrToolsState.horizon`, `.offsets`, `.roof`, `.placer`; `add_unit`, `encode_in_place` and `encode_placement` call the placer; `OpVars.offset`, `_post_shared_offset` and `_encode_capacity` removed |
-| `tests/inductor/lx_equivalence.py` | `install` rows for `OrToolsFamily._run_stages` and `SolveSettings.from_config`; `buffer_decision` |
-| `tests/inductor/lx_sections.py`, `lx_shadow_plugin.py`, `test_lx_live_parity.py` | drop set empty; the plugin also solves and decodes; whole proto on the fixed set |
+| `tests/inductor/lx_sections.py` | drop set empty |
 | `tests/inductor/test_lx_families.py`, `test_lx_packer.py`, `test_lx_ortools_solve.py`, `test_lx_read_back.py`, `test_lx_placement_parity.py` | new |
 | `tests/configs/torch_spyre_tests/inductor/test_lx_*_config.yaml` | one per new test file, `unlisted_test_mode: mandatory_success` |
 
@@ -622,12 +618,12 @@ Commits, each leaving the suite green:
 1. Config: the `"ortools"` value and `lx_placement`, with cache-key tests.
 2. `placement.py`: boxes, settings, statuses, `Solution`; the `Family` protocol, and `Encoding.boxes` and `capacity`, tested with `_NullFamily`.
 3. `packer.py` with its pure tests, including the differential against `_justify`.
-4. The `placement` field, box recording, `_NativePlacer` and the three calls, with provenance tags. Empty the `project_today` drop set. The whole proto of the first solve compares byte-identical.
-5. `OrToolsFamily.solve` running stages in native mode with parameters, and the harness rows. Ladder cases compare byte-identical, solve by solve.
+4. The `placement` field, box recording, `_NativePlacer` and the three calls, with provenance tags. Empty the `project_today` drop set. The whole proto of the first solve compares equal as text on the buffer-level graphs.
+5. `OrToolsFamily.solve` running stages in native mode with parameters. On the buffer-level graphs, which take the ladder, proto text and parameters compare equal solve by solve.
 6. The other `OrToolsFamily` fields and `registry.py`.
-7. `read_back` and `buffer_decision`, with their tests.
+7. `read_back`, with its tests.
 8. `_PackPlacer` and `_solve_packed` with their tests.
-9. `test_lx_placement_parity.py`, the plugin's solve and decode, `test_lx_live_parity.py` on the whole proto, and shard configs.
+9. `test_lx_placement_parity.py`, with its live cases on the card, and shard configs.
 
 ## Interfaces
 
@@ -635,30 +631,29 @@ Commits, each leaving the suite green:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| harness | `install`, `SolveParams`, `ForcedFailure`, `DEFAULT_DTIME`, `Recorder.begin_solve`, `.record_stage`, `.end_solve`, `proto_text`, `provenance_record(p) -> dict`, `BufferDecision`, tiers `intree`, `fake`, `unit-*`, `failure` | 0 | gate, harness rows |
 | `SpyreOptimizationGraph` | `.nodes` in op order, `.data_edges`, `.cuts: set[int]`, `.target`, `.step(node) -> int`, `.lifetime(node) -> tuple[int, int]` | 1 | `encode`, `read_back`, span test |
 | `Target` | `.lx_bytes`, `.alignment`, `.optimizations`, `.cost_model`; `SPYRE`, `TARGETS` | 1 | `Encoding.capacity`, bytes at the edge, coverage test |
 | `Restriction`, `Rule`, `Optimization`, `StepKind` | flag sets and the enum | 1 | `Family` class attributes |
 | decision fields | `OpNode.work_split`, `.resident`, `.offset`; `InputNode.prefetch_view`; `DataEdge.in_place`, `.steps`, `.add_step(step)`, `.insert_step(index, step)` | 1 | `read_back` targets |
 | `Step`, `STEP_KINDS` | `Step(kind=StepKind.RELAYOUT, to_view, reduction_split, source_view, source_footprint_bytes, destination_footprint_bytes)`; a restickify step's `pinned`, `realized_by`; `Step.resident`, `.offset`, `.footprint`, `.edges`; `STEP_KINDS[kind].order`, `.in_lx` | 1 | `read_back` |
 | `work_split_from_division` | `(node, division) -> WorkSplit` | 2 | `read_back` |
-| `build_graph`, `select_target` | `build_graph(ir, target)` with keyword defaults; `select_target(config) -> Target` | 2 | corpus runs |
-| `check_decisions`, `decisions`, `NodeDecision` | `(graph) -> list[Violation]`; `(graph) -> dict[str, NodeDecision]` | 3 | gate; pack proof |
+| `build_graph`, `select_target` | `build_graph(ir, target)` with keyword defaults; `select_target(config) -> Target` | 2 | live parity test |
+| `check_decisions`, `decisions`, `NodeDecision` | `(graph) -> list[Violation]`; `(graph) -> dict[str, NodeDecision]` | 3 | parity tests; pack proof |
 | `coverage`, `Coverage` | `(family, target) -> Coverage(gaps, unused)`; a forced step kind or a rule the family lacks is a gap, a chosen step kind or an optimization is only unused | 3 | coverage test |
-| `decode_todays_plan` | `(graph, allocation, accepted_relayouts) -> list[Mismatch]` | 3 | gate |
+| `decode_todays_plan` | `(graph, allocation, accepted_relayouts) -> list[Mismatch]` | 3 | decode test |
 | `ALWAYS` checks `in_place_conditions`, `boxes_fit_lx`; `RuleTag` | provenance rules, each tagged by its name string | 3 | `_Placer` |
 | `OrToolsFamily` | `encode(graph) -> Encoding`; `ENCODES`, `RULES`, `STEPS`, `OPTIMIZATIONS`; `read_back` raising `NotImplementedError` | 5 | extended |
-| `Encoding`, `OrToolsState`, `Provenance` | `model`, `provenance`, `pruned`, `symbols`, `ortools`; `OrToolsState.ops`, `.units` | 5 | extended |
+| `Encoding`, `OrToolsState`, `Provenance` | `model`, `provenance`, `pruned`, `symbols`, `ortools`; `OrToolsState.ops`, `.units` | 5 | extended; `symbols` binds the cost expression in the live test |
 | encoding functions | `add_unit(enc, table, *, size_units, boundary) -> OpVars`; `encode_placement(enc)`; `post`, `symbol`, `tag(enc, subject, rule, start)`; in `ortools_encode.py`, each taking `enc` first | 5 | hooks |
 | `OpVars`, `DivisionTable` | `table`, `name`, `units`, `in_buffer`, `division`, `eff_size`; `entries`, `residency`, `untiled_bar` | 5 | boxes, `read_back` |
-| `build_today`, `project_today`, `replay_graph`, `lx_shadow_plugin`, `test_lx_live_parity.py` | Stage 5 helpers and live arm | 5 | gate |
+| `build_today`, `project_today`, `replay_graph` | Stage 5 test helpers, buffer-level | 5 | proto tests |
 | `SolveStage`, `OrToolsState.objective_stages` | `SolveStage(name, expr, maximize=False)`; `name == "cost"` for the priced stage; `expr=None` for a constant cost; ladder names `residency`, `cut tiebreak`, `parallelism`, `division shape`, `tile count` | 6 | `_run_stages` |
 | `encode_in_place`, `OpVars.end`, `.start`, slot arithmetic | in-place loop over each node's incoming edges, `add_at_most_one` before `encode_placement`; `_Slots` values as `_encode_lifetimes` uses them | 6 | `tie`, boxes |
 | `_post_shared_offset`, `_encode_capacity` | Stage 6's parity helpers | 6 | replaced here |
 | `fired_relayouts`, `FiredRelayout` | `(enc, value) -> list[FiredRelayout]`; `gate`, `group`, `row`; raises unless exactly one row | 6 | `read_back` |
 | decode helpers | `joined_literal(enc, before)`, `in_place_literal(enc, edge)`, `copy_out_literal(enc, node)`, `via_full_literal(enc, edge)`, `prefetch_view(enc, node, value) -> PerCoreView`, `decision_variables(enc)` | 6 | `read_back`, uniqueness probe |
 | `OrToolsState.relayout_literals` | `dict[str, literal]`, group name to residency | 6 | presolve switch |
-| `edge_tables_from_buffers` | test helper | 6 | replay arm |
+| `edge_tables_from_buffers` | test helper | 6 | buffer-level tests |
 
 **Provides**
 
@@ -678,8 +673,7 @@ Commits, each leaving the suite green:
 | `OpNode.spill_reason` values | Stage 1's field, filled by `read_back` | 8, 9, 10 | final |
 | `config.layout_solver = "ortools"`, `config.lx_placement` | strings | 9, 12 | final |
 | `Solution.stats` | keys of today's `last_solve_stats` | 10 (cost dump) | final |
-| `OrToolsFamily._run_stages`, `._solve_stage` | harness targets | 9 | final |
-| `buffer_decision` | `(decision: NodeDecision, alignment: int) -> BufferDecision`, in `lx_equivalence.py`; `menu_index=None`, `relayouts={}` | 8, 9 | final |
+| `OrToolsFamily._run_stages`, `._solve_stage` | test patch points; `_solve_stage` has `_solve_and_record`'s signature | 9 | final |
 
 ## Tests
 
@@ -706,14 +700,14 @@ Commits, each leaving the suite green:
 `tests/inductor/test_lx_ortools_solve.py`, on hand-built encodings
 
 - `test_default_parameters_equal_today`: capture `SatParameters` through a patched `CpSolver.Solve` from `CpSatLayoutSolver` and `OrToolsFamily.solve` on one model, and assert equal text.
-- `test_harness_settings_match_solve_params`: `SolveSettings(DEFAULT_DTIME, workers=1, deterministic=True)` and `SolveParams.apply` agree as parsed values, where unset and `False`, and unset and `inf`, are equal.
-- `test_forced_failure_is_no_plan[stage]`: a `ForcedFailure` at a stage under `install` gives `NO_PLAN`, recorded through `record_stage`.
+- `test_one_worker_parameters_equal_today`: `SolveSettings(0, workers=1)` gives the parameters today sets with `config.get_cpu_count` patched to return 1 and a time limit of 0. The decode test relies on this.
+- `test_failed_stage_is_no_plan[stage]`: `_solve_stage` patched to return `UNKNOWN` at that stage gives `NO_PLAN`.
 - `test_placer_constraints_are_tagged[no_overlap, pack]`: every constraint has one `Provenance`, with the `"boxes_fit_lx"` or `"in_place_conditions"` check on placement's.
 - `test_deterministic_one_worker_parameters`, `test_deterministic_many_workers_parameters`, `test_zero_time_limit_sets_no_limit`, `test_presolve_switch_above_threshold`.
 - `test_deterministic_runs_repeat[1, 4]`: two runs give identical offsets and values. `test_interleaved_agrees_across_workers`: workers 2 and 4 agree on a model solved to OPTIMAL.
 - `test_ladder_locks_like_today`: lock constraints and solve count equal today's on a tiled model.
 - `test_single_stage_posts_no_lock`, `test_constant_cost_solves_without_objective`.
-- `test_status_mapping`: INFEASIBLE at the first stage, UNKNOWN to `NO_PLAN`, a forced failure at a later stage to `NO_PLAN`.
+- `test_status_mapping`: INFEASIBLE at the first stage, UNKNOWN to `NO_PLAN`, a patched failure at a later stage to `NO_PLAN`.
 - `test_offsets_keep_solver_values_when_justify_cannot_fit`.
 - `test_pack_model_differs_only_by_placement`: the two protos differ by exactly the entries listed in Design.
 - `test_pack_in_place_pair_shares_offset`: a fired in-place overwrite gives both boxes one offset.
@@ -735,72 +729,118 @@ Commits, each leaving the suite green:
 - `test_relayout_inserted_before_pinned_restickify`, `test_steps_keep_list_order`: nothing sorts `steps`.
 - `test_copy_out_shared_per_producer`, `test_cut_graph_output_leaves_no_step`, `test_cuts_decoded[joined, not_joined, segment_break]`: `graph.cuts` holds the tick before each cut and no other.
 - `test_restickify_node_decodes_as_a_node`: the pinned step's fields stay unset.
-- `test_buffer_decision`: decoded units scale to `address`, and fields map from `NodeDecision`.
 
-`tests/inductor/test_lx_placement_parity.py` is the CI replay arm. It covers only what `replay_graph` and `edge_tables_from_buffers` can reach, namely `load_captures`, `synthetic_graphs()` and hand-built cases. It tests emission, solve and decode, not the table or facts, because those nodes have no IR.
+`tests/inductor/test_lx_placement_parity.py` has two parts.
 
-- `test_solve_sequence_matches`, `test_protos_byte_identical`, `test_parameters_match`, `test_responses_match`, `test_decoded_plan_matches`: items 1 to 5 below.
+The buffer-level part is device-free. It covers only what `replay_graph` and `edge_tables_from_buffers` can reach, namely `load_captures`, `synthetic_graphs()` and hand-built cases. These carry no cost expression, so both sides run the ladder (`ilp_solver_ortools.py:1458-1523`). The ladder is not the production path: these tests hold the port of the encoding and the ladder, and Gate 1 holds the default solve. They test emission, solve and decode, not the table or facts, because those nodes have no IR.
+
+- `test_solve_sequence_matches`, `test_protos_match_as_text`, `test_parameters_match`, `test_ladder_optima_match`, `test_decode_of_one_response`: items 1 to 5 of Gate 2.
 - `test_native_plan_passes_check`, `test_pack_plan_passes_check`: item 6, partial where there is no IR.
 - `test_solved_spans_match_graph_lifetime`: `box.span` against `graph.lifetime`, on tiled entries.
 - `test_pack_objective_not_below_native`: on entries where both modes reach OPTIMAL.
 
-`tests/inductor/test_lx_live_parity.py`, Stage 5's file, gains the whole-proto comparison and items 1 to 6 on `fake` compiles of the fixed set, at default and tiling.
+The live part runs on the card, as the existing device suites do.
 
-Existing suites, run serially: `test_scratchpad_solver`, `test_solver_relayout_decision`, `test_cooptimization_types`, `test_cost_expr_dump`, `test_restickify_cost_model`, `test_sa_cooptimizer`, `test_coarse_tiling`, `test_work_division*`, `test_scratchpad_patterns`, `test_perm_layout_solver`, `test_scratchpad_use`, `test_solver_auto_coarse_tiling`, and the graph-layer tests. The parent plan lists no device suite after Stage 7, and this stage changes no production path, so `test_scratchpad_use` and the like are expected to pass as they stand. `make check-all-configs` must pass. `pre-commit run --files <changed>`.
+- `test_live_optimum_matches[case]`: Gate 1, over `test_softplus`, `test__simple_attn`, `test_mlp`, `test_rms_norm` and `test_flash_attention` from `tests/inductor/test_building_blocks.py`. Each case runs the existing test in-process as `TestBuildingBlocks(case).debug()`, at default config, with Gate 1's patches installed, so the compile and its numerical check are the suite's own.
+- `test_live_plan_passes_check[case]`: item 4 of Gate 1 on the same compiles, in both placement modes.
 
-**What proves the parent's claim.** "Places natively, or by packing": the parity suite for native, and the tests above plus `test_pack_plan_passes_check` for packing. "An in-place pair packs as one box": `test_tied_group_packs_as_one` and `test_pack_in_place_pair_shares_offset`. "`SolveSettings` carries the time limit, workers and opt-in determinism": the parameter tests.
+Existing suites, run serially: `test_scratchpad_solver`, `test_solver_relayout_decision`, `test_cooptimization_types`, `test_cost_expr_dump`, `test_restickify_cost_model`, `test_sa_cooptimizer`, `test_coarse_tiling`, `test_work_division*`, `test_scratchpad_patterns`, `test_perm_layout_solver`, `test_scratchpad_use`, `test_solver_auto_coarse_tiling`, and the graph-layer tests. On the card, `test_building_blocks` must stay green. The parent plan lists no device suite after Stage 7, and this stage changes no production path, so `test_scratchpad_use` and the like are expected to pass as they stand. `make check-all-configs` must pass. `pre-commit run --files <changed>`.
+
+**What proves the parent's claim.** "Places natively, or by packing": Gate 1 and the buffer-level part for native, and the tests above plus `test_pack_plan_passes_check` for packing. "An in-place pair packs as one box": `test_tied_group_packs_as_one` and `test_pack_in_place_pair_shares_offset`. "`SolveSettings` carries the time limit, workers and opt-in determinism": the parameter tests.
 
 ## Parity and gates
 
-The parent's gate: "Through Phase 1, and in Phase 2 wherever the rules agree with today's, the CP model stays byte-identical and the committed plans stay identical. Any other difference is listed by rule in its PR and either justified or fixed." Verification adds "the Stage 0 harness, comparing proto, decisions and committed plans between the stage's parent and the change."
+The parent's gate: "Through Phase 1, and in Phase 2 wherever the rules agree with today's, the CP model stays byte-identical and the committed plans stay identical. Any other difference is listed by rule in its PR and either justified or fixed."
 
-Placement does not exist before this stage, so the proto diff finishes here: the `project_today` drop set becomes empty and the diff covers the whole model, where "byte-identical" means `proto_text`-identical.
+Stage 0 is dropped (Deviation 8). Parity here is the proven optimum of the cost expression, not identical protos or
+plans: both paths reach `OPTIMAL` at an equal `objective_ns`, and a different plan at an equal cost is a tie. The proto
+comparison stays as this stage's own test of the encoding, because placement is the last part of the model to be ported.
+It is not the pass condition for plans.
 
-Compared at each solve between `CpSatLayoutSolver` and `OrToolsFamily(placement="no_overlap")`, both under `install`, so `SolveSettings.from_config(config)` gives `SolveSettings(DEFAULT_DTIME, workers=1, deterministic=True)`:
+**Gate 1, the optimum on real compiles.** `test_live_optimum_matches` installs two patches with `monkeypatch`:
 
-1. **The sequence of solves.** The same count, stage by stage, including locks in ladder cases.
-2. **Proto text per solve.** `proto_text`, recorded through `record_stage` on both sides.
-3. **Parameters per solve.** Compared as parsed values, not text: `SolveParams` sets `interleave_search: false` and `max_time_in_seconds: inf` explicitly, where the deterministic column leaves them unset.
-4. **Responses.** The solution vector is equal. Given 2 and 3, a deterministic solve implies this. It is checked because it is cheap and catches a non-determinism that would invalidate the rest.
-5. **Decoded plan.** After `read_back`, `decisions(graph)` against `decisions` of a graph filled by `decode_todays_plan(graph, allocation, accepted_relayouts)`; fired relayouts against `chosen_relayouts` on the buffers, by destination view and address. `in_place`, copy-out steps and `graph.cuts` have no counterpart in today's output, so 4 and `check_decisions` cover them.
+- `CoOptimizingAllocator._solve` (`allocator.py:3218`), to keep the `GraphLowering` it is called with;
+- `CpSatLayoutSolver.plan_layout_and_core_divisions` (`ilp_solver_ortools.py:699`), which the allocator calls with
+  today's `cost_expr` (`allocator.py:3352`).
+
+The second wrapper first runs the family on the same compile: `build_graph(ir, select_target(config))`,
+`OrToolsFamily.from_config(config)`, `encode`, `solve` with `SolveSettings.from_config(config)`, and `read_back`. It then calls
+the original. The family goes first because the old solver writes to its buffers. A case passes when:
+
+1. both statuses are `OPTIMAL`: today's `last_solve_stats["status"]` and the family's `solution.status`;
+2. `objective_ns` is equal. Today's is `_evaluate(cost_expr, solved_bindings(result))` (`plan_solver.py:542`, `:567`). The
+   family's is `_evaluate` of the same `cost_expr` with each free symbol bound to `solution.value(enc.symbols[symbol.name])`.
+   A free symbol with no entry in `enc.symbols` fails the case and names the symbol. Open question 1 asks what "equal"
+   means when two plans tie in the model;
+3. neither side raised `SolveError`, which would otherwise reach the greedy re-plan (`allocator.py:5495-5515`) unnoticed;
+4. `check_decisions(graph) == []` on the family's graph, in both placement modes.
+
+The uniqueness probe is not part of the gate. `uniqueness_check` stays a diagnostic, as `enable_uniqueness_check` is today.
+These cases run at default config, which is one cost-expression solve. With `AUTO_COARSE_TILING=1` today withholds the
+expression and runs the ladder (`allocator.py:3275-3295`), so that config is held by Gate 2 until torch-spyre #6124, in the
+#6121-#6126 stack, removes the bypass. If the stack has merged when this PR opens, the live cases also run at
+`AUTO_COARSE_TILING=1`, with the same pass condition.
+
+**Gate 2, the encoding and the ladder, at buffer level.** Each test patches `CpSatLayoutSolver._solve_and_record` and
+`OrToolsFamily._solve_stage` to capture each solve, and compares `CpSatLayoutSolver` with
+`OrToolsFamily(placement="no_overlap")` on the same buffers:
+
+1. **The sequence of solves.** The same count, stage by stage, including locks.
+2. **Proto text per solve.** `[str(v) for v in proto.variables]` and the constraint strings, in order, taken before each
+   solve. The 9.15 `CpModelProto` wrapper has no `SerializeToString`, so this is a text comparison. The `project_today` drop
+   set is empty, so commit 4 compares the whole first model the same way.
+3. **Parameters per solve.** Compared as parsed values, not text.
+4. **Ladder optima.** Each stage is `OPTIMAL` on both sides at an equal objective value.
+5. **Decode of one response.** This checks `read_back`, not parity. The test pins one worker, seed 0 and no time limit on both
+   sides: `config.get_cpu_count` patched to return 1 and a time limit of 0 for today, `SolveSettings(0, workers=1)` for the
+   family. Then 2 and 3 give equal responses, and the test asserts that too. After `read_back`, `decisions(graph)` is compared
+   with `decisions` of a graph filled by `decode_todays_plan(graph, allocation, accepted_relayouts)`, and fired relayouts with
+   `chosen_relayouts` on the buffers, by destination view and address. `in_place`, copy-out steps and `graph.cuts` have no
+   counterpart in today's output, so `test_lx_read_back.py` and `check_decisions` cover them.
 6. **`check_decisions(graph) == []`** on every plan, in both placement modes.
 
-A pass is zero differences in 1 to 6. The PR-tip tiers are `intree`, the `fake` zoo at default and `AUTO_COARSE_TILING=1`, `unit-*` and `failure`, where a forced failure must return `NO_PLAN`. The `fake` zoo runs as live compiles: `lx_shadow_plugin` wraps `CoOptimizingAllocator._solve`, runs `build_graph(ir, select_target(config))`, encode, solve and `read_back`, and takes the allocator's accepted plans from `_finalize_lx_relayout_allocation`. Captures cannot reach the graph layer, so they serve only the replay arm. No card is needed. A model the `fake` tier cannot reach stays card-only and is listed in the PR. Fake inputs use default layouts, so this proves parity, not production plans. The PR reports hits per coverage feature, including the restickify features.
+A pass is zero differences in 1 to 6.
 
-The gate covers joint solves. The placement-only allocator has no family counterpart here, since its model differs by design, and `greedy`, `bestfit`, `firstfit` and `simulated_annealing` have none either.
+Both gates cover joint solves. The placement-only allocator has no family counterpart here, since its model differs by
+design, and `greedy`, `bestfit`, `firstfit` and `simulated_annealing` have none either.
 
-Committed plans cannot be compared here, because nothing commits a family's plan until Stage 9's bridge. Today's committed plans do not change, since no production path changed, and the Stage 0 diff shows that. Any difference in 1 to 6 is either a bug fixed in this PR or, where a rule intentionally differs, listed by rule with its Stage 5 or 6 reason.
+Committed plans cannot be compared here, because nothing commits a family's plan until Stage 9's bridge. Today's committed
+plans do not change, since no production path changed, and the existing suites listed under Tests stay green. Any
+difference in either gate is either a bug fixed in this PR or, where a rule intentionally differs, listed by rule with its
+Stage 5 or 6 reason.
 
-Pack mode has no parity gate. It must pass item 6. The PR also reports its objective against native on every entry where both reach OPTIMAL, with the assertion `pack >= native`. I have no measurement of pack on real graphs.
+Pack mode has no parity gate. It must pass item 6 of Gate 2 and item 4 of Gate 1. `test_pack_objective_not_below_native` asserts `pack >= native` on every buffer-level entry where both reach OPTIMAL. I have no measurement of pack on real graphs.
 
 ## Risks
 
 - **Box or hook order differs from today's.** LX prefetches come first and relayout copies last, and `declare` must precede the `merge_*` variables. A wrong order shifts every index. Caught by proto text.
-- **Justify differs in a tie.** Two zero-length boxes share a sort key, so component order matters. Caught by the differential test and item 5.
-- **Interleaved search is less deterministic than measured.** Toy models only, and a binding budget is untested. `num_cpus` is out of the cache key, so a plan that varies with worker count would vary by machine under one key. Caught, if at all, by `test_interleaved_agrees_across_workers`. It does not affect the gate, which runs one worker.
+- **Justify differs in a tie.** Two zero-length boxes share a sort key, so component order matters. Caught by the differential test and item 5 of Gate 2.
+- **Interleaved search is less deterministic than measured.** Toy models only, and a binding budget is untested. `num_cpus` is out of the cache key, so a plan that varies with worker count would vary by machine under one key. Caught, if at all, by `test_interleaved_agrees_across_workers`. It does not affect the gates: Gate 1 runs non-deterministic settings and compares optima, and Gate 2's decode test runs one worker without interleaving.
+- **A model tie evaluates unequally.** The CP objective approximates the expression: a core split's log is scaled by 32 with about 0.5% error (`cpsat_expr_printer.py:52-53`). Two plans tied in the model can then differ in `objective_ns`, and Gate 1 runs several workers, so either can come back. Open question 1.
+- **The live cases miss a shape.** Gate 1 covers five building blocks. A graph shape none of them reaches is held only by the buffer-level tests and the existing suites. The PR lists what the five cases contain: relayouts, in-place pairs, prefetches and restickifies.
 - **Pack compile time.** Worst case is `attempts × stages × time_limit`. Pack is off by default, and no default path can reach it.
 - **Mutable `Encoding`.** A second `solve` on one encoding in native mode sees old locks. Stage 9's fallback re-encodes into a new encoding, so it is safe. `OrToolsFamily.solve` asserts first use.
 - **The crash workaround.** `ignore_subsolvers` must stay on in every mode, including interleaved, or google/or-tools#5532 returns. Pinned by the parameter tests.
-- **FakeTensor captures.** The replay arm must blank `residency_edges`, `division_space` and `tile_reads` before any deepcopy. Boxes hold references to nodes, so an `Encoding` must not be deep-copied. `enc.model.clone()` copies only the proto.
-- **Drift on main.** The old solver stays live until Stage 13, and `test_lx_live_parity.py` is what fails in CI when its model changes without `ortools_encode.py`.
+- **FakeTensor captures.** The buffer-level tests must blank `residency_edges`, `division_space` and `tile_reads` before any deepcopy. Boxes hold references to nodes, so an `Encoding` must not be deep-copied. `enc.model.clone()` copies only the proto.
+- **Drift on main.** The old solver stays live until Stage 13. `test_lx_placement_parity.py` is what fails in CI when its model changes without `ortools_encode.py`: Gate 2's text comparison when the model changes, and Gate 1 when the optimum does.
 
 ## Deviations from the parent plan
 
 1. **Native placement posts during encode, not in `solve`.**
    - Plan: the family "records the boxes to place" when it encodes, and `OrToolsFamily.solve` "places in one of two modes, set by its `placement` field".
-   - Code: `off_` is created among the buffer variables (`ilp_solver_ortools.py:301`), ties sit inside the in-place loop (`:1639`), and the no-overlap precedes the residency gates (`:1371-1372`). Posting at solve time cannot be byte-identical.
-   - Resolution: a `_Placer`, chosen by `encode` from the `placement` field, called from three points in `encode`. The mode stays inside the family, and `boxes` stays the record. Once Stage 12 ends byte parity, the calls can move into `solve` with no API change.
+   - Code: `off_` is created among the buffer variables (`ilp_solver_ortools.py:301`), ties sit inside the in-place loop (`:1639`), and the no-overlap precedes the residency gates (`:1371-1372`). Posting at solve time cannot give today's proto.
+   - Resolution: a `_Placer`, chosen by `encode` from the `placement` field, called from three points in `encode`. The mode stays inside the family, and `boxes` stays the record. Once Stage 12 ends the proto comparison, the calls can move into `solve` with no API change.
 2. **One `solve` can run several solves.**
    - Plan: `solve(encoding, settings)` runs one solve of one objective.
    - Code: up to five locked solves (`:1458-1523`).
    - Resolution: `OrToolsFamily._run_stages` runs `enc.ortools.objective_stages` and returns one `Solution`.
 3. **One-worker determinism does not interleave.**
-   - Plan: "budgets by deterministic time with a fixed seed and interleaved search"; Stage 0 solves on one worker.
+   - Plan: "budgets by deterministic time with a fixed seed and interleaved search".
    - Code: OR-Tools 9.15 with `interleave_search` at one worker did not repeat on any of 6 toy instances; at two or more workers it did.
-   - Resolution: interleave when `workers >= 2`. `from_config` uses at least 2. Stage 0's `install` selects plain one-worker search.
+   - Resolution: interleave when `workers >= 2`. `from_config` uses at least 2. A test that wants plain one-worker search builds `SolveSettings(..., workers=1, deterministic=True)` itself.
 4. **`OpNode.spill_reason`.**
    - Plan: `OpNode` has no spill reason.
-   - Code: Stage 0 records spill reasons, and `CoOptimizingAllocator._get_spill_reasons` surfaces the solver's (`allocator.py:3648-3669`). Only `read_back` knows the solver chose to spill.
+   - Code: `CoOptimizingAllocator._get_spill_reasons` surfaces the solver's spill reasons (`allocator.py:3648-3669`). Only `read_back` knows the solver chose to spill.
    - Resolution: Stage 1 declares the field, as plain data, and `read_back` fills it.
 5. **A cut with no data edge has no copy-out step.**
    - Plan: a copy-out is a step on a data edge, "forced when a cut lies between a data edge's ends."
@@ -814,14 +854,23 @@ Pack mode has no parity gate. It must pass item 6. The PR also reports its objec
    - Plan: "chosen by a `config.layout_solver` value."
    - Code: `select_allocator` is the only router, and `plan_allocation` arrives in Stage 9.
    - Resolution: the value exists, is in the cache key, and `FAMILIES` resolves it. `select_allocator` raises its existing `ValueError` until Stage 9.
+8. **Stage 0 is dropped (owner, PR #7, 2026-11-12).**
+   - Plan: every stage runs the Stage 0 harness, comparing proto, decisions and committed plans between the stage's parent and the change.
+   - Code: the torch-spyre suites already compile the building blocks on the card, and the buffer-level graphs already exist in `tests/inductor/cooptimization_capture_loader.py` and `synthetic_cooptimization_graphs.py`.
+   - Resolution: no harness hooks, recordings or tiers. Gate 1 runs five `test_building_blocks` compiles in-process with the allocator and `CpSatLayoutSolver.plan_layout_and_core_divisions` patched in the test, and asserts both paths reach `OPTIMAL` at an equal `objective_ns`. Gate 2 keeps the proto, parameter and ladder comparisons as buffer-level unit tests that patch `_solve_and_record` and `_solve_stage`. Tests that need deterministic settings build a `SolveSettings`. `buffer_decision` is not added.
 
 ## Open questions
 
-None.
+1. **What does "equal `objective_ns`" mean at a model tie?**
+   - Both sides solve the same model, so at `OPTIMAL` their model objective values are equal. The model approximates the expression (`cpsat_expr_printer.py:52-53`), so two plans tied in the model can give different `objective_ns`, and Gate 1 runs several workers, so either can come back.
+   - Recommended: Gate 1 asserts equal model objective values (`solution.objective` against today's `solver.ObjectiveValue()`, read through a third patch on `_solve_and_record`) and equal `objective_ns`. When the model values agree and `objective_ns` does not, the case fails with both plans' values, and the PR lists it as a model tie rather than a parity break. If that happens on any of the five cases, the case runs with `config.get_cpu_count` patched to return 1, as Gate 2's decode test does.
+2. **Does native placement still post during `encode`?**
+   - Deviation 1 posts offsets and the no-overlap at today's positions only so that the protos compare equal as text. With parity now the optimum, posting in `solve` would also pass Gate 1.
+   - Recommended: keep posting during `encode`. It costs no API, Gate 2's whole-model comparison is the only test that finds a wrongly ported placement constraint that happens not to move the optimum on five compiles, and Stage 12 can still move the calls.
 
 ## Out of scope
 
-- Routing `"ortools"` through `scratchpad_planning`, `plan_allocation` and `optimize`, failure and fallback flow, the bridge to `_push_allocation`, the harness's `ortools` cells and `decisions_from_graph`: Stage 9.
+- Routing `"ortools"` through `scratchpad_planning`, `plan_allocation` and `optimize`, failure and fallback flow, the bridge to `_push_allocation` and `decisions_from_graph`: Stage 9.
 - Objective terms: Stage 4. Lowering them, `encode_objective`, `SolveStage`: Stage 6.
 - `AnnealModel`, `SAFamily` and the `"sa"` value: Stage 8.
 - The debug greedy family and its config value: not staged. This stage only keeps it possible.
