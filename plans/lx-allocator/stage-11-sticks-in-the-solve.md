@@ -1,7 +1,7 @@
 # LX allocator, Stage 11: Sticks in the solve
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0-10, plus torch-spyre#5682 Step 1, Step 2 items 1-5 and 7, and the issue's three
+Depends on: Stages 1-10, plus torch-spyre#5682 Step 1, Step 2 items 1-5 and 7, and the issue's three
 direct tests (see "Relation to #5682"). Needed by: step 12c of Stage 12. Stages 12 and 13 do not
 depend on this stage, and it lands before or after them.
 
@@ -14,8 +14,9 @@ unchanged on the solved sticks, and the plan is committed afterwards. All five p
 requirements hold.
 
 What stays unchanged: the default path, `propagate_spyre_tensor_layouts`, the beam, `LX_PLANNING=0`,
-graph-input layouts and `elide_proven_read_copies`. With the switch off, every Stage 0 recording is
-identical. The switch stays off by default until step 12c, which Stage 12 owns.
+graph-input layouts and `elide_proven_read_copies`. With the switch off, `_maybe_solve_sticks`
+returns before it builds anything, so planning runs exactly as it does without this stage. The
+switch stays off by default until step 12c, which Stage 12 owns.
 
 This stage lands as two PRs, 11a and 11b, because their gates contradict each other (D2).
 
@@ -74,7 +75,7 @@ built 2026-10-18 from another checkout, FP16 inputs in default layout, and no Gr
   matmul's choice is on its input edges.
 
 **A restickify can be planned before its op exists.** A second device-free probe used SwiGLU through
-`F.linear` (the shapes of Stage 0's `swiglu_transposed_128x512x1536`), where the beam places three
+`F.linear` at 128x512x1536 with weights stored transposed (#4208), where the beam places three
 restickifies. Under the beam's stamps it built each as a detached `ComputedBuffer` from the
 `Pointwise` that `lower_restickify` builds (`lowering.py:1665-1694`), plus a detached copy of the
 consumer through `make_per_edge_inner_fn` (`insert_restickify.py:304`), both only in
@@ -181,7 +182,7 @@ Stage 11 is the issue's Step 3, and it depends on Step 1 and most of Step 2.
 | Step 2 mutation-target validation | The constraint is done here, as a banned row |
 | Step 2 item 6 (`reorder_nonstick_dims`, `finalize_layouts`, `insert_restickify`) | **Done here, PR 11a, on the graph layer only.** The issue's "virtual op with its own buffer, split menu and price" is a shadow op |
 | Step 2 item 7, dedup | Needs no finalized layout, but stays after `finalize_layouts` (Surprise 5), which breaks the issue's expectation |
-| Direct tests of `reorder_nonstick_dims`, `reorder_nonstick_dims_mutation`, `insert_post_mutation_restickify` | Prerequisite, ahead of Step 2 as the issue says. Stage 0 leaves them to the issue, and 11a's preview rests on them |
+| Direct tests of `reorder_nonstick_dims`, `reorder_nonstick_dims_mutation`, `insert_post_mutation_restickify` | Prerequisite, ahead of Step 2 as the issue says. The issue owns them, and 11a's preview rests on them |
 | Step 3 | **Done here, PR 11b**, from a pruned domain. Stage 6's literal is made live, `CostModel.restickify_cost` is the term, and the beam stays |
 
 **Which goes first.** Step 1, then Step 2 items 1-5 and 7, on `main`, in the issue's order. Then 11a
@@ -446,7 +447,7 @@ unverified: #5695 is not in the snapshot.
 
 Nothing here reads which of them has landed. On the old path `family_key(config)` is `None`, and
 otherwise it names a family. The gates select with `LAYOUT_SOLVER=ortools` or
-`sa`, which mean the same at every point, against `main` at the branch point with the switch off.
+`sa`, which mean the same at every point, and compare switch on against switch off in one process.
 The branch in `_maybe_scratchpad_planning` sits at the head of the wrapper, today's or Stage 13's. A
 compile with no plan reaches `scratchpad_planning` with beam sticks, whichever path that holds by
 then. This stage uses nothing Stage 13 deletes: `check_report` rather than the Stage 3 adapter,
@@ -665,7 +666,7 @@ that is 11a's mode.
 | `torch_spyre/_inductor/work_division.py`, `pass_utils.py` | `_prep_for` and `_per_core_view_on_buf` cache keys take the stamped layout |
 | `torch_spyre/_inductor/pass_counters.py`, `config.py` | Census counters, opt-out reasons; the two values |
 | `docs/source/compiler/scratchpad_planning.md` | Pipeline order and stick domain |
-| `tests/inductor/lx_equivalence.py` | `canonical_proto`, `StageRecord.canonical_sha`, `SCHEMA_VERSION` bump |
+| `tests/inductor/canonical_proto.py` | New: `canonical_proto`, a test helper (D8) |
 
 **PR 11a: the graph is built before `finalize_layouts`, sticks pinned.** Implements #5682 Step 2
 item 6. Each commit leaves tests green; nothing is reachable until commit 8.
@@ -674,7 +675,7 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
 2. `tentative_layouts`, plus layout in the two cache keys.
 3. `restickify_padding_plan` and `restickify_loop_info`, with the passes calling them. No behaviour
    change.
-4. `canonical_proto` in the harness.
+4. `canonical_proto` as a test helper, with `test_canonical_proto.py`.
 5. `stick_key`, `stick_domain`, `StickCandidate`, `build_stick_candidates`.
 6. `StickPairRow`, `StickRelation`, `build_stick_relations`.
 7. `predict_shadow_ops`, `shadow_ops`, `build_graph(stick_candidates=)`. Under
@@ -702,7 +703,6 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| harness | `Recorder`, `proto_text`, `StageRecord`, `lx_fake_device`, `lx_zoo.MODELS`, `FIXED_GRAPHS`, features `beam_restickify`, `fixup_copy` | 0 | Gates, compile-path tests |
 | `OutPort`, `InPort`, `Port`, `DataEdge`, `Pin`, `PortFact` | parent-plan members; `Port = InPort \| OutPort`; `DataEdge.steps`, `DataEdge.add_step(step)` | 1 | Extended here |
 | `Step`, `StepKind.RESTICKIFY`, `apply` | `Step(kind=StepKind.RESTICKIFY, to_stick=None, realized_by=None, target=None, pinned=False, ...)`; `apply(step, layout)` returns `step.target` when set | 1 | Unpinned steps |
 | `RestickifyNode` | Stage 1's class, filled by Stage 2 | 1, 2 | Shadow nodes |
@@ -726,8 +726,10 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
 | `PlacementBox`, `Encoding.boxes`, `Solution`, `SolveStatus`, `OrToolsFamily.encode`, `.read_back` | as Stage 7 | 7 | Step box; decoding stick and the step's `target` |
 | `AnnealModel`, `DivisionSource`, `EdgeRelation`, `TableRelation`, `SAFamily.encode`, `.read_back` | as Stage 8 | 8 | `_StickedDivisions` |
 | `optimize`, `family_key`, `select_families`, `SolveSettings.from_config`, failure flow | `optimize(graph, family, fallback, settings)`, which reads back and checks but never commits; `family_key(config) -> str \| None`, `None` on the old path; `select_families(config) -> tuple[Family, Family \| None]` | 9 | `plan_sticks`, the old-path test |
+| `last_outcome`, `PlanOutcome.fell_back` | `last_outcome() -> PlanOutcome \| None` | 9 | The gates' no-fallback check |
 | `solve_decides_work_division` rule, `optimizer_pass_sources()` | false on a family; planner sources in the FX key | 9 | Turned true on a held plan; lists `sticks.py` |
 | `commit`, `read_commit_plan` | `commit(graph)`, runs the context-switching passes; `(graph) -> CommitPlan` | 10 | Called on the held plan. Unchanged in 11a except the leftover step. Accepts realized steps in 11b |
+| `write_cost_dump` | `(graph, family, encoding, solution) -> None`; writes `objective_ns` and `solve` to `config.dump_cost_expr_file` | 10 | `objective_ns` in the gates |
 | `divide_deferred_op`, `solve_decides_work_division` | #5695 | #5682 Step 1 | Leftovers on a held plan |
 | span floors inside menus | #5682 | #5682 Step 1 | Per candidate |
 | reservations for fixup passes | #5682 | #5682 Step 2 | Ported by Stages 5-7 |
@@ -752,8 +754,16 @@ item 6. Each commit leaves tests green; nothing is reachable until commit 8.
 
 ## Tests
 
-New tests, all under `tests/inductor/`. Compile-path files run on Stage 0's `fake` tier, one process
-per compile.
+New tests, all under `tests/inductor/`. Compile-path files compile on a card, as the device suites
+do, and get the allocator's IR by calling `plan_sticks` directly or by wrapping a family method with
+`mock.patch.object` inside the test.
+
+The compile cases are real compiles the existing suites already have: SwiGLU through `F.linear`
+from `BaseTestScratchpadUsage._swiglu` (`tests/inductor/test_scratchpad_use.py:399`), whose gate and
+up weights are restickified (`:1160`); softmax and the MLP from `ParameterizedScratchpadUsage`
+(`_softmax_case`, `_mlp_case`, `:526-533`); and the models of `test_mlp`, `test_rms_norm` and
+`test_flash_attention` (`tests/inductor/test_building_blocks.py:103`, `:130`, `:319`), copied into
+a case list with the source test named.
 
 - `test_stick_domain.py`: `test_beam_choice_always_kept` (rules 3 and 4 never remove
   `committed_stl`), `test_one_layout_per_distinct_stick` (the census's 42-op case),
@@ -770,12 +780,14 @@ per compile.
   `.layout`), `test_infeasible_pair_has_no_row`, `test_no_row_restickifies_a_mutation_target`,
   `test_co_output_rows_require_equality`, `test_clone_consumer_crosses_frame_without_a_step`,
   `test_rows_keyed_by_edge_key_match_finalize_layouts` (`x + x` and `x[..., :8] + x[..., 8:]`).
-- `test_shadow_ops.py`, compile path, on the transposed SwiGLU: `test_shadow_menu_equals_real_op`,
+- `test_shadow_ops.py`, compile path, on the SwiGLU case: `test_shadow_menu_equals_real_op`,
   `test_shadow_reads_equal_insert_restickify`, `test_shadow_features_equal_real_op`
   (`extract_op_features` at one division, with bundle membership),
   `test_shadow_ops_restore_on_exception` (`operations`, `name_to_buffer`, no buffer name consumed),
   `test_shadow_builds_restickify_node_and_pinned_step`, `test_realized_op_without_a_shadow_raises`,
-  `test_unshadowed_shapes_opt_out` (one per table row, and the counter names the reason).
+  `test_unshadowed_shapes_opt_out` (one per table row, and the counter names the reason), and
+  `test_limit_one_model_matches_switch_off`: `canonical_proto` of the model at limit 1 equals the
+  switch-off model's, each taken by wrapping `OrToolsFamily.solve` in the test (D8).
 - `test_canonical_proto.py`: `test_tick_shift_compares_equal` (models differing by tick offset and
   buffer names), `test_structure_change_compares_different` (an extra box, a changed size, a changed
   domain).
@@ -801,79 +813,95 @@ per compile.
   `test_lx_planning_off_never_enters_the_solve`, `test_old_path_never_enters_the_solve`,
   `test_committed_mode_and_tiling_keep_sticks_pinned`, `test_held_plan_defers_distribute_work`,
   `test_no_plan_runs_distribute_work_in_full`, `test_commit_divides_leftover_deferred_ops`,
-  `test_read_commit_plan_accepts_realized_step` (and raises on an unrealized one), and
-  `test_forced_candidate_sweep`: over the zoo, force each free op to its non-beam candidate in turn,
-  and run through kernel preparation. No pass may raise and `verify_realized` must pass.
+  `test_read_commit_plan_accepts_realized_step` (and raises on an unrealized one),
+  `test_switch_off_never_enters_the_solve` (`build_stick_candidates` and `plan_sticks` are not
+  called), `test_limit_one_reaches_the_same_optimum` and `test_free_sticks_no_worse_than_pinned`
+  (both under Parity and gates), and `test_forced_candidate_sweep`: over the compile cases, force
+  each free op to its non-beam candidate in turn, and run through kernel preparation. No pass may
+  raise and `verify_realized` must pass.
 - `test_solver_relayout_decision.py`, added: the new config names match no ignore prefix.
 
 **Existing suites.** All parent-plan unit suites, serially. On every commit: `test_restickify`,
 `test_padding`, `test_dedup_constants`, `test_frontend_work_bounds`, `test_indirect_access_*` and
-the issue's direct tests.
+the issue's direct tests. These stay green with the switch off, and that is what shows the
+switch-off path did not move.
 
-**Device suites** after each PR, with the switch on for 11b: the parent plan's list and the
-`test_inductor_ops_lx_*` shards. These run on a card, by hand: no CI job sets
-`SPYRE_LX_STICKS_IN_SOLVE`.
+**Device suites** after each PR, with the switch on for 11b: the parent plan's list,
+`test_building_blocks` and the `test_inductor_ops_lx_*` shards. These run on a card, by hand: no CI
+job sets `SPYRE_LX_STICKS_IN_SOLVE`.
 
-**What proves the claim.** `test_solver_takes_restickify_when_it_saves_spills` and
-`test_forced_candidate_sweep`, plus the predicted-runtime comparison below.
+**What proves the claim.** `test_limit_one_reaches_the_same_optimum` for 11a.
+`test_free_sticks_no_worse_than_pinned`, `test_solver_takes_restickify_when_it_saves_spills` and
+`test_forced_candidate_sweep` for 11b, plus the predicted-runtime comparison below.
 
 ## Parity and gates
 
 The parent plan gives this stage no gate of its own. Its rule is: "Any other difference is listed by
-rule in its PR and either justified or fixed." Verification adds the Stage 0 harness, the device
-suites after Stage 11, and planning time. The issue says plans change by design at this point, so
-the gates take its guards.
+rule in its PR and either justified or fixed." Verification adds the device suites after Stage 11
+and planning time. The issue says plans change by design at this point, so the gates take its
+guards.
 
-**Precondition: probe P2, before Stage 5.** On today's main, device-free, no new code: for each of
+Parity is the optimum of the cost expression. `objective_ns` is the value Stage 10's
+`write_cost_dump` writes for a solve, the expression evaluated on the plan that came back; each test
+points `config.dump_cost_expr_file` at a temporary file and reads `objective_ns` and `solve.status`
+from it. A different plan at an equal proven cost is a tie and passes. `_is_unique_solution` is a
+diagnostic, never a gate. Defaults are kept (co-optimizing on, `auto_coarse_tiling` off), so these
+solves take one cost-expression model, not the ladder. No plan or objective is stored: both arms run
+in the same test.
+
+**Precondition: probe P2, before Stage 5.** On today's main, on a card, no new code: for each of
 the 35 free regions force the non-beam candidate after the beam, compile through `CostReport`, and
 record `total_us`, whether a pass raises, and the count of ops added between the beam and planning
 and how many end up LX-resident. This is the core of `test_forced_candidate_sweep`, plus a census.
 It answers whether sticks pay at all and how many ops need a shadow or opt out, and it informs both
 Open questions. It has not been run.
 
-**Tiers.** `fake` zoo and the fixed set, with Stage 0's two restickify graphs, plus Granite for 11b.
-The base arm is `main` at the branch point. `fake` inputs use default layouts, so `fake` proves
-parity, not production plans. `CARD_ONLY` models stay on a card.
+**Corpus.** The compile cases under Tests, at default config, plus Granite for 11b, by hand on a
+card through hf-adapters. The census found no beam restickify on the zoo, so the SwiGLU case is the
+one that builds shadows. `test_limit_one_reaches_the_same_optimum` asserts that it builds at least
+one `ShadowRow`, or the gate is vacuous and fails.
 
 **PR 11a. Gate: nothing changes.**
 
-- Compare, under `LAYOUT_SOLVER=ortools` and Stage 0's deterministic settings: base against 11a with
-  `lx_sticks_in_solve=1`, `lx_stick_domain_limit=1`, and against 11a with the switch off.
-- Corpus: as above, at default config. Stage 0's `beam_restickify` feature must have hits, or the
-  gate is vacuous and fails.
-- Pass, switch off: proto, decisions and committed plan identical, byte for byte.
-- Pass, switch on, the hard gate: decisions, objective, inserted ops, addresses, divisions and spill
-  reasons identical.
-- Pass, switch on: `canonical_proto` identical (D8). It takes a clone of the model's proto, clears
-  `name` on variables and constraints, collects the constants in the `start`, `end` and `size` of
-  every interval `no_overlap_2d.x_intervals` names plus the bounds of `start_` and `end_` variables,
-  replaces each with its rank, and applies the same map to linear constraints over those variables.
-  Nothing else changes. Rewriting a cloned OR-Tools proto this way works on a toy model; on a real
-  one it is unproven until commit 4. `StageRecord` gains `canonical_sha`, with a `SCHEMA_VERSION`
-  bump, and `diff` compares it on switch-on arms.
+- `test_limit_one_reaches_the_same_optimum`, the hard gate. In one process, under
+  `LAYOUT_SOLVER=ortools`, each case compiles with the switch off and with `lx_sticks_in_solve=1`,
+  `lx_stick_domain_limit=1`, over `torch.compiler.reset()` with caches off. Pass: both `OPTIMAL`,
+  `objective_ns` equal to a relative 1e-9, and `last_outcome().fell_back` false on both, so no
+  `SolveError` fallback was taken.
+- Switch off: `test_switch_off_never_enters_the_solve`, and the existing suites stay green.
+- Encoding: `test_limit_one_model_matches_switch_off` (D8). This is a test of the shadows, not of
+  plans. Rewriting a cloned OR-Tools proto works on a toy model; on a real one it is unproven until
+  commit 4.
 - A graph that opts out is listed by rule, and passes because it takes the switch-off path.
 - A difference is a bug. It is fixed, or listed by rule and justified.
 
-**PR 11b. Gate: plans change, and each change is justified.**
+**PR 11b. Gate: plans change, and each is no worse.**
 
-- Switch off: same byte-identity pass as above.
-- Switch on, limit 2, per graph on the same corpus:
+- Switch off: as in 11a.
+- **No worse, the hard gate: `test_free_sticks_no_worse_than_pinned`.** In one process, each case
+  solves at limit 2 and again with every free stick fixed to its beam key: the test wraps
+  `OrToolsFamily.encode` and posts each free port's `stick_var` equal to its beam candidate. Both
+  solves therefore price with one cost expression. Pass: both `OPTIMAL`, free `objective_ns` at most
+  the pinned one's (relative 1e-9), and neither fell back. The limit-1 objective is reported beside
+  them: a gap between it and the pinned one is standalone pricing (Risk R5), listed in the PR.
+- Switch on, limit 2, per case:
   1. `check_report` and `verify_realized` report nothing on any plan.
-  2. **Predicted runtime.** `CostReport.total_us` (`SPYRE_DUMP_COST=1`) against the 11a baseline,
-     measured on the committed IR by `cost_model_pass`, so it does not trust the solver's pricing.
-     Any increase over 0.1% needs a written reason in the PR. An unexplained increase blocks. The
-     geomean must not rise.
-  3. **Solve status.** On the fixed graph set, a graph that newly stops at the time limit or falls
+  2. **Predicted runtime.** `CostReport.total_us` (`SPYRE_DUMP_COST=1`) against limit 1 in the same
+     process, measured on the committed IR by `cost_model_pass`, so it does not trust the solver's
+     pricing. Any increase over 0.1% needs a written reason in the PR. An unexplained increase
+     blocks. The geomean must not rise.
+  3. **Solve status.** On the compile cases, a case that newly stops at the time limit or falls
      back fails. On Granite this is a report, and a limit stop is accepted where predicted total did
      not rise. With the hint, a stopped solve is never worse than the pinned plan on the solver's
      objective.
   4. **Size counters.** CP-SAT variables, constraints and table entries per op, bounded in the style
      of `test_frontend_work_bounds.py`. Bounds are set from 11b's first run and pinned.
-  5. **Compile time.** Live `fake` compiles, interleaved, reading `pass_loop_ns` as Stage 9's Gate 3
-     does. A report, not a gate: Stage 12 sets 12c's written limit. The parent's zoo replay cannot
-     be used, since captures have no candidates.
-- Family gate: all of the above with `LAYOUT_SOLVER` selecting each family, SA against its own 11a
-  baseline.
+  5. **Compile time.** Card compiles, limit 1 and limit 2 interleaved in one process, reading
+     `pass_loop_ns` as Stage 9's Gate 3 does. A report, not a gate: Stage 12 sets 12c's written
+     limit.
+- Family gate: all of the above with `LAYOUT_SOLVER` selecting each family. SA proves no optimum, so
+  its no-worse check is that the limit-2 `objective_ns` is at most that of its beam seed, which
+  Stage 8's best-seen rule gives, with limit 2 against limit 1 reported.
 - Device: the suites above pass, on a card. Predicted numbers justify default-off only.
 - **The issue's weekly perf check** (`make tests TEST_TYPE=perf`) runs on 11b before step 12c, whose
   gate reads it.
@@ -958,9 +986,13 @@ carries Stage 1's `Step.target`, which the parent's `STEP_KINDS` table does not 
 read itself (overlap, direct-read provenance)". The code derives overlap from `td.device_coords`
 (`work_division_constraints.py:1151-1172`). Resolution: per row, under `facts_for`.
 
-**D8. Byte-identical proto in 11a.** Ticks come from the op list at the solve, and dedup has not run
+**D8. Proto comparison in 11a.** Ticks come from the op list at the solve, and dedup has not run
 there, so the numbers differ even when the order does not. A shadow's variables also carry another
-name. Resolution: `canonical_proto`, with decision equality as the hard gate.
+name. Resolution: `canonical_proto`, a test helper used by one stage-local test of the shadows. It
+takes a clone of the model's proto, clears `name` on variables and constraints, collects the
+constants in the `start`, `end` and `size` of every interval `no_overlap_2d.x_intervals` names plus
+the bounds of `start_` and `end_` variables, replaces each with its rank, and applies the same map to
+linear constraints over those variables. Nothing else changes. The hard gate is the optimum (D12).
 
 **D9. `plan_allocation` is split in two.** Stick passes must run between `optimize` and `commit`,
 because commit needs final layouts, while the parent's `plan_allocation` runs them back to back.
@@ -972,6 +1004,13 @@ later position runs a second solve with sticks pinned. This is a failure path on
 
 **D11. Stage order.** The parent places Stage 11 before Stages 12 and 13. Neither depends on it
 here, only step 12c does. Stage numbers do not change.
+
+**D12. Stage 0 is dropped (owner, PR #7, 2026-11-12).** The parent's "every stage" check through
+the Stage 0 harness does not exist. In its place, each gate runs both arms in one test on real
+compiles from the existing suites, on a card: switch off against limit 1 for 11a, and limit 2
+against the same encoding with beam sticks fixed for 11b. Both must be `OPTIMAL`; 11a's
+`objective_ns` must be equal, and 11b's no higher. Switch-off behaviour rests on the existing suites
+and `test_switch_off_never_enters_the_solve`. Plans and objectives are not stored.
 
 ## Open questions
 
@@ -991,8 +1030,7 @@ numbered order, nothing here changes, since the switch stays off through Stages 
 ## Out of scope
 
 - Moving #5682 Step 1 and Step 2 items 1-5 and 7, and the issue's direct tests: the issue's roadmap.
-- The harness, corpus and guards: Stage 0. Encodings for pinned sticks: Stage 6. Commit's step
-  insertion: Stage 10. The default flip, comparison and step 12c: Stage 12. Deleting old solvers:
+- Encodings for pinned sticks: Stage 6. Commit's step insertion: Stage 10. The default flip, comparison and step 12c: Stage 12. Deleting old solvers:
   Stage 13.
 - Sticks under tiling, which would need a restickify rung on CP-SAT's ladder, and a non-enumerating
   stick encoding: future work.
