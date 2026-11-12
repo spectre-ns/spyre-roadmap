@@ -35,11 +35,18 @@ solves a plan. The only other `Solve` call is the optional uniqueness probe
 (`ilp_solver_ortools.py:1376`, `config.py:385`), `config.get_cpu_count()` workers
 (`:1399`), seed 0 (`:1405`) and the crashing subsolvers removed (`:1415`).
 
-A solve is one of two shapes. With a cost expression there is one model
-(`_minimize_cost_expr`, `:830`). Without one there is a ladder of up to five stages
-(`:1457-1523`). The allocator withholds the expression under `auto_coarse_tiling`
-(`allocator.py:3275-3299`), so tiling compiles always
-run the ladder.
+**The production path is the cost expression.** At the defaults, `layout_solver="cpsat"`
+(`config.py:365`), `co_optimizing_lx_planning` on (`config.py:41`) and
+`auto_coarse_tiling` off (`config.py:454`), `CoOptimizingAllocator` builds a cost
+expression and the solve is one model that minimizes it (`_minimize_cost_expr`, `:830`).
+That is what the gate is about.
+
+The lexicographic ladder of up to five stages (`:1457-1523`) runs only off that path:
+the fallback when the expression cannot be built or lowered (`allocator.py:3321-3336`,
+`ilp_solver_ortools.py:886-900`), placement-only `plan_layout` with co-optimization off,
+`AUTO_COARSE_TILING=1` (off by default; the allocator withholds the expression there,
+`allocator.py:3275-3299`, until #6124), and the in-tree test graphs, which carry no
+expression. The harness records it where it runs but gates on none of it.
 
 The ladder mutates one model. Each stage adds a lock whose right-hand side is the
 previous stage's solved objective (`ilp_solver_ortools.py:1471`, `:1498`, `:1509`,
@@ -165,22 +172,23 @@ of a diff share them. Gates that need a card only to reach `GraphLowering` use `
 Numeric device suites stay on the card. A model the fake device cannot reach stays
 card-only and is compared at calibration.
 
-CI holds what the repo holds. `intree` runs against a committed golden (about 15 s for the
-CP-SAT arm, 5 s for `sa_legacy`, measured here). `fake` compiles of the fixed set run in CI
-as absolute checks: status, size, fallback. Base-versus-change diffs run through
+CI holds what the repo holds. `fake` compiles of the fixed set at `DEFAULT_CELL`, the
+production path, run in CI against a committed golden and as absolute checks: status,
+size, fallback. `intree` runs in CI as a fast check of the harness and the solver hooks
+(about 15 s for the CP-SAT arm, 5 s for `sa_legacy`, measured here): status, size and a
+repeat recording, with no golden, because those graphs take the ladder. Base-versus-change diffs run through
 `tools/lx_planning/lx_gate.sh` because CI has no base recording. Pickles are never
 committed: they are large (7-28 MB per set), tied to one base, and regenerable.
 
-**Golden.** `lx_equivalence_golden.json` holds objectives only, never plans: per `intree`
-case, the status and objective of each solve. Plans are not stored, because a tied plan
-can change without anything being wrong. The in-tree graphs have no cost expression, so
-until Stage 4's `price` exists their objective is the one the solver minimized, the
-final stage objectives. That is a stand-in, not a measure the gate trusts, and it goes
-when `price` prices them, as `objective_ns`. `check-golden` fails on a status or an
-objective, and a changed plan at the same objectives passes. A PR that moves an
-objective runs `bless`, and the change shows in its diff. Compile tiers have no golden: names move with every pass change.
-`bless --tier fake` exists for the golden that replaces `intree` when `CpSatLayoutSolver`
-goes.
+**Golden.** `lx_equivalence_golden.json` holds objectives only, never plans: per
+compile-level `FIXED_GRAPHS` model at `DEFAULT_CELL` on `fake`, the status and
+`objective_ns` of each solve, keyed by model and solve index. Plans are not stored,
+because a tied plan can change without anything being wrong, and with no plans stored
+the golden does not churn when names move. `check-golden` fails on a status or an
+objective beyond 1e-9 relative, and a changed plan at the same objective passes. A PR
+that moves an objective runs `bless --tier fake`, and the change shows in its diff. A
+`CARD_ONLY` fixed-set model has no golden row. The ladder-only `intree` graphs have no
+golden.
 
 **Zoo.** The zoo moves into torch-spyre as `tests/inductor/lx_zoo.py`, because a torch-spyre
 PR cannot gate on a file in another repo. It has 35 models: the 32 unchanged, plus three.
@@ -482,7 +490,7 @@ load and solve happily (the October ones do), so staleness will not announce its
 
 ### Where recordings live, and rebases
 
-Nothing but the `intree` golden goes in git, and it holds objectives only. Plans are
+Nothing but the golden goes in git, and it holds objectives only. Plans are
 never kept past the gate run that compares them. A run records base and HEAD into
 `$LX_EQUIV_ROOT/runs/<run>/`, diffs them, writes `report.md` and `objectives.json`, and
 deletes the plans: solves' decisions, commits, snapshots, protos, expressions and
@@ -936,7 +944,7 @@ accepts. `source` is the buffer `_restickify_input` (`padding.py:478`) returns.
 | `tests/inductor/lx_corpus.py` | new: cells, tiers, compile driver, replay, CLI |
 | `tests/inductor/lx_zoo.py` | new: 35 models, 32 lifted from `probes-cpsat-graph/zoo.py`; `CARD_ONLY`, `FAKE_DIVERGES` |
 | `tests/inductor/lx_fake_device.py` | new: fake device, lifted from `swiglu.py`; P1 census |
-| `tests/inductor/lx_equivalence_golden.json` | new: `intree` status and objectives per case; no plans |
+| `tests/inductor/lx_equivalence_golden.json` | new: status and `objective_ns` per solve for the `fake` fixed set at default; no plans |
 | `tests/inductor/test_lx_equivalence.py` | new: host tests of the harness and CI guards |
 | `tests/inductor/test_lx_equivalence_compile.py` | new: compile tests, on `fake` in subprocesses, plus one calibration test on the card |
 | `tests/configs/torch_spyre_tests/inductor/test_lx_equivalence_config.yaml` | new: labels `[unit, regression, trunk]`, both files `unlisted_test_mode: mandatory_success` |
@@ -953,10 +961,10 @@ Commits, each leaving the suite green:
 2. **Recorder and solve hooks.** `lx_equivalence.py` through `diff`, `check_guards`
    without commit data, and the plugin. `lx_corpus.py` with the `intree` tier. Host tests,
    config yaml, `make check-all-configs`.
-3. **Golden.** `lx_equivalence_golden.json`, `bless`, `check-golden`, size bounds for
-   `intree`.
-4. **Commit hooks.** `snapshot_commit`, observers, the compile driver and
-   `test_lx_equivalence_compile.py`.
+3. **Commit hooks.** `snapshot_commit`, observers, the compile driver and
+   `test_lx_equivalence_compile.py`. Size bounds for `intree`.
+4. **Golden.** `lx_equivalence_golden.json` over the `fake` fixed set at default, `bless`,
+   `check-golden`. It needs commit 3's compile driver.
 5. **Tiers.** `unit-*`, `fake`, `zoo`, `matrix`, `failure`, `replay`, `real`, captures,
    `corpus_coverage`, `cost_report`, `timing_report`.
 6. **Gate and calibration.** `lx_gate.sh`, docs, then one card calibration: compile
@@ -1038,8 +1046,8 @@ lands.
   target to `OPTIONAL_TARGETS`.
 - **Stage 13** counts `lx_equivalence.py` and `lx_corpus.py` as importers of the old
   solvers and allocators, removes `decisions_from_buffers`, `sizes_from_buffers`, the
-  replay helpers and the old-solver hooks, and replaces `test_golden_intree` with `bless
-  --tier fake` on the fixed set, recording objectives and predicted total.
+  replay helpers and the old-solver hooks, and the `intree` tier with them. The golden
+  is already on the `fake` fixed set and stays.
 
 ## Tests
 
@@ -1053,7 +1061,7 @@ under `--noconftest` with no card.
 | `test_ladder_records_every_stage` | a no-cost joint solve records 3 stages, placement-only 1 |
 | `test_second_solve_in_process_is_identical` | two recordings of `intree` in one process, `diff` empty |
 | `test_hash_seed_does_not_change_recording` | subprocess `record --tier intree` at `PYTHONHASHSEED=0` and `1`, `diff` empty |
-| `test_golden_intree` | `intree` status and objectives match `lx_equivalence_golden.json`; the golden holds no decisions or protos |
+| `test_intree_records_twice_the_same` | two recordings of `intree` in one process give the same status, objectives and sizes; it checks the harness, not production |
 | `test_gate_run_deletes_plans` | after `lx_gate.sh` without `--keep`, only `objectives/` and `report.md` remain |
 | `test_diff_detects[kind]` | in exact mode, each `Difference.kind` fires on a record mutated in that one field, and only that kind; the test that shows `diff` can fail |
 | `test_objective_mode_reports_a_tie` | the same objectives with different decisions give one `tie` with `fails=False`, and its commit difference does not fail either |
@@ -1188,7 +1196,11 @@ time is unmeasured.
 - **The allocator depends on hash order.** The solver-level result says nothing about it.
   Caught by G1 and `test_compile_twice_is_identical`.
 - **Golden churn.** A PR that moves an objective has to run `bless`. An OR-Tools bump
-  that only picks another tied plan does not, since the golden holds no plans.
+  that only picks another tied plan does not, since the golden holds no plans. A fixed-set
+  objective also moves with any torch-spyre change upstream of planning or in the cost
+  model, so unrelated PRs may have to `bless` too. That is the price of goldening the
+  production path. If it proves noisy, the golden narrows to status alone and the
+  objective check moves to `lx_gate.sh`.
 - **No stored plan to look back at.** With plans deleted after each run, a regression
   found later cannot be traced to the plan that caused it from storage. It is
   re-recorded from the two shas, which a frozen tree makes repeatable.
