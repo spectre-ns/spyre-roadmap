@@ -1,7 +1,7 @@
 # LX allocator, Stage 3: Restrictions and the check
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2. Needed by: Stage 4 (the Phase 1 exit only) and Stages 5 to 13.
+Depends on: Stages 1, 2. Needed by: Stage 4 (the Phase 1 exit only) and Stages 5 to 13.
 
 ## Goal
 
@@ -723,7 +723,8 @@ def _check_plan(self, graph, allocation, accepted) -> "PlanCheck | None":
 
 - **Staying off the result.** `check_todays_plan` builds its own graph and returns a
   `PlanCheck` holding it. Neither `_post_solve` nor `_push_allocation` reads it, and it takes
-  no solver path, so the CP model cannot change.
+  no solver path, so the CP model cannot change. `test_optimum_unchanged_with_check_on_and_off`
+  tests this on real compiles.
 - **Staying off the failure path.** A `SolveError` comes from `_solve`, before the hook
   (`ALLOC:5493-5495`), so the failed plan is never checked. The greedy re-plan runs the
   template again and is checked once. The `except` is broad on purpose: an error in a
@@ -762,8 +763,9 @@ def _check_plan(self, graph, allocation, accepted) -> "PlanCheck | None":
   `_counted_compile` (`tests/inductor/test_frontend_work_bounds.py:126`) pins
   `lx_check_decisions` to `False` beside its four pins, so the bounds keep meaning analysis.
 - **Default.** On by default only if the measured cost is within noise: `seconds` per record
-  against `TORCH_SPYRE_TIMING=1` planning time on a live `zoo` or `fake` run, at default and
-  tiling, attached to this PR. Otherwise the default is `"0"` and a `tests/conftest.py`
+  against `TORCH_SPYRE_TIMING=1` planning time on a card run of the existing compile suites,
+  `test_building_blocks` among them, at default and with `auto_coarse_tiling=True`, attached
+  to this PR. Otherwise the default is `"0"` and a `tests/conftest.py`
   fixture turns it on for the suites. The cost is unmeasured until Stage 2 exists. Phase 1
   exit sets a budget from this figure, as a share of planning, for Stage 9's gate.
 - **Captures.** `PlanCheck` holds op references. It is dropped when
@@ -800,7 +802,8 @@ def check_buffers(allocation: Sequence[LifetimeBoundBuffer],
 Most unit suites call solvers directly on synthetic buffers: `test_scratchpad_solver`,
 `test_sa_cooptimizer`, `test_cooptimization_types`, `test_restickify_cost_model`,
 `test_perm_layout_solver`, `test_solver_relayout_decision`. They have no `GraphLowering`,
-so `build_graph` cannot run. The in-repo captures, Stage 0's `intree` tier, are the same.
+so `build_graph` cannot run. The in-repo captures (`cooptimization_capture_loader.py`) are
+the same.
 `target` gives the capacity, alignment, core budget and `Rule` flags; the fixture passes
 `replace(select_target(config), lx_bytes=solver_capacity)`. `check_buffers` evaluates the
 part of the check that needs only buffers: `boxes_fit_lx`, `residency` from
@@ -866,7 +869,6 @@ Consumes:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| harness tiers | `intree`, `fake`, `zoo`, `unit-*`, `failure`, `FIXED_GRAPHS`, `corpus_coverage`; records proto, decisions, committed plan | 0 | parity gate |
 | `graph.flags.Restriction` | `NONE` and eleven members: the parent's six plus `WINDOW_UNSPLIT`, `CONV_SPATIAL_UNSPLIT`, `TOPK_SPLITS`, `KEEP_BY_INDEX_SPLITS`, `PLAIN_REDUCTION_UNSPLIT` | 1 | rule tags |
 | `graph.flags.PortFact` | `QFP8WT`, `STAGGERED_EA`, `OVERLAPPING_READ`, `DIRECT_READ_SOURCE` | 1 | fact rules |
 | `graph.flags.Rule` | `NONE`, `ONE_REDUCTION_SPLIT`, `TILES_OFF_STICK`, `RESIDENT_TILE_UNREDUCED`, `COPY_OUT_IN_HBM` | 1 | `RULE_CHECKS`, `coverage` |
@@ -893,6 +895,9 @@ Consumes:
 | `build_graph`, `select_target` | `(ir, target, *, divisions_committed=False, drain_plans=None, lx_relayout_plans=())`, never writes the IR, asserts one config per type; `(config) -> Target` | 2 | adapter, `check_buffers` fixture |
 | `carry_pairs` | `(graph) -> list[CarryPair(storage, reader, role)]` | 2 | `resident_read` skip |
 | `DirectReadStick` | `(axis, eps)`, set only past the 3-trip gate `WDC:263` | 1, filled by 2 | `DIRECT_READ_SOURCE` |
+| `CpSatLayoutSolver.plan_layout_and_core_divisions`, `.last_solve_stats` | `(self, cost_expr=None)` (`ILP:699`); `last_solve_stats["status"]`, `["objective_used"]`, set by the solve that produced the plan (`ILP:1347`) | existing | the on/off test |
+| `solved_bindings`, `_evaluate` | `(buffers) -> dict` (`PS:542`), `(expr, bindings) -> float \| None` (`PS:567`) | existing | `objective_ns` in the on/off test |
+| `TestBuildingBlocks` | `tests/inductor/test_building_blocks.py:40` | existing | the on/off test's compiles |
 
 Provides, all under `torch_spyre._inductor.scratchpad.lx_allocator`:
 
@@ -987,14 +992,14 @@ New, device-free unless marked.
 | `test_adapter_target_uses_allocator_capacity` | The graph's `target.lx_bytes` is `allocator.size`; the rest is `select_target(config)`. |
 | `test_mismatch_reports_lifetime_and_size` | |
 | `test_check_buffers_on_synthetic_graphs[...]` | CP-SAT and SA on `synthetic_cooptimization_graphs.synthetic_graphs()`, no violations. |
-| `test_check_buffers_on_captures[...]` | Same on `cooptimization_capture_loader.load_captures()`. |
+| `test_check_buffers_on_captures[...]` | Same on `cooptimization_capture_loader.load_captures()`. These buffer-level graphs and the synthetic ones take the ladder, so both tests judge legality only, never an optimum. |
 | `test_check_buffers_catches_edits[...]` | An overlapped address, a resident barred buffer, a pair outside `cd_parent_matches`. |
 
 `tests/inductor/test_lx_check_hook.py`:
 
 | test | asserts |
 |---|---|
-| `test_plan_identical_with_check_on_and_off` | Addresses, chosen divisions and the proto match, CP-SAT at one worker. |
+| `test_optimum_unchanged_with_check_on_and_off[...]` | Card. The five `test_building_blocks` compiles Stage 2's e2e test runs (`test_mlp`, `test__simple_attn`, `test_rms_norm`, `test_flash_attention`, `test_sdpa_lk_uses_for_each_tile`), each at the default config, once with `lx_check_decisions` on and then once off, in one process with the FX graph cache off and dynamo reset between runs. A wrapper on `CpSatLayoutSolver.plan_layout_and_core_divisions` records `last_solve_stats["status"]` and `objective_ns = _evaluate(cost_expr, solved_bindings(result))`. Both runs are `OPTIMAL` with `objective_used`, at equal `objective_ns` (1e-9 relative), with one solve per plan and no `SolveError` fallback. A different plan at the same cost passes. |
 | `test_check_failure_does_not_reach_the_compile[...]` | `check_todays_plan` raises `Unsupported`, `SolveError`, `AssertionError`: `ScratchpadAllocator.plan_allocation` finishes unchanged and greedy is not entered. |
 | `test_solve_failure_checks_only_the_fallback` | One record, naming `ScratchpadAllocator`. |
 | `test_check_sees_the_ir_the_solve_saw` | Hook runs before `apply_chosen_tilings`. |
@@ -1018,13 +1023,29 @@ below proves plans pass.
 
 ## Parity and gates
 
-**Every stage (parent):** "the Stage 0 harness, comparing proto, decisions and committed
-plans between the stage's parent and the change." Compared at the PR tip: `intree`, the `fake`
-zoo at both configs, `unit-*` and `failure`, base against this PR, with the check on. Each
-commit runs `intree` and the fixed set. A pass is an empty diff. Any difference is a bug in
-this PR, because nothing here may reach a solver. `fake` inputs use default layouts, so this
-proves parity, not production plans. The timing report on the zoo at default and tiling is
-attached to the PR.
+**No plan change.** The parent's per-stage harness gate is dropped with Stage 0
+(Deviation 13). The claim it guarded here is the Goal's: the check cannot change a plan, a
+model or the outcome of a compile. After the owner's review of PR #7, a plan claim means every
+solve reaches `OPTIMAL` at the same `objective_ns` (`_evaluate(expr, solved_bindings(buffers))`
+on the returned plan), and a different plan at an equal cost is a tie. It is met three ways:
+
+- **On the production path,** by `test_optimum_unchanged_with_check_on_and_off` on the card:
+  the default config (`layout_solver="cpsat"`, co-optimizing on, `auto_coarse_tiling` off)
+  solves one cost-expression model, and `lx_check_decisions` is the switch, so one test runs
+  both sides on the same input. The check-on compile runs first, so state the check leaves
+  behind reaches the check-off compile's solve.
+- **On the ladder paths** (placement-only, auto tiling, the greedy fallback), by position:
+  the hook runs after `_solve` returns, so the model is built and solved before the check
+  starts. `test_check_failure_does_not_reach_the_compile`,
+  `test_solve_failure_checks_only_the_fallback` and `test_disabled_runs_nothing` hold the
+  rest. No ladder objective is compared.
+- **For the rule moves** in commits 3 to 5, which have no config switch and leave no old path
+  to run beside the new one, by `tests/inductor/test_work_division.py` unchanged as the
+  behaviour pin, `test_domains_match_collect`, `test_indirect_access_gather`, and the card
+  suites under Tests, run with the check on at the PR tip.
+
+Each commit runs the parent's unit suites. Nothing is stored between runs: no baseline, plan
+or objective. The timing figure from section 7 is attached to the PR.
 
 **Phase 1 exit (parent):** "across the unit and device suites, `check_decisions` reports
 nothing, or every report traces to a real bug that gets an issue."
@@ -1033,11 +1054,11 @@ How it is met. Run the suites on the card with `SPYRE_LX_CHECK_FILE` set, then r
 `tests/scripts/lx_check_summary.py`. It groups by rule, op kind and solver, and fails on a
 violation, error or mismatch not listed in `lx_check_known.json`. A port defect is fixed. A
 real bug gets an issue and a line in the known file. `evaluated` must be non-zero for every
-rule that applies to the corpus, so silence means checked, and `skipped` is reviewed in the
-same pass.
+rule that applies to the suites' plans, so silence means checked, and `skipped` is reviewed
+in the same pass.
 
-The Stage 3 PR does not wait for this gate: it merges on the parity gate and the unit suites.
-The exit gate closes Phase 1 and must pass before Stage 4 merges. Stages 6 and 8 rerun the
+The Stage 3 PR does not wait for this gate: it merges on the no-plan-change tests and the
+unit suites. The exit gate closes Phase 1 and must pass before Stage 4 merges. Stages 6 and 8 rerun the
 summary, since they add encodings of these rules and a new family.
 
 **What I expect it to report.** None of this has been run. The snapshot has no built
@@ -1067,28 +1088,31 @@ no real report, because every clause is either a menu filter or a model constrai
 
 *Will not be exercised much.* `pinned_steps_stay` and `Rule.COPY_OUT_IN_HBM` are vacuous
 here. The tiling rules run only in `test_solver_auto_coarse_tiling` and with
-`AUTO_COARSE_TILING=1`. Loop-carry pairs are skipped and judged at commit. Restickifies are
-close to unexercised on the zoo; the two restickify graphs in Stage 0's fixed set give
-`cross_frame` and `restickify_sticks_differ` real input. So "reports nothing" at this gate
-is weaker for these rules than for the rest.
+`AUTO_COARSE_TILING=1`. Loop-carry pairs are skipped and judged at commit. Restickifies get
+real input only where a suite compile makes one, so `cross_frame` and
+`restickify_sticks_differ` are judged only there, and the summary's `evaluated` count for each
+shows whether any compile did. So "reports nothing" at this gate is weaker for these rules
+than for the rest.
 
-From #5682's regression guards, this stage reuses plan equivalence through Stage 0 and
-the solve-status guard through the record's allocator and solver fields.
+From #5682's regression guards, this stage covers plan equivalence with
+`test_optimum_unchanged_with_check_on_and_off`, and the solve-status guard through the
+record's allocator and solver fields.
 
 ## Risks
 
 | risk | caught by |
 |---|---|
-| A rule move changes behaviour in a corner. | `test_work_division.py`, `test_indirect_access_gather.py`, the Stage 0 proto diff. |
+| A rule move changes behaviour in a corner. | `test_work_division.py`, `test_indirect_access_gather.py`, `test_domains_match_collect`, and the card suites. No old path is left to compare against in process. |
 | `frame_of` diverges from `work_division_context_for_op`, so rule data drifts from the menu. | `test_frame_matches_context`, `test_domains_match_collect`. |
 | Tests patching `WDC` names stop intercepting after a move. | Those tests fail in commit 3 to 5; old names stay in the call path, so the wrapper must call through its module name. |
 | Import cycle: `WDC` imports `rules.py`, which needs `WD`. | `rules.py` keeps IR imports local; import test runs in every commit. |
 | The hook costs real compile time on large graphs. `build_graph` is sympy-heavy, and views are per edge. | `seconds` per record on a live run; over noise, the default is off. |
-| The check mutates shared state through a memo or `prep_cache`. | Each check uses its own `prep_cache`. `test_plan_identical_with_check_on_and_off`, Stage 0 diff. |
+| The check mutates shared state through a memo or `prep_cache`. | Each check uses its own `prep_cache`. `test_optimum_unchanged_with_check_on_and_off` runs check-on first, so a leak that moves a later solve shows as a changed `objective_ns`. A leak that changes only a commit does not show there. |
+| A building-block compile does not reach `OPTIMAL` within the solver's time limit, so the on/off test has no optimum to compare. | The test fails rather than comparing a `FEASIBLE` objective. The case is replaced by another existing compile that proves its optimum. |
 | `build_graph` needs `V.graph`, set during the pass but not in a test double. | `check_todays_plan` raises, is logged, is contained. Reported as a missing record, which the summary counts. |
 | A broad `except` hides that the check never runs. | `evaluated` counters; summary fails if a suite has plans but no records. |
 | The solver's lifetime exceeds the bound on purpose, so a real overlap of solver spans goes unseen. | Accepted. The bound is what correctness needs: a longer span "can only cost space" (`ILP:1225`). |
-| #5695 lands first. | The adapter reads `chosen_division` for joint buffers and ownership only on the placement path, which #5695 leaves. A rebase re-records baselines. |
+| #5695 lands first. | The adapter reads `chosen_division` for joint buffers and ownership only on the placement path, which #5695 leaves. A rebase reruns the suites; there are no baselines. |
 | #5682 moves `span_reduction` into the solver. | `span_floor` reads `node.span_floors`; only the builder's source changes. |
 | An op tiled before the solve (a `spyre_hint` or `for_each_tile` op) decodes with a non-empty `tiling`, so `COARSE_TILING` reads as used while `auto_coarse_tiling` is off. | `optimizations_used` skips a node with a `tiling` hazard pin, which Stage 2 sets on every op with `loop_info`; the exit-gate summary groups reports by tag, so a miss shows as `COARSE_TILING` on one op kind. |
 | The adapter judges a different card than the allocator planned for. | The adapter's target is `select_target(config)` with `lx_bytes=allocator.size`; `test_adapter_target_uses_allocator_capacity`. |
@@ -1149,6 +1173,13 @@ the solve-status guard through the record's allocator and solver fields.
     its reason, a split reduction combined core to core, describes this card (section 2).
     Resolution: one rule, `Rule.RESIDENT_TILE_UNREDUCED`, checked when the target sets it;
     Stage 6 encodes it under the same condition.
+13. **Stage 0 is dropped (owner, PR #7, 2026-11-12).** This stage's parity gate ran Stage 0's
+    tiers, base against this PR, on proto, decisions and committed plan. None is built. The
+    claim is now the proven optimum, tested in process by
+    `test_optimum_unchanged_with_check_on_and_off` on existing `test_building_blocks` compiles,
+    with `lx_check_decisions` as the switch. The ladder paths and the rule moves rest on the
+    hook's position, the hook tests and the existing suites. The timing figure for the default
+    comes from a card run of the suites, not the zoo.
 
 ## Open questions
 
