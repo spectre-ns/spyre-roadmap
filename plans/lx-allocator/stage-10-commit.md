@@ -1,19 +1,20 @@
 # LX allocator, Stage 10: Commit
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1, 2, 3, 4, 5, 6, 7, 8, 9. Needed by: Stages 11, 12, 13.
+Depends on: Stages 1, 2, 3, 4, 5, 6, 7, 8, 9. Needed by: Stages 11, 12, 13.
 
 ## Goal
 
 When this PR merges, `commit(graph)` lowers a solved graph onto the `GraphLowering` directly and
 runs the post passes, `optimize` writes the full cost dump, and the temporary Stage 9 bridge is
 gone. No code in the optimizer reads `LifetimeBoundBuffer` or `CoreDivisionBuffer`, and
-none calls `_post_solve` or `_push_allocation`. On every corpus entry the new commit produces the
-same IR as those two methods: the same ops in the same order, the same clones, addresses, views,
-divisions, loop metadata and relayout registry, and the same `LxContextSwitchingPass` result. The
-default configuration is unchanged. The old allocators and `_push_allocation` stay in service for
-it until Stage 13, and the extraction refactors below leave them byte-for-byte equivalent in
-behaviour. No layout changes, because the Stage 2 stick pins are still in place.
+none calls `_post_solve` or `_push_allocation`. With equal decisions, on every real compile G1
+runs, the new commit produces the same IR as those two methods in the same process: the same ops
+in the same order, the same clones, addresses, views, divisions, loop metadata and relayout
+registry, the same spill reasons, and the same `LxContextSwitchingPass` result. The default
+configuration is unchanged. The old allocators and `_push_allocation` stay in service for it until
+Stage 13, and the extraction refactors below leave their behaviour unchanged. No layout changes,
+because the Stage 2 stick pins are still in place.
 
 ## Today
 
@@ -435,7 +436,7 @@ only `read_back` knows a solver chose to spill, and staging has cleared a staged
 Then, if any op carries `JOINT_TILING_AND_DIVISION_ATTR`, every op outside `plan.planned` gets
 `setdefault(name, "added by coarse tiling")` (`allocator.py:3659-3668`). In committed mode a node
 with no reason takes the base allocator's "no room" string (`allocator.py:1150`). The map goes to
-the debug log and to `CommitResult.spill_reasons`, where the harness reads it.
+the debug log and to `CommitResult.spill_reasons`, where G1 reads it.
 
 ### Failure
 
@@ -452,9 +453,13 @@ The bridge goes in the same commit that switches `plan_allocation` to `commit(gr
 has neither or both. That commit deletes `lx_allocator/optimizer_bridge.py` (`records_from_graph`,
 `_CommitBridge`), `_commit_via_bridge`, Stage 9's reduced cost line and
 `tests/inductor/test_optimizer_bridge.py` with its config shard, and adds
-`test_optimizer_reads_no_solver_records`. The Stage 3 adapter stays: it runs the other way, records
-onto the graph, and the shadow gate needs it. The gate's base still has the bridge, so its removal
-costs no comparison.
+`test_optimizer_reads_no_solver_records`. It also deletes Stage 9's
+`test_bridge_records_equal_todays_records`, which G1 supersedes, and switches the new arm of Stage
+9's `lx_arms.py` from `objective_on_old_expr` over bridge records to the `objective_ns` of the dump
+line `write_cost_dump` writes, with `run_arm` setting `dump_cost_expr_file` to a temporary file.
+The Stage 3 adapter stays: it runs the other way, records onto the
+graph, and G1 needs it. G1 tests `lower_commit` against `_push_allocation` from commit 4 on, so
+removing the bridge loses no comparison.
 
 ### Cost dump
 
@@ -526,25 +531,28 @@ hashed, and every user recompiles once more when this PR lands.
 | `.../lx_allocator/optimizer_bridge.py`, `tests/inductor/test_optimizer_bridge.py`, `tests/configs/torch_spyre_tests/inductor/test_optimizer_bridge_config.yaml` | Deleted. |
 | `.../lx_allocator/family/base.py`, `family/ortools_encode.py`, `family/sa/`, `family/placement.py` | `DumpTables`, `Family.dump_tables` with `OrToolsFamily.dump_tables` and `SAFamily.dump_tables`, `Solution.score_ns`, `.off_expression_ns`. |
 | `optimizer_pass_sources()` (Stage 9) | Adds `lower_commit`. |
-| `tests/inductor/lx_equivalence.py`, `lx_corpus.py` | New record fields, `SCHEMA_VERSION`, `compile_model(stop_at="codegen")`, the commit hook, `commit_shadow`, all under "Parity and gates". |
-| `tests/inductor/test_lx_commit.py`, `test_lx_commit_e2e.py` | New host tests, new device tests. |
+| `tests/inductor/lx_commit_shadow.py` | New: `commit_snapshot`, `record_decisions`, `replay_decisions`, `commit_shadow`, all under "Parity and gates". |
+| `tests/inductor/lx_arms.py` (Stage 9) | The new arm reads `objective_ns` from the dump line once the bridge is gone. |
+| `tests/inductor/test_spyre_optimizer_e2e.py` (Stage 9) | `test_bridge_records_equal_todays_records` deleted with the bridge. |
+| `tests/inductor/test_lx_commit.py`, `test_lx_commit_e2e.py` | New host tests, new device tests, G1 and G5 among them. |
 | `docs/source/compiler/scratchpad_planning.md` | Name `commit(graph)` beside `_push_allocation` at `:308`. |
 
 Commits, each leaving the suites green:
 
 1. **Extract the shared helpers.** Refactor only. The existing tests at
    `tests/inductor/test_coarse_tiling.py:9750-10780`, `tests/inductor/test_work_division.py:3280`
-   and `tests/inductor/test_cost_expr_dump.py` prove it unchanged, and G0 confirms it.
-2. **Extend the harness record.** Add the fields and `compile_model(stop_at="codegen")`, and bump
-   `SCHEMA_VERSION`. Nothing is re-recorded by hand: `lx_gate.sh` records the base tree with HEAD's
-   harness, so both sides carry the fields.
+   and `tests/inductor/test_cost_expr_dump.py` prove it unchanged, with the suites G0 names.
+2. **Add the shadow helpers.** `commit_snapshot`, `record_decisions` and `replay_decisions` in
+   `tests/inductor/lx_commit_shadow.py`, with host tests on the tiny IR of
+   `tests/inductor/test_scratchpad_use.py:106`. Nothing is stored on disk.
 3. **Add `read_commit_plan` and `relayout_plans`** with host tests. Nothing calls them yet.
 4. **Add `lower_commit` and `verify_copy_outs`** with host tests, plus `commit_shadow`, which
-   drives them from the old allocators. This is how the new code runs before production calls it.
+   drives them from the old allocators, and G1. This is how the new code runs before production
+   calls it.
 5. **Add `dump_tables`, `graph_bindings` and `write_cost_dump`** with host tests, still uncalled.
 6. **Switch `plan_allocation` to `commit(graph)`, delete the bridge,** and add the post passes, the
-   dump, the `optimizer_pass_sources()` entry, the commit hook, the guard, device tests and the doc
-   note.
+   dump, the `optimizer_pass_sources()` entry, `test_optimizer_reads_no_solver_records`, the
+   `lx_arms.py` change, G5, the other device tests and the doc note.
 
 ## Interfaces
 
@@ -572,15 +580,15 @@ Commits, each leaving the suites green:
 | `plan_allocation`, `optimize` | `plan_allocation(ir, config) -> SpyreOptimizationGraph`; `optimize(graph, family, fallback, settings)`: `check_decisions` raises before return, and nothing is read back after a proven-infeasible solve | 9 | `plan_allocation` calls `commit` after `optimize`, outside the fallback flow; `optimize` writes the cost dump |
 | `_context_switching_passes` | `() -> list[ScratchpadOptimizationPass]`, the same for every family | 9 | `commit` runs them |
 | `optimizer_pass_sources()` | planner sources in the FX key | 9 | adds `lower_commit` |
-| `records_from_graph`, `_CommitBridge`, `_commit_via_bridge` | temporary; records in `_build_cd_bound_buffers` order, inputs first | 9 | G2's base, then deleted here |
-| harness | `lx_gate.sh`, `Recorder.record_commit`, `snapshot_commit`, `OPTIONAL_TARGETS`, `compile_model`, `corpus_coverage`, `SCHEMA_VERSION` | 0 | gates, extended below |
+| `records_from_graph`, `_CommitBridge`, `_commit_via_bridge` | temporary; records in `_build_cd_bound_buffers` order, inputs first | 9 | deleted here |
+| Arm helpers, `committed_hbm_traffic` | `run_arms(case, **config_patch) -> (old, new)`, `ArmRun`, `objective_on_old_expr` in `tests/inductor/lx_arms.py`; `committed_hbm_traffic(graph) -> int` in `lx_traffic.py`; the arm cases and Gate 2's rules | 9 | G2, G5; the new arm's objective source changes here |
 
 ### Provides
 
 | symbol | signature | for Stages | stability |
 |---|---|---|---|
 | `commit` | `commit(graph) -> None`, runs `_context_switching_passes()` after `lower_commit` | 11, 12, 13 | final |
-| `read_commit_plan`, `lower_commit`, `CommitPlan`, `CommitResult`, `CollectiveStage`; `relayout_plans` | as in Design; `lower_commit` returns the `CommitResult` the harness hook reads; `(graph) -> tuple[LXRelayoutPlan, ...]` | 11 | final |
+| `read_commit_plan`, `lower_commit`, `CommitPlan`, `CommitResult`, `CollectiveStage`; `relayout_plans` | as in Design; `lower_commit` returns the `CommitResult` G1 reads; `(graph) -> tuple[LXRelayoutPlan, ...]` | 11 | final |
 | `write_cost_dump`, the `cost_expr_record` writer | `(graph, family, encoding, solution) -> None`; today's schema | 12, 13 | final |
 | `cost_record`, `DumpTables`, `Family.dump_tables` | as in Design; `dump_tables(encoding, solution) -> DumpTables`, which extends Stage 7's `Family` protocol; `OrToolsFamily` and `SAFamily` implement it | 12, 13 (every family `FAMILIES` holds) | final |
 | `push_one_placement`, `commit_chosen_divisions`, `check_priced_footprint`, `accepted_lx_views`, `collective_output_stages`; `apply_tiling_choices`, `splits_from_divisions` | as in Design | 13 | final; they stay in `allocator.py` and `coarse_tiling.py` |
@@ -636,86 +644,102 @@ Existing suites: the serial list in the parent's Verification, plus `test_cost_e
 suites, per the parent: `test_scratchpad_use`, `test_work_division`, `test_solver_relayout_e2e`,
 `test_solver_auto_coarse_tiling`, `test_lx_planning_suite`.
 
-The parent's claim for this stage is proven by G1 and G2 below, not by the unit tests.
+The parent's claim for this stage is proven by G1 and G2 below, not by the unit tests. G1 and
+G5 live in `test_lx_commit_e2e.py` as `test_commit_matches_push_allocation[case, config]` and
+`test_cost_dump_matches_todays[case]`.
 
 ## Parity and gates
 
 The parent says: "`commit(graph)` inserts each edge's steps in canonical order (pinned steps
 already exist), then commits divisions and offsets through `GraphEditor`. This replaces
-`_push_allocation`," "`LxContextSwitchingPass` runs after commit, unchanged," and under
-Verification, "comparing proto, decisions and committed plans between the stage's parent and the
-change." Stage 0 records "inserted clones, relayout ops, addresses, divisions and spill reasons."
+`_push_allocation`," and "`LxContextSwitchingPass` runs after commit, unchanged." The parent's
+Verification ran every stage through the Stage 0 harness, which is dropped (Deviation 9). This
+stage instead checks the claim directly: with equal decisions, `commit` produces the same
+committed graph as `_push_allocation`, in the same process. Nothing is stored.
 
-**What that record is missing.** Those five fields do not prove equality of the effects listed
-under "What depends on the result". Commit 2 extends the format and bumps `SCHEMA_VERSION`. The
-record is taken at two points:
+**What G1 compares.** Inserted clones, relayout ops, addresses, divisions and spill reasons do not
+on their own prove equality of the effects listed under "What depends on the result", so
+`commit_snapshot(ir)` takes one snapshot when `scratchpad_planning` returns, after the post passes,
+so it covers `LxContextSwitchingPass`:
 
-- **P1**, when `_maybe_scratchpad_planning` returns: `graph_snapshot(graph)` from
-  `tools/lx_planning/lx_semantic_plan.py:181`, which already covers the op list with names and
-  kinds, layouts with allocation and `lx_view`, dependencies, `iteration_space_ownership`,
-  `loop_info`, outputs and the registry. Added beside it: `dim_hints`, `symbols_on_tile`,
-  `_work_division_chosen_with_tiling`, presence of `_loop_carry_record`, `graph_outputs` wrapper
-  types, `name_to_users`, `additional_buffer_deps`, the FX node list with arguments, and spill
-  reasons. P1 is after post passes, so it covers `LxContextSwitchingPass`.
-- **P2**, at codegen: the `graph`, `op_specs`, `pool_size` and `arguments` that `capture_off_plan`
-  records, plus `last_cost_report` with the cost model on. P2 covers elision, demotion, HBM
-  pooling and OpSpec emission. `capture_off_plan` itself cannot be used under the default config
-  because of its `lx_extended_ownership` check, so the harness calls `graph_snapshot` and `freeze`
-  from its own wrapper of `SpyreKernel.codegen_kernel`. Stage 0's driver stops after
-  `CustomPreSchedulingPasses.__call__`, so commit 2 adds `compile_model(stop_at="codegen")`. No run
-  has shown a `fake` compile reaching codegen. A model that does not gets P2 on the card only.
+- `graph_snapshot(graph)` from `tools/lx_planning/lx_semantic_plan.py:181`, which already covers
+  the op list with names and kinds, layouts with allocation and `lx_view`, dependencies,
+  `iteration_space_ownership`, `loop_info`, outputs, removed buffers and the registry. It is
+  called directly, not through `capture_off_plan`, whose contract requires
+  `lx_extended_ownership` off (Surprises).
+- Beside it: `dim_hints`, `symbols_on_tile`, `_work_division_chosen_with_tiling`, presence of
+  `_loop_carry_record`, `graph_outputs` wrapper types, `name_to_users`, `additional_buffer_deps`,
+  and the FX node list with arguments.
+- Spill reasons: run A's from a wrapper of `_get_spill_reasons`, run B's from its
+  `CommitResult`.
 
-The commit hook moves from `_push_allocation` to `commit(graph)` by wrapping the `lower_commit` it
-calls, so the `CommitRecord` snapshot stays before the post passes, where the old hook takes it. It
-calls `snapshot_commit` with `allocator="plan_allocation"` and
-`spill_reasons=result.spill_reasons`, and its target joins `OPTIONAL_TARGETS`, because the base has
-no `commit`. The `_push_allocation` hook stays for the old path.
+Codegen is not compared. Every pass after planning reads only the committed graph and config
+("What depends on the result"), and the device suites run it on a card.
 
-**Which corpus entries can run commit.** Unit-test solves, the synthetic graphs and capture pickles
+**Equal decisions.** Two compiles of one model can return different plans at an equal cost, so G1
+does not solve twice. `record_decisions` wraps the solver method the allocator calls
+(`plan_layout_and_core_divisions`, or `plan_layout` on the placement path and in the greedy
+re-plan) and keeps, per solve and by buffer name, the address, the chosen division by value,
+`chosen_relayouts` and the spill reason. `replay_decisions` patches the same method in run B to
+write them onto B's own buffers and return without solving. A name, a solve count or a division
+that B's menus lack fails the test. Both compiles run after `torch.compiler.reset()` with
+`force_disable_caches=True`, as `tests/inductor/test_scratchpad_use.py:254` does, so buffer names
+agree.
+
+**Which compiles can run commit.** Unit-test solves, the synthetic graphs and capture pickles
 cannot: they hold no IR (`tests/inductor/synthetic_cooptimization_graphs.py`,
-`probes-cpsat-graph/README.md`). The `fake` zoo at `ZOO_CELLS`, `matrix` and `failure` can, by
-compiling again, with no card. `unit-device` suites can, on a card. `zoo` and `CARD_ONLY` models are
-compared at card calibration, Stages 9 and 12.
-
-So "the whole corpus" means every entry that reaches a live `GraphLowering`. The PR-tip gate is
-Stage 0's row for this stage: all tiers including `matrix`, through `lx_gate.sh` with HEAD's harness
-over the base tree. A commit-level gate is `intree` and the fixed set. `fake` proves parity, not
-production plans, because fake inputs use default layouts. Determinism is one worker, seed 0 and a
-deterministic budget, through Stage 0's patch of `SolveSettings.from_config`. The PR reports hits per
-coverage feature, including the five restickify features.
+`probes-cpsat-graph/README.md`). Real compiles can, on a card, where CI test jobs run. G1's cases
+are Stage 9's arm cases (the building-block bodies and the softmax and MLP factories of
+`test_scratchpad_use.py`) and the bodies of the device tests in `test_lx_commit_e2e.py` below,
+which reach the copy-out, relayout, prefetch, drain and staging branches the arm cases may not.
+Configs: `layout_solver` `cpsat` and `simulated_annealing`, each at default, at
+`AUTO_COARSE_TILING=1` and with `co_optimizing_lx_planning=False`, plus the forced timeout of
+`tests/inductor/test_scratchpad_use.py:1477` on both runs for the greedy re-plan.
 
 **The gates.**
 
-- **G0, default path untouched.** The Stage 0 comparison between base and change, default config:
-  protos, decisions and P1 and P2 records all equal. This proves the extraction inert.
-- **G1, shadow: commit against `_push_allocation` on the same decisions, one tree.** For each
-  usable entry, compile twice. Run A is unmodified. Run B patches `_post_solve` to a no-op and
-  `_push_allocation` to `build_graph`, then `decode_todays_plan`, then `read_commit_plan` and
-  `lower_commit`. `commit_shadow` is a harness monkeypatch, never production code. The adapter and
-  `build_graph` run before any edit, because `_post_solve` has been disarmed. Both runs keep the
-  allocator's own post passes. This compares against today's real solvers, including the greedy
-  replan, and answers the stage's question literally. It stays runnable until Stage 13. B's spill
-  reasons come from its `CommitResult`.
-- **G2, tree to tree.** On the `ortools` and `sa` cells: base (bridge) against change (commit), the
-  same comparison, at both configs and in committed mode.
+- **G0, default path untouched.** No code on the default path calls `commit`, which Stage 9's
+  `test_old_values_never_reach_plan_allocation` covers. Commit 1's extraction is a refactor: the
+  existing tests named there, the unit list and device suites under Tests, and
+  `test_cost_expr_dump` stay green without edits.
+- **G1, shadow: commit against `_push_allocation` on the same decisions, one process.** For each
+  case and config, compile twice. Run A is unmodified and records its decisions. Run B replays
+  them, patches `_post_solve` to a no-op and `_push_allocation` to `build_graph`, then
+  `decode_todays_plan`, then `read_commit_plan` and `lower_commit`. `commit_shadow` is a test
+  monkeypatch, never production code. The adapter and `build_graph` run before any edit, because
+  `_post_solve` has been disarmed. Both runs keep the allocator's own post passes. This compares
+  against today's real solvers, including the greedy re-plan, and answers the stage's question
+  literally. It stays runnable until Stage 13.
+- **G2, the new path end to end.** Stage 9's arm tests, rerun on this PR with `commit` in place of
+  the bridge, with Stage 9's rules unchanged. The joint objective is fixed before commit, so what
+  this adds is that committed graphs from each family compile and match CPU, and that committed
+  traffic, which is measured after commit, stays in Stage 9's bands.
 - **G3, device suites** above, on a card with each family selected, by dispatch of Stage 9's
   `lx_planner_compare.yaml` with `SPYRE_LX_ROUTE_TO_FAMILIES=1`.
 - **G4,** `test_optimizer_reads_no_solver_records`.
-- **G5, cost dump.** On the fixed set, `ortools` and `sa` cells against the old allocators' records
-  on the same decisions: the same keys, and equal `bindings`, `bundles`, `divisions`,
-  `objective_ns` and each relayout term's `value_ns`.
+- **G5, cost dump.** `test_cost_dump_matches_todays[case]` runs Stage 9's `run_arms` with
+  `dump_cost_expr_file` set on both arms, `layout_solver` `cpsat` and `simulated_annealing`,
+  default config. Per solve: the same keys, and equal values for the keys that do not depend on
+  the decisions (`buffers`, `buffer_sizes`, `params`, each bundle's `ops` and `expr`, `divisions`
+  without `chosen`, `priced_relayouts`). On CP-SAT both arms are `OPTIMAL` with `objective_ns`
+  equal to a relative 1e-9. The old arm's value is today's expression under `solved_bindings`,
+  and the new arm's is `graph_bindings`, so an equal optimum checks the new bindings. On SA,
+  `score_ns` is equal at seed 0. `bindings`, `chosen` and each `value_ns` are compared only where
+  the two arms' decisions agree; elsewhere the plans are a tie and the PR lists them. Under
+  `AUTO_COARSE_TILING=1` neither arm writes a line on CP-SAT (flow 7 in Stage 9) until #6124
+  lands, and SA's `matches` and `chosen` are compared where the decisions agree.
 
-**Pass and normal form.** P1 and P2 must be equal, names included, as in `lx_semantic_plan`
-("an unstable name stops equality"). The harness applies one normal form, and only this one: when
-one source fires two or more relayout groups, a run of adjacent relayout clones of that source
-compares as a set, with names mapped by `(source, consumers, destination view)`. The PR reports how
-many solves needed it. If none did, the normal form is removed before merge.
+**Pass and normal form.** G1's two snapshots must be equal, names included, as in
+`lx_semantic_plan` ("an unstable name stops equality"). G1 applies one normal form, and only this
+one: when one source fires two or more relayout groups, a run of adjacent relayout clones of that
+source compares as a set, with names mapped by `(source, consumers, destination view)`. The PR
+reports how many solves needed it. If none did, the normal form is removed before merge.
 
 **A difference** is fixed unless it is one of these, each listed by rule in the PR:
 
-1. An `sa` cell against an old `simulated_annealing` arm: the family brackets an extern kernel and
-   today's allocator does not. This is Deviation 7. Old SA arms carry Stage 9's baseline patch, so it
-   shows only on an unpatched arm. G1 and G2 do not meet it: both sides of each run the same passes.
+1. SA brackets: the family brackets an extern kernel and today's joint SA allocator does not. This
+   is Deviation 7. G1 does not meet it, since both runs keep the old allocator's post passes, and
+   G2 compares joint SA arms by score, before commit.
 2. Spill reason text: tick numbers in the committed-mode "no room" string. It is debug text only.
 3. Relayout clone order, as above.
 4. Cost dump text: `env.solver`, `env.allocator`, and a relayout term's `expr`, which prints
@@ -727,21 +751,21 @@ Anything else blocks the merge.
 
 | risk | caught by |
 |---|---|
-| A clone's name or position shifts because record order differs. | G1 and G2 compare names and op order. `test_order_*`. |
+| A clone's name or position shifts because record order differs. | G1 compares names and op order. `test_order_*`. |
 | An op object is held across `apply_tilings` and goes stale. | Names only in `CommitPlan`. G1 under `AUTO_COARSE_TILING=1`. |
-| A relayout source's or input's view differs in slot spelling from today's. | `source_view` and `prefetch_view` carried from the solve; `lx_view` in P1, OpSpecs in P2. |
-| An offset or footprint is used in the wrong unit. | `test_read_plan_scales_units`; `allocation` in P1. |
-| Metadata is snapshotted before divisions or tilings land. | `test_lower_order`; `iteration_space_ownership` and `loop_info` in P1. |
-| A step is lowered twice, or a pinned op re-inserted. | `test_pinned_restickify_*`; op list in P1. `materialize_lx_relayouts` raises on a second run. |
+| A relayout source's or input's view differs in slot spelling from today's. | `source_view` and `prefetch_view` carried from the solve; `lx_view` in G1's snapshot; G3 runs the OpSpecs on a card. |
+| An offset or footprint is used in the wrong unit. | `test_read_plan_scales_units`; `allocation` in G1's snapshot. |
+| Metadata is snapshotted before divisions or tilings land. | `test_lower_order`; `iteration_space_ownership` and `loop_info` in G1's snapshot. |
+| A step is lowered twice, or a pinned op re-inserted. | `test_pinned_restickify_*`; op list in G1's snapshot. `materialize_lx_relayouts` raises on a second run. |
 | Committed mode overwrites anchored owners. | `test_committed_mode_skips_division_commit`; G1 on `co_optimizing_lx_planning=False`. |
 | A staged output overlaps a live box. | Step 6 raises before any address lands. `test_staged_overlap_raises_before_placement`. |
-| Not verified: `live_boxes` may measure a staged node larger than the `partition_footprint` its gap was found with, so step 6 raises on a good plan; and a resident input's span from `prefetch_view` may differ from its prefetch division's `per_core_size`, which feeds only staging's gap search. | G1 and G2 on models with staging. |
-| The post passes are lost with the bridge. | `test_commit_runs_post_passes_after_lower`; `test_context_switching_after_commit`; P1. |
+| Not verified: `live_boxes` may measure a staged node larger than the `partition_footprint` its gap was found with, so step 6 raises on a good plan; and a resident input's span from `prefetch_view` may differ from its prefetch division's `per_core_size`, which feeds only staging's gap search. | G1 on cases with staging. |
+| The post passes are lost with the bridge. | `test_commit_runs_post_passes_after_lower`; `test_context_switching_after_commit`; G1's snapshot, taken after the post passes. |
 | Failure after tilings is treated as recoverable. | `plan_allocation` contract in Consumes; a test that `Unsupported` from step 4 propagates. |
-| #5695 lands first and adds deferred divisions. | It changes `commit_divisions`, which this stage extracts, so both paths inherit it. Rebase, re-record. It also adds "after the solve, for ops the solve committed no split to", which belongs in `commit_chosen_divisions`. |
+| #5695 lands first and adds deferred divisions. | It changes `commit_divisions`, which this stage extracts, so both paths inherit it. Rebase and rerun G1. It also adds "after the solve, for ops the solve committed no split to", which belongs in `commit_chosen_divisions`. |
 | `scratchpad_planning` runs under `_flat_operations` (`passes.py:447`), so `graph.operations` may be an `OpsView`, where a rebind raises (`passes.py:472`). | Only the editor's and `coarse_tile`'s existing index, insert and remove calls are used. `tests/inductor` loop-node tests in the suites. |
 | The FX cache reuses stale compiles after a commit change. | `test_commit_module_is_in_pass_sources`. |
-| G1 proves nothing on a path the corpus never takes, such as staging or same-tile relayouts (`lx_same_tile_group_relayout` is off by default). | The PR reports, per branch of `push_one_placement`, how many corpus hits it had. A zero-hit branch needs a device test. Same-tile relayout gets one G1 run with the flag on. |
+| G1 proves nothing on a path its cases never take, such as staging or same-tile relayouts (`lx_same_tile_group_relayout` is off by default). | The PR reports, per branch of `push_one_placement`, how many G1 cases reached it, counted by a wrapper in the test. A zero-hit branch needs a device test. Same-tile relayout gets one G1 run with the flag on. |
 
 ## Deviations from the parent plan
 
@@ -781,6 +805,15 @@ Anything else blocks the merge.
    can read out of its own native model. Resolution: the protocol gains the method, and `optimize`,
    which holds the accepted family, `Encoding` and `Solution`, writes the dump before it returns.
    A family whose tables carry `cost_expr=None` writes no line.
+9. **Stage 0 is dropped (owner, PR #7, 2026-11-12).**
+   Plan: the Stage 0 harness compares proto, decisions and committed plans between parent and
+   change, and this stage gated on its tiers through `lx_gate.sh`, with `snapshot_commit` records
+   and commit-record diffs. Resolution: no harness, record or stored plan. G1 compiles each case
+   twice in one process, replays run A's decisions into run B, and compares `commit`'s committed
+   graph with `_push_allocation`'s: clones, relayouts, addresses, divisions, spill reasons and the
+   rest of `commit_snapshot`. G0 is the existing suites. G2 and G5 reuse Stage 9's arm tests and
+   compare objectives, not plans. The tree-to-tree bridge comparison is gone: G1 covers `commit`
+   at equal decisions, and Stages 7 and 8 own `read_back`.
 
 ## Open questions
 
