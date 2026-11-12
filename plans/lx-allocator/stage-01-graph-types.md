@@ -1,7 +1,7 @@
 # LX allocator, Stage 1: Graph types
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stage 0 (the `intree` tier, for the gate only).
+Depends on: none.
 Needed by: Stages 2 to 13.
 
 ## Goal
@@ -809,7 +809,6 @@ Consumes:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| harness `intree` tier | as Stage 0 names it | Stage 0 | the gate; no production call |
 | `FixedTiledLayout` | `(device, dtype, size, stride, device_layout, offset=0)`, `.unallocated_copy()` | existing, `ir.py:89` | every `apply` |
 | `SpyreTensorLayout` | `_C.pyi:186` | existing | `moved_stick`, tests |
 | `restickify_device_size` | `(old_device_size, old_sd_outer_dim, old_sd_host_size, new_sd_outer_dim, new_sd_host_size, stick_size) -> list` | existing, `pass_utils.py:2271` | `moved_stick` |
@@ -1017,19 +1016,18 @@ are masked by the config where the builder derives them, so Stage 2 tests the ma
 
 ## Parity and gates
 
-The parent plan's gates:
+The parent plan asks that each stage leave the full suite green and, through Phase 1, change
+no plan. After the owner's review of PR #7, "no plan change" means every solve reaches
+`OPTIMAL` at the same value of the cost expression (`objective_ns`, `_evaluate(expr,
+solved_bindings(buffers))` on the returned plan), not an identical proto or plan. The parent's
+per-stage harness gate is dropped (Deviation 17).
 
-> Each stage is its own PR on `main` and leaves the full suite green. Through Phase 1, and in
-> Phase 2 wherever the rules agree with today's, the CP model stays byte-identical and the
-> committed plans stay identical.
-
-> **Every stage:** the Stage 0 harness, comparing proto, decisions and committed plans between
-> the stage's parent and the change.
-
-**How they are met.** This stage runs the `intree` tier and the import test, on the PR tip. Pass
-means an empty diff in proto, status, objective, decisions and committed plan, and any difference
-is a bug in this PR. It does not run the zoo, `matrix` or a card: nothing imports the package, so
-those would prove nothing that `grep -r lx_allocator torch_spyre` outside the package does not.
+**How they are met.** No production module imports the package, so no compile reaches the
+new code and no solve can change. The PR shows `grep -rln lx_allocator torch_spyre` listing
+only files under `scratchpad/lx_allocator/`. There is no old-versus-new comparison to run,
+because there is no new path. The gate is the parent's unit suites, serially, green on the PR
+tip, plus this PR's tests and `make check-all-configs`. No card run is needed: nothing calls the
+package, so a card run would prove nothing the grep does not.
 
 Agreement with today's code is proven per function by the `matches` tests. They run on hand-built
 fixtures, not real compiles. Real-graph agreement of `lifetime`, sizes and read sets is a Stage 2
@@ -1042,16 +1040,18 @@ gate.
   Interfaces, and review. A wrong use would show as a missing restickify in Stage 3's check.
 - **`stick_dims` trusts `stride_map`.** It returns `()` when no unique host dim matches, which reads
   as "not stuck" and widens a domain instead of failing. Unknown how often. Caught by Stage 3's
-  comparison with `WorkDivisionContext` on the corpus.
+  comparison with `WorkDivisionContext` (`test_domains_match_collect`) and its Phase 1
+  exit run over the suites.
 - **`read_ticks` and `uses` diverge.** `lifetime` prefers `uses`, so a divergence would hide in
   `read_ticks`. Earlier work matched read sets 744/762, with the misses being multi-output plumbing
   (feasibility §3c). Caught by Stage 2's comparison with the records.
 - **`deepcopy` of a big graph.** On a 400-node chain of the prototype, `copy.deepcopy` raised
   `RecursionError` through the port and edge links. A built graph also holds live ops in `op` and
-  `graph.ir`, so it must not be deep-copied or pickled at all. Stage 0 records decisions, not graphs,
-  and SA's `copy.deepcopy(ff_bufs)` (`sa_cooptimizer.py:1285`) must not be ported as a graph copy.
+  `graph.ir`, so it must not be deep-copied or pickled at all. No stage stores a graph, and SA's
+  `copy.deepcopy(ff_bufs)` (`sa_cooptimizer.py:1285`) must not be ported as a graph copy.
 - **`read_layout` cost.** It builds a layout per step per call. Enumeration is the main planning
-  cost, so Stage 5's timing run must include it. The fix is memoizing in `encode`, not the graph.
+  cost, so any measure of Stage 5's planning time must include it. The fix is memoizing in
+  `encode`, not the graph.
 - **My import measurements used a foreign `_C.so`.** The snapshot has no extension, so I used the
   Oct 18 build from `/home/senuser/torch-spyre` with the snapshot's Python. Module lists come from
   Python imports and should hold. `_C` behaviour (layout construction, `stride_map`) is from that
@@ -1081,8 +1081,9 @@ gate.
    solver type. Inputs sit in `nodes` with no tick and raise in `step`.
 6. **Two more node types, and a pre-pass restickify as a step alone.** Extern kernels and CPU buffers
    run and hold a tick but fit no parent type: `OpaqueNode`. A restickify op has its own division,
-   residency and box, so a step alone cannot keep the model byte-identical: `RestickifyNode` plus
-   `Step(kind=StepKind.RESTICKIFY, pinned=True, realized_by=node)`. Both get a row in `SPYRE_OPS`.
+   residency and box, so a step alone drops those decisions from the model and need not reach
+   today's optimum: `RestickifyNode` plus `Step(kind=StepKind.RESTICKIFY, pinned=True,
+   realized_by=node)`. Both get a row in `SPYRE_OPS`.
    Because it is a node, `lifetime` takes an `OpNode` or a relayout `Step` only.
 7. **Canonical order.** The Steps table gives `RESTICKIFY` order 1 and `RELAYOUT` order 2. Both
    orders are legal in today's code: restickify then relayout (`lx_relayout.py:661-690`, with an
@@ -1121,6 +1122,12 @@ gate.
     `graph/target.py` importing Stage 4's `cost.py`. Resolution: `SPYRE.cost_model` stays `None`,
     and Stage 2's `select_target` attaches `COST_MODELS.get(target.name)` from `cost.py` once
     Stage 4 lands.
+17. **Stage 0 is dropped (owner, PR #7, 2026-11-12).** This stage depended on Stage 0's
+    `intree` tier for its gate, and the parent's gates ran the harness on every stage. No
+    harness, golden or recording is built. Since nothing outside the package imports it, the
+    gate here is the parent's unit suites, this PR's tests and the grep under Parity. Where a
+    later stage claims parity, it means both paths reach `OPTIMAL` at equal `objective_ns`;
+    the uniqueness probe stays a diagnostic.
 
 ## Open questions
 
@@ -1128,8 +1135,8 @@ Both must be settled before this PR merges, because every later parity gate depe
 plan is written against the recommendations.
 
 1. **Does a pre-inserted restickify stay a `RestickifyNode` plus a pinned step?** Recommendation:
-   yes. It is the only form that keeps byte parity with no flag exemption, and the parent's "pinned
-   step" still holds on the edge. If the answer is a step alone, a restickify `Step` needs the
+   yes. It is the only form that keeps today's model, and so today's optimum, with no flag
+   exemption, and the parent's "pinned step" still holds on the edge. If the answer is a step alone, a restickify `Step` needs the
    node's division, tick, size and residency, and Stages 2, 3, 5, 6, 7, 8 and 10 change.
 2. **Is relayout-before-restickify a legal step order, with list order physical?** Recommendation:
    yes. It is legal in the code, and the only test of it is mocked. If the answer is no,
