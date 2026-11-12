@@ -1,7 +1,7 @@
 # LX allocator, Stage 2: Builder
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0, 1. Needed by: Stages 3, 4, 5, 6, 7, 8, 9, 10, 11, 13.
+Depends on: Stage 1. Needed by: Stages 3, 4, 5, 6, 7, 8, 9, 10, 11, 13.
 
 ## Goal
 
@@ -12,9 +12,10 @@ with no solver and no allocator instance: one node per leaf op, made through
 masked by each node type's config, and pins. The graph keeps `target`. Nothing in
 production calls either yet. The production edits are a set of extractions inside
 `allocator.py` with no behaviour change and the `config.target` setting, which only joins
-the FX graph cache key, so the CP model, decisions and committed plans stay
-byte-identical. Faithfulness is proven by comparing the graph with the allocator's
-records, which become the test oracle rather than the builder's input.
+the FX graph cache key, so no solver sees a different input and every solve keeps today's
+status and optimum. Faithfulness is proven by comparing the graph with the allocator's
+records inside compiles the existing suites already run, so the records become the test
+oracle rather than the builder's input.
 
 ## Today
 
@@ -573,13 +574,14 @@ Nothing here assumes a solver, so a debug greedy solve is unaffected.
 | `torch_spyre/_inductor/config.py` | `target: str = "spyre"`, in the FX graph cache key |
 | `torch_spyre/_inductor/scratchpad/allocator.py` | extract `division_pin_reasons`, `inplace_edge_ok`, `op_inputs_good_for_lx_inplace` |
 | `tests/inductor/test_graph_builder.py` | new, device-free fixtures |
-| `tests/inductor/test_graph_builder_e2e.py` | new, `fake` compiles |
-| `tests/inductor/graph_builder_oracle.py` | new: `assert_graph_matches_records`, `make_observer` |
+| `tests/inductor/test_graph_builder_e2e.py` | new, on the card: the oracle inside existing `test_building_blocks` compiles |
+| `tests/inductor/graph_builder_oracle.py` | new: `assert_graph_matches_records`, `install_oracle`, `OracleRun` |
 | `tests/configs/torch_spyre_tests/inductor/test_graph_builder_config.yaml`, `test_graph_builder_e2e_config.yaml` | new shard configs |
 
 Commits, each with tests green:
 
-1. The three `allocator.py` extractions. Harness diff empty.
+1. The three `allocator.py` extractions, with `test_division_pin_reasons_matches_division_map`.
+   The suites that patch or call these helpers stay green unchanged.
 2. `division_convert.py` with its round-trip test.
 3. `config.target`, `select_target`, `classify`, nodes through `target.ops.make` in op
    order, the one-config-per-type assertion, axes, ports, axis maps, `matmul_axes`, node rule
@@ -609,7 +611,9 @@ Commits, each with tests green:
 | `Pin`, `WorkSplitPin`, `DimOrderPin`, `DirectReadStick` | `WorkSplitPin(split, reason, seeds=())`, `DimOrderPin(indirect_device_pos, stride_map)`, `DirectReadStick(axis, eps)`; sources `graph input`, `pre-pass`, `layout`, `hazard`, `committed`, `greedy`, `hint` | 1 | pins |
 | `stick_dims`, `SPARSE_STICK` | `stick_dims(layout) -> tuple[int, ...]`, `SPARSE_STICK = -1`, in `steps.py` | 1 | stick pins |
 | `lx_graph_fixtures.py` | layout builders | 1 | unit fixtures |
-| harness | `record_compile(name, cell, out, *, device="fake", observers=...)`, `Observer.on_solve_begin(allocator, solver, ir, buffers, cost_expr)`, `check_guards`, `lx_gate.sh`, `Cell`, `DEFAULT_CELL`, `TILING_CELL`, `FIXED_GRAPHS`, `corpus_coverage`, `CARD_ONLY` | 0 | oracle, gates |
+| `ScratchpadAllocator._build_solver` | `(self, buffers) -> MemoryPlanSolver`; `plan_allocation` calls it once, after `_prepare_buffers` and before `_solve` (`torch_spyre/_inductor/scratchpad/allocator.py:1007`, `:1044-1046`) | existing | the oracle's patch point |
+| `CoOptimizingAllocator` | `torch_spyre/_inductor/scratchpad/allocator.py:3085` | existing | joint or placement path, by `isinstance` |
+| `TestBuildingBlocks` | `tests/inductor/test_building_blocks.py:40` | existing | the e2e compiles |
 
 **Provides**
 
@@ -679,16 +683,29 @@ Every fixture builds with `SPYRE`, or with a target derived from it by `replace`
 | `test_refuses_nested_list`, `test_ops_view_sees_leaves` | `LoopNode` precondition; ticks through a real `OpsView` are leaf positions |
 | `test_build_is_deterministic`, `test_build_does_not_mutate_ir` | same structure over two builds and hash seeds; no op attribute changes except the `op_read_writes` memo. On the rebase over #5695, a deferred pinned op is added, and its ownership stays unset |
 
-**`tests/inductor/test_graph_builder_e2e.py`, on `fake` compiles.** A fake compile needs a
-process of its own, so each model runs through `record_compile(model, cell, out,
-device="fake", observers=("graph_builder_oracle:make_observer",))`. The observer's
-`on_solve_begin` calls `build_graph(ir, select_target(config), divisions_committed=not
-joint)` on the live graph,
-where `joint` is `isinstance(allocator, CoOptimizingAllocator)`, and
-`assert_graph_matches_records(graph, buffers)` on the result, and the compile continues. A
-mismatch raises inside the observer, `check_guards` reports it, and the case fails. Models
-are `FIXED_GRAPHS`, restickify graphs included, at `DEFAULT_CELL` and
-`Cell(co_optimizing=False)`. Every comparison below happens before a solver runs.
+**`tests/inductor/test_graph_builder_e2e.py`, on the card.** The oracle runs inside
+compiles an existing suite already makes. `graph_builder_oracle.install_oracle(monkeypatch)`
+wraps `ScratchpadAllocator._build_solver`
+(`torch_spyre/_inductor/scratchpad/allocator.py:1007`), which `plan_allocation` calls once,
+with the allocator's records in hand and before any solver runs (`:1044-1046`). The wrapper
+calls `build_graph(V.graph, select_target(config), divisions_committed=not joint)`, where
+`joint` is `isinstance(self, CoOptimizingAllocator)`, then
+`assert_graph_matches_records(graph, buffers)`, and calls through. It catches a mismatch and
+appends it to the returned `OracleRun`, so the compile finishes and the test reports every
+mismatch, not the first. `OracleRun` also counts builds and the `RestickifyNode`s it saw.
+
+Each case runs one existing test method as it stands: `TestBuildingBlocks(name)`, `setUp()`,
+then the method. The cases, all in `tests/inductor/test_building_blocks.py`, are `test_mlp`
+(a SwiGLU MLP, `:103`), `test__simple_attn`
+(softmax attention, `:76`), `test_rms_norm` (`:130`), `test_flash_attention` (`:319`) and
+`test_sdpa_lk_uses_for_each_tile` (`:378`, a counted loop, so loop facts and `OpsView`
+ticks meet real input). Each runs under three configs through `config.patch`: the default
+(joint, `cpsat`), `co_optimizing_lx_planning=False` (placement), and
+`auto_coarse_tiling=True`. The test turns the FX graph cache off and resets dynamo before
+each case, then asserts `run.builds >= 1`, so a cached compile cannot pass with no oracle run,
+and `run.mismatches == []`. The module also asserts that some case built a `RestickifyNode`
+with its pinned step; if none of these compiles has one, the PR adds an existing compile
+that does, and names it here. Every comparison below happens before a solver runs.
 
 | record field | graph side |
 |---|---|
@@ -705,8 +722,8 @@ are `FIXED_GRAPHS`, restickify graphs included, at `DEFAULT_CELL` and
 
 **Existing suites.** The parent plan's unit suites, serially, and Stage 1's graph tests.
 Device, on the card: `test_work_division`, `test_scratchpad_use`, because commit 1 touches
-`_division_map`. `make check-all-configs` after adding the configs, and `pre-commit run
---files <changed>`.
+`_division_map`, and `test_building_blocks`, whose compiles the oracle runs inside.
+`make check-all-configs` after adding the configs, and `pre-commit run --files <changed>`.
 
 **What proves the claim.** `test_classify_*`, `test_nodes_made_through_target`,
 `test_one_config_per_type_asserted`, `test_nodes_in_op_order`, `test_axis_map_*`,
@@ -716,24 +733,28 @@ lost on real graphs.
 
 ## Parity and gates
 
-Parent plan: "Every stage: the Stage 0 harness, comparing proto, decisions and committed
-plans between the stage's parent and the change. Baselines are re-recorded after every
-rebase." And: "Through Phase 1 ... the CP model stays byte-identical and the committed
-plans stay identical."
+The parent plan: "Through Phase 1 ... the CP model stays byte-identical and the committed
+plans stay identical." After the owner's review of PR #7, that claim is the proven optimum:
+every solve reaches `OPTIMAL` at the same `objective_ns` (`_evaluate(expr,
+solved_bindings(buffers))` on the returned plan), and a different plan at an equal cost is a
+tie. The parent's per-stage harness gate is dropped (Deviation 16).
 
-| gate | compares | corpus | pass | on a difference |
+| gate | compares | on | pass | on a difference |
 |---|---|---|---|---|
-| harness | parent commit vs this PR: proto, status, objective, decisions, committed plan | `intree`, fixed set | zero differences | a bug in commit 1; fix it |
-| builder oracle | `build_graph` vs records, in one process | `FIXED_GRAPHS` per commit, in CI; the `fake` zoo at `DEFAULT_CELL` and `TILING_CELL` at the PR tip | zero mismatches | fix the builder, or list the mismatch by cause in the PR. The 18 `MultiOutput` and 62 `-1` cases from #5676 must both match, by construction |
+| no plan change | commit 1's extractions and `config.target` against today's behaviour | `test_division_pin_reasons_matches_division_map`, `test_select_target`, and the existing suites that patch or call the extracted helpers (`tests/inductor/test_work_division.py:3462,3995,4048`, `tests/inductor/test_scratchpad_use.py:2033`, `tests/inductor/test_coarse_tiling.py:9727`) | all pass | a bug in commit 1; fix it |
+| builder oracle | `build_graph` vs records, in one process | `test_graph_builder_e2e.py`, five building-block compiles at three configs, on the card | zero mismatches, at least one build per case, at least one `RestickifyNode` across the module | fix the builder, or list the mismatch by cause in the PR. The 18 `MultiOutput` and 62 `-1` cases from #5676 must both match, by construction |
 | suites | above | | pass | fix |
 
-`lx_gate.sh` records both sides, and after a rebase only the last rebase before merge is
-recorded again. The PR reports oracle hits per `corpus_coverage` feature, `restickify_op`,
-`beam_restickify` and `fixup_copy` among them. A model the `fake` tier cannot reach stays
-card-only. `fake` inputs use default layouts, so this proves the builder faithful to the
-allocator and says nothing about production plans. Pickled captures blank the live ops, so
-the oracle cannot replay them. This builder has no zoo measurement yet; the numbers above
-are #5676's.
+No old-versus-new comparison of objectives runs here. Commit 1 moves code with no config
+switch, so no old path is left to run beside the new one, and nothing calls the builder. The
+extracted functions keep their call sites and the class keeps its delegates, so the existing
+suites exercise the moved code exactly where they did. Nothing is stored between runs: no
+baseline, plan or objective.
+
+The oracle runs on the card, where CI runs these suites, with the inputs the suites build. It
+proves the builder faithful to the allocator on those compiles and says nothing about the
+plans. Pickled captures blank the live ops, so the oracle cannot replay them. #5676's figures
+above come from its own zoo run; this builder has no measurement yet.
 
 The stage has no planning-time gate because nothing calls the builder. Its cost is one
 `indirect_access_subs_from_op` and two coordinate calls per dep, comparable to
@@ -748,6 +769,8 @@ The stage has no planning-time gate because nothing calls the builder. Its cost 
 | The `coord_ranges` copy drifts from `overlapping_window_split_domains` | `test_port_fact_overlapping*` against the rule's own output |
 | `stick_dims` returns `()` on a layout with no unique match, so a real stick reads as sparse | `test_stick_pin_matches_stick_symbol`, on every op in the e2e run |
 | A coordinate call raises something other than `Unsupported` on a real op | the e2e run |
+| The building-block compiles miss a case #5676's zoo run had: a restickify op, a `MultiOutput`, an unsized buffer | the module's `RestickifyNode` assertion; `test_classify_*` has a `MultiOutput` row; if no e2e compile has an unsized buffer, the PR adds one to the `test_lifetime_*` fixtures. The oracle is only as wide as the compiles it rides on |
+| A wrapped `_build_solver` sees a cached compile, and the oracle never runs | `run.builds >= 1` per case, with the FX graph cache off |
 | #5695 lands first and pinned ops have no committed split | `_committed_work_split` is the one seam, and it must stay read-only, as must `division_pin_reasons`: the rebase keeps `divide_deferred_op` in `_division_map`, outside the extracted chain. The oracle's `core_divisions` row and the #5695 case of `test_build_does_not_mutate_ir` fail until both hold |
 | A #5682 Step 2 item moves a stick pass after the solve, so layouts are not final at build time | `stick` pins would pin stale layouts, and the oracle's `size` row fails first. Rebase work for whichever lands second |
 | `build_graph` is called after `_post_solve` | stale graph. The precondition catches materialized relayouts, not chosen tilings, so this rests on the contract |
@@ -762,8 +785,9 @@ The stage has no planning-time gate because nothing calls the builder. Its cost 
    `GraphLowering`, as the parent's `build_graph(ir, target)` does, and records are the test
    oracle.
 2. **Five subtypes, and "one node per op" vs "a pinned step".** Extern kernels and CPU
-   buffers run, hold a tick and a record, and fit none of the five. Byte-identical protos
-   need a node for a restickify, and a `PointwiseNode` would break `POINTWISE_STICKS`.
+   buffers run, hold a tick and a record, and fit none of the five. A restickify op has its
+   own division, residency and box in today's model, so reaching today's optimum needs a node
+   for it, and a `PointwiseNode` would break `POINTWISE_STICKS`.
    Resolution: `OpaqueNode`, and `RestickifyNode` plus a pinned step with `realized_by`.
    Each has its own `OpConfig` in `SPYRE_OPS`, since every target fills `ops` for every
    node type.
@@ -816,6 +840,14 @@ The stage has no planning-time gate because nothing calls the builder. Its cost 
     `AUTO_COARSE_TILING` vary per compile today, and the parent's "narrowed further by
     config, as coarse tiling is today" asks for this. Resolution: `select_target(config)`,
     which `plan_allocation` calls in place of the bare lookup.
+16. **Stage 0 is dropped (owner, PR #7, 2026-11-12).** This stage consumed Stage 0's
+    `Observer`, `record_compile` on `fake` compiles, `FIXED_GRAPHS`, `corpus_coverage`,
+    `check_guards` and `lx_gate.sh`. None is built. The oracle now patches
+    `ScratchpadAllocator._build_solver` in its own test and runs inside existing
+    `test_building_blocks` compiles on the card, at default, placement and tiling configs.
+    Commit 1's "no plan change" rests on the extraction tests and the existing suites that
+    patch those helpers, since no old path is left to compare against. Parity means the proven
+    optimum of the cost expression.
 
 ## Open questions
 
