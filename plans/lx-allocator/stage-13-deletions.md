@@ -1,7 +1,7 @@
 # LX allocator, Stage 13: Deletions
 
 Parent plan: `plans/lx-allocator.md` at `c8ebd86`. Code base: torch-spyre `5268ba95`.
-Depends on: Stages 0-10 and 12. Needed by: none (Phase 3 exit). Stage 11 may land before or
+Depends on: Stages 1-10 and 12. Needed by: none (Phase 3 exit). Stage 11 may land before or
 after this stage: nothing here needs it, and nothing deleted here is something it needs.
 
 Paths under `torch_spyre/_inductor/` are shortened to `inductor/`, `inductor/scratchpad/` to
@@ -15,8 +15,8 @@ or `sa` family. The old allocator classes, whose role `plan_allocation` takes ov
 base classes, the five placement solvers, `CpSatLayoutSolver`, `SaCoOptimizingSolver` and the
 greedy re-plan are gone, along with the side-by-side machinery, every temporary item earlier
 stages left for this stage, and config values, tests and docs that only served them. Family
-plans do not change: the Stage 0 harness shows an empty diff on family cells between Stage 12's
-head and every commit here, C12's gated change aside.
+plans keep their optimum: on family arms, every commit here reaches the same proven
+`objective_ns` as Stage 12's head (the objective gate), C12's gated change aside.
 
 Stays unchanged: the beam, `_distribute_work`, `span_reduction`, `LX_PLANNING=0`,
 `elide_proven_read_copies`, `LxContextSwitchingPass`, the native packer, and sticks pinned
@@ -182,7 +182,6 @@ staging (`:3613`) and the branch at `:1400`.
 | `LEGACY_LAYOUT_SOLVERS`, `warn_planner_selection` | 12 | C4 |
 | `lx_check_decisions`, `lx_check_file`, cache prefix `lx_check` and the test pinning it; `_check_plan`, `_finish_plan_check`; `test_lx_check_hook.py`, `lx_check_summary.py`, `lx_check_known.json` | 3 | C4 |
 | Reversed lane; the `lx_route_to_families` input and its export line, in `_test_matrix.yaml` and `lx_planner_compare.yaml` | 12, 9 | C4 |
-| Hooks on `CpSatLayoutSolver._solve_and_record`, `MemoryPlanSolver.plan_layout`, `CoreDivisionLayoutSolver.plan_layout_and_core_divisions`, and any left on `_get_spill_reasons`; `decisions_from_buffers`, `sizes_from_buffers`; `replay_intree`, `replay_capture`, `blank_for_capture`; the `intree` tier | 0 | C4b |
 | `plan_adapter.py`: `decode_todays_plan`, `check_todays_plan`, `check_buffers`, `Mismatch`, `PlanCheck`; `test_lx_plan_adapter.py` | 3 | C4b |
 | `lx_sections.py`, `lx_shadow_plugin.py` with `sa_dual_run`, `test_lx_encoder_sections.py`, `test_lx_live_parity.py`, the `AGENTS.md` line | 5 to 8 | C4b |
 | `test_lx_placement_parity.py`; `lx_objective_shadow.py`, `test_lx_cost_parity.py`; `commit_shadow` | 7, 4, 10 | C4b |
@@ -396,7 +395,6 @@ named in this PR, deletes the function, and `cpsat` then raises like any other v
 | `inductor/work_division.py` | `solve_decides_work_division()`, if #5695 has landed |
 | `inductor/propagate_layouts.py` | `_matmul_layouts` calls `matmul_axes`; comment at `:2053-2055` |
 | `inductor/pass_utils.py:4191`, `scratchpad/coarse_tiling.py:463`, `scratchpad/lx_relayout.py:899` | Stale names in docstrings and comments |
-| `tests/inductor/lx_equivalence.py`, `lx_corpus.py`, `lx_equivalence_golden.json`, `tools/lx_planning/lx_gate.sh` | Old arm out, golden on `fake` |
 | `tests/inductor/*`, `tests/configs/torch_spyre_tests/inductor/*` | See Tests |
 | `.github/workflows/lx_planner_compare.yaml`, `_test_matrix.yaml`, `.github/runner_overrides.yaml`, `.github/suite_test_flags.yaml`, `tools/lx_planning/compare_planners.py`, `planner_compare_reasons.json` | Per "Temporary items" |
 | `AGENTS.md:126`, `docs/source/api/torch_spyre.rst`, `docs/source/compiler/{scratchpad_planning,co_optimizer,sa_co_optimization,cost_model,inductor_frontend,index}`, `docs/source/user_guide/debugging/failure_classes.md:163`, `docs/source/_static/images/lx/allocator-architecture.svg` | Rewritten for the new names, with Stage 12's kill-switch text removed |
@@ -410,12 +408,12 @@ because a test importing a deleted name fails at collection. Commits are signed 
 
 | # | commit | why this order |
 |---|---|---|
-| C0 | Audit, not a commit. Scan the AST for every deleted name, every row of "Temporary items" and every allocator private method referenced from outside the deleted set, counting `lx_equivalence.py` and `lx_corpus.py` as importers, and paste the result in the PR. The script stays out of the repo. | Tells which of C2, C3, C8 and C13 are no-ops. A hit that no row explains stops the PR. |
+| C0 | Audit, not a commit. Scan the AST for every deleted name, every row of "Temporary items" and every allocator private method referenced from outside the deleted set, and paste the result in the PR. The script stays out of the repo. | Tells which of C2, C3, C8 and C13 are no-ops. A hit that no row explains stops the PR. |
 | C1 | Retarget tests pinned to removed values to `ortools` and `sa` (`test_work_division_hint.py:1492,1593,1657,1735,2163`, `test_fallback_kernel.py:441`, the `solver_method` axes at `test_scratchpad_use.py:536,849,1200`). Tests only. Stage 12's soak dispatches this branch before 12b. | Both paths still exist, so any failure is a real gap in Stage 6, not deletion damage. |
-| C2 | Add `LxRecordBuilder`. Move the residency group. Old classes delegate. `rules.py`'s host and `_UNBUILT_SOLVER` test sites move to the builder or the moved functions. `TRANSFER_CERTIFICATES` path in the same commit. | Old classes still work, so the suite is green and the harness diff is empty. |
+| C2 | Add `LxRecordBuilder`. Move the residency group. Old classes delegate. `rules.py`'s host and `_UNBUILT_SOLVER` test sites move to the builder or the moved functions. `TRANSFER_CERTIFICATES` path in the same commit. | Old classes still work, so the suite is green, Stage 12's side-by-side test still holds, and the objective gate passes. |
 | C3 | Extract `first_fit.py`. `FirstFitLayoutSolver` and `SolverToPermutation` become thin wrappers over it. `_seed_permutation` and `collective_output_stages` call functions. | Must precede C6, since `_seed_permutation` needs `SolverToPermutation` until then. |
 | C4 | Remove the C4 rows of "Temporary items" and the `SolveError` handler. Rewrite `scratchpad_planning`, `_maybe_scratchpad_planning`, `family_key`, `select_families` and `_fall_back`, and `solve_decides_work_division()` if #5695 has landed. Delete `select_allocator`, `_cpsat_solver_class`, `_PLACEMENT_SOLVERS`. Narrow `layout_solver`, add `layout_solver_key`, remove `allow_exhaustive_search`. Rewrite or delete `TestSelectAllocator`, `TestSolverCapabilities`, `TestCpsatFallbackWarning`, `TestSolveErrorFallback`, `TestCpSatTimeoutFallback`, `TestCpSatAllocatorFallback` and the old-path rows of `test_planner_default.py`. Update `profile_ops.py`. List old-value plan changes in the PR. | From here old classes are unreachable in production, and tests build them directly. |
-| C4b | Retire the old arm. `bless --tier fake` on the fixed set, recording decisions and predicted total, replaces `test_golden_intree`, and the other `intree` tests move to the fixed set. Move `Cell`'s default, `ZOO_CELLS` and `MATRIX_CELLS` to `ortools` and `sa`, and drop `ALLOW_EXHAUSTIVE_SEARCH` from `Cell.env`. Delete the C4b rows of "Temporary items", and `plan_adapter` from `optimizer_pass_sources()`. | Each runs an old solver as its reference, so it would fail at C6 to C10. Must precede C5. |
+| C4b | Delete the C4b rows of "Temporary items", and `plan_adapter` from `optimizer_pass_sources()`. | Each runs an old solver as its reference, so it would fail at C6 to C10. Must precede C5. |
 | C5 | Delete `exhaustive_search.py`, `prune`, and the exhaustive-only chain. | Top of the solver stack, nothing else depends on it. |
 | C6 | Delete `simulated_annealing.py`, `cooling_schedules.py`, the doc examples, `plot_buffers`, `quality_plot`, and `test_simulated_annealing.py` with its config yaml. | Removes the last importer of greedy and best-fit outside `allocator.py`. |
 | C7 | Delete `greedy_solver.py`, `BestFitLayoutSolver`, the two pattern classes and solver subclasses. | Depends on C6. |
@@ -434,7 +432,6 @@ Consumes:
 
 | symbol | signature | from Stage | used for |
 |---|---|---|---|
-| Equivalence harness | `lx_gate.sh`, `diff`, `bless --tier fake`, `Cell`, `ZOO_CELLS`, `FIXED_GRAPHS`, tiers `fake`, `unit-*`, `failure` | 0 | Every commit's gate. Old arm retired in C4b. |
 | `decode_todays_plan`, `check_todays_plan`, `check_buffers`, `Mismatch`, `PlanCheck` | As Stage 3 | 3 | Deleted in C4b. |
 | `check_decisions`, `RuleViolation`, `coverage` | `check_decisions(graph)`, `coverage(family, target) -> Coverage(gaps, unused)`, as Stage 3 | 3 | Run on every plan. Untouched. |
 | `rules.stick_tables` | `(node, flag) -> list[StickTable]` | 3 | Agreement test. |
@@ -462,6 +459,8 @@ Consumes:
 | Settings and retired-values tables, rollout step 6 | `layout_solver` default `"ortools"`, `fallback_solver` default `"sa"`; aliases as Stage 12's contract | 12 | Entry, Config, C4. |
 | `LEGACY_LAYOUT_SOLVERS`, `warn_planner_selection` | As Stage 12 | 12 | Removed in C4. |
 | `compare_planners.compare`, `Thresholds`, label `lx_compare`, lane cron | As Stage 12 | 12 | Removed by whichever of this stage and 12c lands last. |
+| `compare_planners.from_run`, `main`; I1, I2 and B1 rules | `from_run(dump, timing, *, case) -> CaseResult`, reading only `objective_ns` and `solve.status` | 12 | The objective gate, run with Stage 12 head's copy of the tool so commits that remove it still compare. |
+| `write_cost_dump` | `(graph, family, encoding, solution) -> None`, `objective_ns` and `solve` per solve | 10 | The objective gate. |
 
 Provides:
 
@@ -472,7 +471,6 @@ Provides:
 | `LxRecordBuilder` | See Design | none | final |
 | `config.layout_solver` | `Literal["ortools", "sa"]` | a debug family may extend it | final |
 | `layout_solver_key` | `(value: str) -> str` | none | temporary, removed one tagged release after this stage |
-| `lx_equivalence_golden.json`, `test_golden_fake` | `fake` compiles of the fixed set: decisions and predicted total | 11 if later, #5682 | final |
 | `solve_records` | See Tests | none | final |
 
 ## Tests
@@ -489,7 +487,6 @@ All files are in `tests/inductor/` and are unit unless marked device.
 | `test_work_division.py` | 16 / 150 | `_UNBUILT_SOLVER` sites use `LxRecordBuilder(decides_relayouts=True)` or the moved function. `TestResidencyEdgeInversion` (8) ports with Stage 8. Tests of `prune=True` at `:3526`, `:3662` delete. | Kept by construction change, as methods move verbatim. |
 | `test_work_division_hint.py` | 9 / 69 | Five greedy-pinned tests retargeted in C1. Plan-handoff tests at `:720-830` delete with C12. | See "Behaviour at risk". |
 | `test_solver_relayout_decision.py` | 9 / 33 | `_cap_relayout_groups` calls Stage 6's function, `_relayout_copy_buffers` ports to `RelayoutGroup`, and the cache-prefix test loses `lx_check`. | Kept. Certificates name these tests, so keep the names. |
-| `test_lx_equivalence.py`, `test_lx_equivalence_compile.py` | Stage 0 | C4b as in Commits. `test_golden_intree` becomes `test_golden_fake`. | Yes, `fake` replaces buffer-level replay. |
 | `test_planner_default.py` | Stage 12 | `test_every_old_value_reaches_the_old_path`, `test_cache_key_differs_between_old_and_new`, `test_legacy_value_warns_once`, `test_value_without_replacement_names_the_default`, `test_exhaustive_flag_warns_only_on_a_family` delete in C4. | `test_scratchpad_entry.py` below. |
 | `test_sa_cooptimizer.py` | 26 / 111 | Each class ports with Stage 8. The PR lists each deleted class with its Stage 8 counterpart. Class constructed directly at 20+ sites, so most of the file is affected even where not counted. `test_ceiling_is_higher_than_the_layout_only_annealer` (`:778`) deletes. | Must be shown class by class. A class without a counterpart is ported, not dropped. |
 | `test_cooptimization_types.py` | 8 / 18 | `_NoOpSolver`, `NoOpSolverABCTest` delete. `EngineBindingTest` deletes. `SpillCostTest::test_matches_the_cpsat_engine_formula` moves to `SpyreCostModel.spill_cost`. Capture tests stay while `CoreDivisionBuffer` does. | Partly. |
@@ -562,39 +559,46 @@ def solve_records(
 
 **Suites run.** Unit, serially: every suite in the parent's Verification list that still
 exists, plus `test_op_spec_validation`, `test_stick_rule_agreement`, `test_first_fit`,
-`test_scratchpad_entry`, `test_lx_equivalence`. Device, on the final commit and on the C1
-dispatch: `test_scratchpad_use`, `test_work_division`, `test_work_division_hint`,
+`test_scratchpad_entry`. Device, on the final commit and on the C1
+dispatch: `test_scratchpad_use`, `test_building_blocks`, `test_work_division`, `test_work_division_hint`,
 `test_solver_relayout_e2e`, `test_solver_auto_coarse_tiling`, `test_lx_planning_suite`,
 `test_lx_context_switching`, `test_fallback_kernel`, and the `test_inductor_ops_lx_*` shards.
 
-**What proves the claim.** The name scan below finds nothing, the harness diff is empty on family
-cells, and both suites pass with no skip added.
+**What proves the claim.** The name scan below finds nothing, the objective gate passes on family
+arms, and both suites pass with no skip added.
 
 ## Parity and gates
 
 Parent: "**Phase 3 exit:** the optimizer is the default, and the replaced solvers and the
-duplicated rules are gone." Verification: "**Every stage:** the Stage 0 harness, comparing
-proto, decisions and committed plans between the stage's parent and the change."
+duplicated rules are gone." The parent's per-stage check through the Stage 0 harness is dropped
+(D12). Parity is the proven optimum of the cost expression, compared as objectives; no plan is
+stored, and a different plan at an equal cost is a tie.
 
-- **Harness gate.** `lx_gate.sh` with HEAD's harness on both sides, base Stage 12's head, at
-  Stage 0's deterministic settings. The gate compares family cells: `ortools` and `sa` ×
-  co-optimizing and committed, at default and `AUTO_COARSE_TILING=1`, with the forced failure,
-  at Stage 12's head against the same cells at each commit from C2 on. Per commit that is the
-  fixed set, plus `intree` until C4b retires it. At the PR tip it is every tier left: `fake`,
-  `matrix`, `unit-*` and `failure`; `zoo` stays a calibration at Stages 0, 9 and 12. Pass is
-  byte-equal protos, decisions and committed plans. A difference is a bug in this PR, since
-  nothing here is meant to change a family plan, and blocks the commit.
-- **Old-value cells.** These are retired, not compared. At C4 `cpsat × 1` and
-  `simulated_annealing × 1` alias onto arms Stage 12 held to identity (I1, I2), and
-  `cpsat × 0` and `simulated_annealing × 0` become committed cells, under Stage 12's B1 and B2.
-  The PR lists their plan changes against Stage 12's reversed lane on `total_us` bands, the SA
+- **Objective gate.** Family arms: `ortools` and `sa` × co-optimizing and committed, at default
+  and `AUTO_COARSE_TILING=1`, selected through the environment. The cases are the existing tests
+  among Stage 12's compile cases that patch none of those settings: `test_mlp`, `test_rms_norm`,
+  `test__simple_attn` and `test_flash_attention` in `TestBuildingBlocks`
+  (`tests/inductor/test_building_blocks.py:103`, `:130`, `:76`, `:319`), one test per process,
+  with `SPYRE_DUMP_COST_EXPR_FILE` and `TORCH_SPYRE_TIMING_OUT` set. One run on Stage 12's head is
+  the base, and one run per commit from C2 on is the change. `compare_planners.py` pairs the runs
+  by test id and keeps `objective_ns` and status only. Pass: Stage 12's I1 rule for OR-Tools (both
+  `OPTIMAL`, `objective_ns` equal to a relative 1e-9), I2's for SA at its fixed seed, and B1's
+  bands for an unpriced solve. A difference is a bug in this PR, since nothing here is meant to
+  change a family plan, and blocks the commit. Until C4, Stage 12's `test_planner_side_by_side.py`
+  also runs as it is, both paths still being present.
+- **Forced failure.** Stage 12's `test_forced_failure_falls_back` passes at every commit while it
+  exists, and `TestSolveErrorFallback`'s Stage 9 form (see Tests) after C4.
+- **Old-value arms.** These are retired, not compared. At C4 `cpsat × 1` and
+  `simulated_annealing × 1` alias onto arms Stage 12 held to I1 and I2, and
+  `cpsat × 0` and `simulated_annealing × 0` become committed arms, under Stage 12's B1 and B2.
+  The PR lists their changes against Stage 12's reversed lane on `total_us` bands, the SA
   committed change among them (D7). They block only if outside those bands.
 - **C12 gate.** Runs only with `lx_solver_completed_reduction_routes` on by default. Family
-  committed cells, same corpus. A plan difference is expected if the anchor mattered, so
+  committed arms, same cases and runs. A plan difference is expected if the anchor mattered, so
   `hbm_traffic_bytes` takes Stage 12's B1 bands. If it fails them, or the flag is off, drop C12
   and keep the anchor and collector.
 - **Name scan.** `git grep -nwE
-  'ScratchpadAllocator|CoOptimizingAllocator|MemoryPlanSolver|CoreDivisionLayoutSolver|CpSatLayoutSolver|GreedyLayoutSolver|FirstFitLayoutSolver|BestFitLayoutSolver|ExhaustiveSearchSolver|SimulatedAnnealingLayoutSolver|SaCoOptimizingSolver|SolverToPermutation|select_allocator|allow_exhaustive_search|SolveError|lx_route_to_families|_greedy_replan|LEGACY_LAYOUT_SOLVERS|warn_planner_selection|lx_check_decisions|lx_check_file|decode_todays_plan|decisions_from_buffers|sizes_from_buffers|replay_intree|replay_capture|blank_for_capture'`
+  'ScratchpadAllocator|CoOptimizingAllocator|MemoryPlanSolver|CoreDivisionLayoutSolver|CpSatLayoutSolver|GreedyLayoutSolver|FirstFitLayoutSolver|BestFitLayoutSolver|ExhaustiveSearchSolver|SimulatedAnnealingLayoutSolver|SaCoOptimizingSolver|SolverToPermutation|select_allocator|allow_exhaustive_search|SolveError|lx_route_to_families|_greedy_replan|LEGACY_LAYOUT_SOLVERS|warn_planner_selection|lx_check_decisions|lx_check_file|decode_todays_plan'`
   across the repo returns nothing.
 - **Dead-code scan.** The AST reachability script from C0 reports no new unreachable
   top-level name under `scratchpad/`.
@@ -602,7 +606,8 @@ proto, decisions and committed plans between the stage's parent and the change."
 - **Exit wording.** "Duplicated rules are gone" cannot be met as written (D1, D6). It is met as
   one authoritative definition, with every other site a generator or validator tested against it.
 
-After this PR the new path is the harness's reference, as mtsokol anticipated in PR #5.
+After this PR the new path is the reference every later comparison runs against, as mtsokol
+anticipated in PR #5.
 
 ## Risks
 
@@ -683,15 +688,23 @@ matmul's output in leftover LX, while the drain clone stays in HBM, calling firs
 (`allocator.py:3525-3646`). Resolution: Stage 10 keeps it as `collective_output_stages`, and C3
 moves it to `free_gap`.
 
-**D9. Stage 0's combination list shrinks.** "Every `layout_solver` × `co_optimizing_lx_planning`
-combination" loses all five old values: three raise, and two alias for one tagged release. The
-parent's "every stage" gate therefore holds on family cells, not on those combinations.
+**D9. The `layout_solver` combinations shrink.** The parent's Stage 0 corpus named "every
+`layout_solver` × `co_optimizing_lx_planning` combination". All five old values leave here: three
+raise, and two alias for one tagged release. The objective gate therefore runs on family arms, not
+on those combinations.
 
 **D10. Stage 13 is absent from the parent's device-suite list.** This plan runs them anyway,
 because it retargets device tests.
 
 **D11. This stage does not follow Stage 11.** The parent orders Stage 11 first. Resolution: as
 Stage 12, the old path goes with sticks pinned, and Stage 11 lands before or after this stage.
+
+**D12. Stage 0 is dropped (owner, PR #7, 2026-11-12).** No harness hooks, golden, tiers, recordings
+or gate script exist, so nothing of them is retired here, C0 counts no harness file as an importer,
+and C4b keeps only its Stage 3 to 10 rows. Each commit is checked by the existing suites and by the
+objective gate: four `TestBuildingBlocks` tests on family arms, run on Stage 12's head and on the
+commit, compared on `objective_ns` and status with Stage 12's `compare_planners.py`. Nothing is
+stored.
 
 ## Open questions
 
