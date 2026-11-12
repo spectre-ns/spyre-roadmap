@@ -157,7 +157,7 @@ the card or on the fake device.
 | `zoo` | card compile | all of `lx_zoo.MODELS`, × `ZOO_CELLS` | card | calibration at Stages 0, 9 and 12 |
 | `matrix` | fake compile; card at calibration | `MATRIX_MODELS` × all 10 solver cells | `_C` | gate at Stages 0, 9, 10 |
 | `failure` | fake compile; card at calibration | `mlp_swiglu_128x512x1536` with a forced failure, default and tiling | `_C` | one case in CI, both in the gate |
-| `replay` | CP-SAT over pickles | pickles from this base's `fake` or `zoo` run, `cpsat` cells | no card | local fast loop only |
+| `replay` | CP-SAT over pickles | pickles from this base's `fake` or `zoo` run kept with `--keep`, `cpsat` cells | no card | local fast loop only |
 | `real` | card compile | Granite 4.0 micro, `max_new_tokens=2`, every planning call | card, weights, `hf-adapters` | gate, on the stages that ask for it |
 
 `fake` proves parity, not production plans: fake inputs use default layouts, and both sides
@@ -171,12 +171,14 @@ as absolute checks: status, size, fallback. Base-versus-change diffs run through
 `tools/lx_planning/lx_gate.sh` because CI has no base recording. Pickles are never
 committed: they are large (7-28 MB per set), tied to one base, and regenerable.
 
-**Golden.** `lx_equivalence_golden.json` holds the `intree` digests per case: status and
-objective per stage, proto shas, a decisions sha and `uniqueness`. The in-tree graphs have
-no cost expression, so they are `unpriced` and `check-golden` compares them exactly until
-Stage 4's `price` exists. Then the golden adds the priced cost per case, which gates, and
-the rest becomes a report. A PR that changes a plan runs `bless`, and the change shows in
-its diff. Compile tiers have no golden: names move with every pass change.
+**Golden.** `lx_equivalence_golden.json` holds objectives only, never plans: per `intree`
+case, the status and objective of each solve. Plans are not stored, because a tied plan
+can change without anything being wrong. The in-tree graphs have no cost expression, so
+until Stage 4's `price` exists their objective is the one the solver minimized, the
+final stage objectives. That is a stand-in, not a measure the gate trusts, and it goes
+when `price` prices them, as `objective_ns`. `check-golden` fails on a status or an
+objective, and a changed plan at the same objectives passes. A PR that moves an
+objective runs `bless`, and the change shows in its diff. Compile tiers have no golden: names move with every pass change.
 `bless --tier fake` exists for the golden that replaces `intree` when `CpSatLayoutSolver`
 goes.
 
@@ -480,12 +482,19 @@ load and solve happily (the October ones do), so staleness will not announce its
 
 ### Where recordings live, and rebases
 
-Nothing but the `intree` golden goes in git. A recording is a directory, keyed by tree:
+Nothing but the `intree` golden goes in git, and it holds objectives only. Plans are
+never kept past the gate run that compares them. A run records base and HEAD into
+`$LX_EQUIV_ROOT/runs/<run>/`, diffs them, writes `report.md` and `objectives.json`, and
+deletes the plans: solves' decisions, commits, snapshots, protos, expressions and
+captures. `--keep` leaves them for debugging, and they are still deleted by the next run
+on that tree. What persists per tree is `objectives.json`, the status and objective of
+every solve, keyed by case. A recording during the run is a directory, keyed by tree:
 
 ```text
 $LX_EQUIV_ROOT/                     # default ~/lx_equiv
   src/<sha12>-h<harness8>/          # frozen tree plus HEAD's harness, _C.so symlinked
-  <sha12>-h<harness8>[-dirty<hash8>]/
+  objectives/<sha12>-h<harness8>.json   # kept: status and objectives per case
+  runs/<run>/<sha12>-h<harness8>[-dirty<hash8>]/   # deleted after the run
     MANIFEST.json                   # identity and environment
     DONE                            # written last
     <tier>/<cell>/
@@ -504,7 +513,8 @@ $LX_EQUIV_ROOT/                     # default ~/lx_equiv
 `<key>` is the sanitized case plus `#<n>`, the solve's position in the case. The October
 recording took 11 MB for 125 solves.
 
-`tools/lx_planning/lx_gate.sh [--base COMMIT] [--tiers ...] [--record-only]` is the one
+`tools/lx_planning/lx_gate.sh [--base COMMIT] [--tiers ...] [--record-only]
+[--objectives-only] [--keep]` is the one
 command, and it replaces `freeze.sh`, `gate.sh` and `rec_pair.sh`, which hard-code one
 worktree:
 
@@ -513,16 +523,19 @@ worktree:
 2. Freeze the base into `src/<sha12>-h<harness8>` with `git archive`, then copy HEAD's
    `tests/inductor/lx_*` over it, so one harness measures both sides. Symlink `_C.so`, or
    stop and say to build it if `torch_spyre/csrc` differs between base and HEAD.
-3. If that recording's `DONE` is missing, record the base. A rebase changes the sha, so the
-   baseline is re-recorded by construction, and a baseline is never rewritten.
+3. Record the base. A rebase changes the sha, so the baseline is re-recorded by
+   construction. With `--objectives-only` and a kept `objectives/` file for the base,
+   the base is not re-recorded and the gate compares objectives alone: no `tie`, commit
+   or `unpriced` checks, which need both sides' plans.
 4. Record HEAD, frozen the same way, with `base_sha` set in its manifest.
 5. Plain-run the unit suites, then `diff`, `guards` and `timing`, and write `report.md`
-   for the PR, with recording time per tier.
+   for the PR, with recording time per tier. Write `objectives/` for both trees, then
+   delete the run directory unless `--keep`.
 
 Card tiers run under `flock ~/.spyre-card.lock`, as the old scripts did. `fake` and
-`intree` take no lock. `--record-only` records a commit and stops, so a nightly cron on a
-host that keeps `$LX_EQUIV_ROOT` can record `main` by sha, `lx_gate.sh` finds the base
-already recorded, and a rebase costs one recording. CI pods keep nothing, so this is not a
+`intree` take no lock. `--record-only` records a commit's objectives and stops, so a
+nightly cron on a host that keeps `$LX_EQUIV_ROOT` can record `main` by sha, and an
+`--objectives-only` gate finds the base already recorded. CI pods keep nothing, so this is not a
 workflow, and which host runs it is not settled.
 
 ### Record format
@@ -923,7 +936,7 @@ accepts. `source` is the buffer `_restickify_input` (`padding.py:478`) returns.
 | `tests/inductor/lx_corpus.py` | new: cells, tiers, compile driver, replay, CLI |
 | `tests/inductor/lx_zoo.py` | new: 35 models, 32 lifted from `probes-cpsat-graph/zoo.py`; `CARD_ONLY`, `FAKE_DIVERGES` |
 | `tests/inductor/lx_fake_device.py` | new: fake device, lifted from `swiglu.py`; P1 census |
-| `tests/inductor/lx_equivalence_golden.json` | new: `intree` digests per case |
+| `tests/inductor/lx_equivalence_golden.json` | new: `intree` status and objectives per case; no plans |
 | `tests/inductor/test_lx_equivalence.py` | new: host tests of the harness and CI guards |
 | `tests/inductor/test_lx_equivalence_compile.py` | new: compile tests, on `fake` in subprocesses, plus one calibration test on the card |
 | `tests/configs/torch_spyre_tests/inductor/test_lx_equivalence_config.yaml` | new: labels `[unit, regression, trunk]`, both files `unlisted_test_mode: mandatory_success` |
@@ -1026,7 +1039,7 @@ lands.
 - **Stage 13** counts `lx_equivalence.py` and `lx_corpus.py` as importers of the old
   solvers and allocators, removes `decisions_from_buffers`, `sizes_from_buffers`, the
   replay helpers and the old-solver hooks, and replaces `test_golden_intree` with `bless
-  --tier fake` on the fixed set, recording decisions and predicted total.
+  --tier fake` on the fixed set, recording objectives and predicted total.
 
 ## Tests
 
@@ -1040,7 +1053,8 @@ under `--noconftest` with no card.
 | `test_ladder_records_every_stage` | a no-cost joint solve records 3 stages, placement-only 1 |
 | `test_second_solve_in_process_is_identical` | two recordings of `intree` in one process, `diff` empty |
 | `test_hash_seed_does_not_change_recording` | subprocess `record --tier intree` at `PYTHONHASHSEED=0` and `1`, `diff` empty |
-| `test_golden_intree` | `intree` matches `lx_equivalence_golden.json`; decisions are compared on x86_64 only, protos everywhere |
+| `test_golden_intree` | `intree` status and objectives match `lx_equivalence_golden.json`; the golden holds no decisions or protos |
+| `test_gate_run_deletes_plans` | after `lx_gate.sh` without `--keep`, only `objectives/` and `report.md` remain |
 | `test_diff_detects[kind]` | in exact mode, each `Difference.kind` fires on a record mutated in that one field, and only that kind; the test that shows `diff` can fail |
 | `test_objective_mode_reports_a_tie` | the same objectives with different decisions give one `tie` with `fails=False`, and its commit difference does not fail either |
 | `test_objective_mode_fails_on_objective_ns` | on a priced solve, `objective_ns` changed beyond 1e-9 relative fails; a changed ladder stage objective alone only reports |
@@ -1173,9 +1187,11 @@ time is unmeasured.
   restickify. A hard feature with no case stops the PR at G5 until a graph is found.
 - **The allocator depends on hash order.** The solver-level result says nothing about it.
   Caught by G1 and `test_compile_twice_is_identical`.
-- **Golden churn.** A PR that moves an optimum has to run `bless`. An OR-Tools bump that
-  only picks another tied plan no longer does, since objectives gate and decisions report.
-  Decisions are compared on x86_64 only, where CI runs.
+- **Golden churn.** A PR that moves an objective has to run `bless`. An OR-Tools bump
+  that only picks another tied plan does not, since the golden holds no plans.
+- **No stored plan to look back at.** With plans deleted after each run, a regression
+  found later cannot be traced to the plan that caused it from storage. It is
+  re-recorded from the two shas, which a frozen tree makes repeatable.
 - **The uniqueness probe costs a second solve.** It has no wall clock and inherits dtime
   30, so a hard case can double its recording time, and proving `INFEASIBLE` can be the
   harder half. Recording time is measured per tier with the probe on at calibration. If it
@@ -1207,7 +1223,8 @@ time is unmeasured.
   whether it held its "plans should be identical" claim. It only changes `op_it_space_splits`
   timing, which is read after the commit.
 - **The nightly host does not exist.** Without `--record-only` on a schedule, every gate
-  records its own base, and the cost is unmeasured. The merge queue is not re-measured
+  records its own base, and the cost is unmeasured. Each full gate records its base
+  anyway, because the diagnostics need both sides' plans and plans are not kept. The merge queue is not re-measured
   either way.
 
 ## Deviations from the parent plan
