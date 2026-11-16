@@ -125,11 +125,243 @@ The four rules that keep lists short:
    value: one literal per value holds the product at that value times the rest. A 0/1
    literal times a term is the two-value case.
 
+## The process, step by step
+
+numpy computes every value before the solve, in float. CP-SAT computes only where to
+look. The two meet at one constraint per linear term.
+
+```mermaid
+flowchart LR
+    subgraph NP["Before the solve: numpy, float"]
+        E["cost expression<br/>a sum of terms"]
+        L["float list per term<br/>one value per position"]
+        C["collapse<br/>multiply, add, round once"]
+        T["integer table"]
+        E --> L --> C --> T
+    end
+    subgraph CP["In the model: CP-SAT, integer"]
+        D["decision variables<br/>divisions, literals, integers"]
+        I["index<br/>offsets and strides, linear"]
+        EL["element<br/>cost == table[index]"]
+        O["objective<br/>sum of the cost variables"]
+        D --> I --> EL --> O
+    end
+    T -- entries --> EL
+```
+
+For each term of the objective:
+
+1. **Find what it reads.** Each symbol belongs to one CP-SAT variable: a buffer's split
+   and tile symbols to that buffer's division, a residency symbol to its literal, any
+   other symbol to its integer variable.
+2. **Tabulate.** numpy evaluates the term at every assignment of those variables. The
+   result is a float list with one value per position. Squares, roots, logs and
+   divisions all happen here.
+3. **Index.** Each variable gives a position, and the positions combine into one index
+   through constant offsets and strides. The index is a linear expression.
+4. **Collapse.** The float list is multiplied by what stands above it, added to the other
+   lists on its index, and rounded once onto `COST_SCALE`. That is the integer table.
+5. **Look up.** `add_element(index, table, cost)` makes `cost == table[index]`. The
+   objective is the sum of the cost variables.
+
+Every table in this section was run through CP-SAT at every assignment of its inputs, and
+each came back within half a unit of the float value.
+
+### Two inputs: `f(x)**2 + g(y)**0.5`
+
+`x` is `split_a` with menu `[1, 2, 4]`, chosen by `division_a`. `y` is `split_b` with
+menu `[1, 3]`, chosen by `division_b`. Take `f(x) = 3/x` and `g(y) = y`. Each term reads
+one input, so each is its own table on its own index, and no table spans both.
+
+```mermaid
+flowchart LR
+    subgraph NP["numpy, before the solve"]
+        FX["f(x)**2 at x = 1, 2, 4<br/>9, 2.25, 0.5625"] --> TF["table_f<br/>9216, 2304, 576"]
+        GY["g(y)**0.5 at y = 1, 3<br/>1, 1.7321"] --> TG["table_g<br/>1024, 1774"]
+    end
+    subgraph CP["CP-SAT"]
+        DA["division_a in 0..2"] -- index --> EF["cost_f == table_f[division_a]"]
+        DB["division_b in 0..1"] -- index --> EG["cost_g == table_g[division_b]"]
+        EF --> OBJ["minimize cost_f + cost_g"]
+        EG --> OBJ
+    end
+    TF -- entries --> EF
+    TG -- entries --> EG
+```
+
+| `division_a` | `x` | `f(x)**2` | entry |
+|---|---|---|---|
+| 0 | 1 | 9 | 9216 |
+| 1 | 2 | 2.25 | 2304 |
+| 2 | 4 | 0.5625 | 576 |
+
+| `division_b` | `y` | `g(y)**0.5` | entry |
+|---|---|---|---|
+| 0 | 1 | 1 | 1024 |
+| 1 | 3 | 1.7321 | 1774 |
+
+At `division_a = 1`, `division_b = 1` the objective is 2304 + 1774 = 4078, and the float
+value is 4077.62. Two variables and two constraints are added to the model. The square
+and the root never reach CP-SAT.
+
+### One input: the terms share a table
+
+`f(x)**2 + g(x)**0.5`, both on `split_a`. The two float lists are added before the
+rounding, so there is one table, one rounding and one constraint,
+`cost == table[division_a]`:
+
+| `division_a` | `x` | `f(x)**2` | `g(x)**0.5` | sum | entry |
+|---|---|---|---|---|---|
+| 0 | 1 | 9 | 1 | 10 | 10240 |
+| 1 | 2 | 2.25 | 1.4142 | 3.6642 | 3752 |
+| 2 | 4 | 0.5625 | 2 | 2.5625 | 2624 |
+
+The order of the collapse matters. At `split_a = 2`:
+
+- `7 * split_a ** 0.5` is 10137, the rounding of 7 * 1448.15. Rounding first and
+  multiplying after gives 7 * 1448 = 10136.
+- `split_a ** 0.5 + split_a ** 0.7` is one entry, 3112, the rounding of
+  1448.15 + 1663.49. Collapsing each list alone gives 1448 + 1663 = 3111.
+
+### What a position is: a buffer's menu
+
+A buffer does not have one variable per split. It has a menu of candidate divisions, and
+one variable, its division, that picks a row. Each symbol of the buffer is a column:
+
+| `division_a` | `split_a_d0` | `split_a_d1` | `tile_a` | a term, `8 / (split_a_d0 * tile_a)` |
+|---|---|---|---|---|
+| 0 | 1 | 1 | 1 | 8 |
+| 1 | 2 | 1 | 1 | 4 |
+| 2 | 2 | 2 | 1 | 4 |
+| 3 | 4 | 1 | 2 | 1 |
+
+A term over any of the buffer's symbols is a list with one value per row. Its index is
+`division_a` itself, with no offset and no stride: position `d` holds the value at
+candidate division `d`.
+
+Equal values can share a position. The list above is `[8, 4, 4, 1]`, its distinct values
+are `[1, 4, 8]`, and `rank_of = [2, 1, 1, 0]` gives each division its rank:
+`rank == rank_of[division_a]`. A product pairs ranks, so repeated values do not widen its
+table.
+
+### Several variables: offsets and strides
+
+A term `h(x, y, z)` over three integer variables: `x` in `2..5`, `y` in `0..1`, `z` in
+`0..2`.
+
+```mermaid
+flowchart LR
+    X["x in 2..5"] --> PX["position x - 2<br/>0..3"]
+    Y["y in 0..1"] --> PY["position y<br/>0..1"]
+    Z["z in 0..2"] --> PZ["position z<br/>0..2"]
+    PX -- "times 6" --> IDX["index == 6*(x - 2) + 3*y + z<br/>0..23"]
+    PY -- "times 3" --> IDX
+    PZ -- "times 1" --> IDX
+    IDX --> EL["cost == table[index]"]
+    TAB["table, 24 entries<br/>h on the grid, z fastest"] -- entries --> EL
+```
+
+- **Offset.** A variable in `lo..hi` has the position `var - lo`. A domain with gaps
+  gets its position from a lookup.
+- **Stride.** A position is multiplied by the product of the sizes of the variables
+  after it: 2 * 3 = 6 for `x`, 3 for `y`, 1 for `z`.
+- **Linear.** The strides are constants, so the index is a linear equality. No two
+  variables are multiplied, and CP-SAT takes it as an ordinary linear constraint.
+
+numpy fills the table in the same order, last variable fastest:
+
+| `x` | `y` | `z` | index |
+|---|---|---|---|
+| 2 | 0 | 0 | 0 |
+| 2 | 0 | 1 | 1 |
+| 2 | 0 | 2 | 2 |
+| 2 | 1 | 0 | 3 |
+| ... | | | |
+| 4 | 1 | 2 | 17 |
+| ... | | | |
+| 5 | 1 | 2 | 23 |
+
+The table has 4 * 2 * 3 = 24 entries. The sizes multiply, so this form is only for a term
+whose variables fit the cap together.
+
+### A product across two inputs
+
+`f(x)**2 * g(y)**0.5` cannot be two tables: its value depends on both inputs at once. Its
+list is the outer product of the two lists, and its index is the pair of their positions.
+
+```mermaid
+flowchart LR
+    DA["division_a in 0..2"] -- "times 2" --> P["pair == 2*division_a + division_b<br/>0..5"]
+    DB["division_b in 0..1"] -- "times 1" --> P
+    P --> EL["cost == table[pair]"]
+    T["outer product, collapsed<br/>9216, 15963, 2304, 3991, 576, 998"] -- entries --> EL
+```
+
+| `division_a` | `division_b` | pair | float | entry |
+|---|---|---|---|---|
+| 0 | 0 | 0 | 9 | 9216 |
+| 0 | 1 | 1 | 15.5885 | 15963 |
+| 1 | 0 | 2 | 2.25 | 2304 |
+| 1 | 1 | 3 | 3.8971 | 3991 |
+| 2 | 0 | 4 | 0.5625 | 576 |
+| 2 | 1 | 5 | 0.9743 | 998 |
+
+### A term with structure: positions below, the value on top
+
+`Max(split_a / 2, split_b ** 0.5)`. One table over both inputs would also do here. With
+more operands and longer menus it would not, and the Max is read by rung instead.
+
+```mermaid
+flowchart LR
+    subgraph NP["numpy, before the solve"]
+        LA["split_a / 2<br/>0.5, 1, 2"] --> RA["rungs_a<br/>0, 0, 2"]
+        LB["split_b ** 0.5<br/>1, 1.7321"] --> RB["rungs_b<br/>0, 1"]
+        LAD["ladder, float<br/>1, 1.7321, 2"] --> TAB["table<br/>1024, 1774, 2048"]
+    end
+    subgraph CP["CP-SAT: positions only, until the last lookup"]
+        DA["division_a"] --> EA["rung_a == rungs_a[division_a]"]
+        DB["division_b"] --> EB["rung_b == rungs_b[division_b]"]
+        EA --> MX["rank == max(rung_a, rung_b)"]
+        EB --> MX
+        MX --> EC["cost == table[rank]"]
+    end
+    RA -. entries .-> EA
+    RB -. entries .-> EB
+    TAB -. entries .-> EC
+```
+
+- The operand lists are `[0.5, 1, 2]` and `[1, 1.7321]`. A Max is never under the largest
+  operand minimum, 1, so 0.5 is clamped to 1.
+- The ladder is the values the Max can return, ascending: `[1, 1.7321, 2]`.
+- Each operand's list becomes its rungs on the ladder, `[0, 0, 2]` and `[0, 1]`. These
+  are positions, not costs.
+- CP-SAT looks up each rung, takes their max, and only then reads a cost.
+
+At `division_a = 1`, `division_b = 1` the rungs are 0 and 1, the rank is 1, and the cost
+is 1774, which is Max(1, 1.7321) times 1024. Below the last lookup CP-SAT holds positions
+only. The float ladder is collapsed once, at the top.
+
+### Which form a node takes
+
+```mermaid
+flowchart TD
+    S["a node of the objective"] --> Q1{"a sum?"}
+    Q1 -- yes --> A1["stays linear<br/>each term lowered on its own,<br/>lists on one index added"]
+    Q1 -- no --> Q2{"can it be one list?"}
+    Q2 -- yes --> A2["its inputs fit one table,<br/>or its parts give a shorter list<br/>(rules 1, 2, 3)<br/>collapse it: one element lookup"]
+    Q2 -- no --> Q3{"Min or Max?"}
+    Q3 -- yes --> A3["kept linear<br/>lin_min or lin_max over its operands"]
+    Q3 -- no --> Q4{"a product?"}
+    Q4 -- yes --> A4["rule 4: switched on a factor<br/>a 0/1 literal is a gate"]
+    Q4 -- no --> A5["not lowered<br/>the printer takes the whole objective"]
+```
+
 ## How a table maps onto CP-SAT
 
-A list is computed in numpy before the solve. CP-SAT returns the right entry because a
-list and its index are made together, by one rule in one order. Every operation that makes
-a new list also makes the constraint that computes the new index.
+This is the reference for the section above: every way a list is made, and what it
+guarantees. A list is computed in numpy before the solve. CP-SAT returns the right entry
+because a list and its index are made together, by one rule in one order. Every operation
+that makes a new list also makes the constraint that computes the new index.
 
 The only lookup is `add_element(index, table, target)`, which enforces
 `target == table[index]`. The rest is making `index` the position numpy used.
@@ -204,30 +436,6 @@ is exact to half a unit per list and costs the factor's number of values times t
 entries. #6315 measured that form at 26 to 27 s against 5 to 6 s for the switch on the 14B
 and 24B auto-tiling prefill objectives. The plan keeps the switch. The largest error
 measured over the 50 objectives is 1.2e-7 of the cost.
-
-**Worked example**, each form checked with CP-SAT at every assignment. Buffer a has
-`split_a = [1, 2, 4]` over `division_a` in `0..2`. Buffer b has `split_b = [1, 3]` over
-`division_b` in `0..1`.
-
-1. *One table over both*, `10 / (split_a * split_b) ** 0.5`. Sizes (3, 2) give strides
-   (2, 1) and `joint == 2*division_a + division_b`. The float list is
-   `[10, 5.7735, 7.0711, 4.0825, 5, 2.8868]`. Collapsed, it is
-   `[10240, 5912, 7241, 4180, 5120, 2956]`. At `division_a = 1`, `division_b = 1` the
-   joint index is 3 and the entry is 4180: 10 / 6 ** 0.5 is 4.0825, and times 1024 that
-   is 4180.46. The worst entry is 0.46 units off.
-2. *Max by rung*, `Max(split_a / 2, split_b)`. The operand lists are `[0.5, 1, 2]` and
-   `[1, 3]`. A Max is never under the largest operand minimum, 1, so 0.5 is clamped to 1.
-   The ladder is `[1, 2, 3]`, the rungs are `[0, 0, 1]` for a and `[0, 2]` for b. At
-   `division_a = 2`, `division_b = 0` the rungs are 1 and 0, their max is 1, and the
-   entry is 2, which is Max(2, 1).
-3. *Rank*. A menu `tile_a = [1, 2, 1]` gives `8 / tile_a = [8, 4, 8]`. `distinct` is
-   `[4, 8]` and `rank_of` is `[1, 0, 1]`: divisions 0 and 2 share rank 1, and
-   `distinct[rank_of[d]]` is the value at every division `d`.
-
-4. *Collapse order*, at `split_a = 2`. For `7 * split_a ** 0.5` the entry is 10137, the
-   rounding of 7 * 1448.15; rounding first and multiplying after gives 7 * 1448 = 10136.
-   For `split_a ** 0.5 + split_a ** 0.7` the one entry is 3112, the rounding of
-   1448.15 + 1663.49; collapsing each list alone gives 1448 + 1663 = 3111.
 
 The *exact* tests of every stage are the check on this mapping: they solve at every
 assignment of the inputs, so an entry read from the wrong position fails.
