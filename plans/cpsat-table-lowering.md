@@ -126,6 +126,75 @@ The four rules that keep lists short:
    value: one literal per value holds the product at that value times the rest. A 0/1
    literal times a term is the two-value case.
 
+## How a table maps onto CP-SAT
+
+A list is computed in numpy before the solve. CP-SAT returns the right entry because a
+list and its index are made together, by one rule in one order. Every operation that makes
+a new list also makes the constraint that computes the new index.
+
+The only lookup is `add_element(index, table, target)`, which enforces
+`target == table[index]`. The rest is making `index` the position numpy used.
+
+**Inputs.**
+
+- A buffer's division is a variable in `0..n-1`, and each of the buffer's symbols has `n`
+  values: position `d` holds the symbol's value at division `d`. The index is the
+  division itself.
+- A residency literal has the list `[0, 1]` and is its own index.
+- Any other integer variable has its domain's values, ascending. Its index is `var - lo`
+  when the domain has no gaps. With gaps it is a position `pos` under
+  `add_element(pos, domain_values, var)`; the values are distinct, so one position fits.
+
+**Each way a list is made.** Lists are built from the leaves of the expression upward: a
+node's list is made from its arguments' lists.
+
+| Form | The list, in numpy | Its index, in CP-SAT |
+|---|---|---|
+| a function of one indexed node | `f(values)`, elementwise | the same index |
+| terms on one index | the lists added elementwise | the same index |
+| one table over inputs of sizes `n1..nm` | the node on the row-major grid: assignment `(i1..im)` at position `i1*s1 + ... + im*sm`, `s_k = n_(k+1) * ... * n_m`, so the last input varies fastest | `joint == index_1*s1 + ... + index_m*sm` |
+| rank: equal values share a position | `distinct`, the values ascending without repeats | `add_element(index, rank_of, rank)`, where `rank_of[i]` is the position of `values[i]` in `distinct` |
+| product of lists `a` and `b` of sizes `na`, `nb` | the outer product: `a[i] * b[j]` at position `i*nb + j` | `pair == rank_a*nb + rank_b` |
+| Min/Max by rung | the ladder, ascending | per operand `add_element(index_o, rungs_o, rung_o)`, then `rank == min(rung_o)` or `max(rung_o)` |
+| fold | one value per reachable state | per step `position == state*size + group`, then `add_element(position, next_state, state')` |
+
+**Why the right entry comes back.**
+
+- Every index is fixed by an equality, an element or a min/max over indexes that are
+  fixed themselves. Once the inputs have values, each index has one feasible value, and
+  it is the position numpy used.
+- The strides of a joint table, and `nb` of a pair, are computed once and used for both
+  the numpy list and the linear equality. The inputs of a table are taken in one fixed
+  order for both.
+- A ladder is ascending, so position keeps order: the Min of the rungs is the rung of the
+  Min. A value clamped to the bound can never be the result, so sharing the bound's rung
+  changes nothing.
+
+**Into the objective.** A float list is rounded once, `table[i] = rint(COST_SCALE *
+values[i])`, and read by `add_element(index, table, target)`. The domain of `target` is
+the set of entries, and the objective adds `target`. A list affine in its index needs no
+lookup: it is `table[0] + step * index`.
+
+**Worked example**, each form checked with CP-SAT at every assignment. Buffer a has
+`split_a = [1, 2, 4]` over `division_a` in `0..2`. Buffer b has `split_b = [1, 3]` over
+`division_b` in `0..1`.
+
+1. *One table over both*, `12 / (split_a * split_b)`. Sizes (3, 2) give strides (2, 1),
+   the list is `[12, 4, 6, 2, 3, 1]`, and `joint == 2*division_a + division_b`. At
+   `division_a = 1`, `division_b = 1` the joint index is 3 and the entry is 2, which is
+   12 / (2 * 3).
+2. *Max by rung*, `Max(split_a / 2, split_b)`. The operand lists are `[0.5, 1, 2]` and
+   `[1, 3]`. A Max is never under the largest operand minimum, 1, so 0.5 is clamped to 1.
+   The ladder is `[1, 2, 3]`, the rungs are `[0, 0, 1]` for a and `[0, 2]` for b. At
+   `division_a = 2`, `division_b = 0` the rungs are 1 and 0, their max is 1, and the
+   entry is 2, which is Max(2, 1).
+3. *Rank*. A menu `tile_a = [1, 2, 1]` gives `8 / tile_a = [8, 4, 8]`. `distinct` is
+   `[4, 8]` and `rank_of` is `[1, 0, 1]`: divisions 0 and 2 share rank 1, and
+   `distinct[rank_of[d]]` is the value at every division `d`.
+
+The *exact* tests of every stage are the check on this mapping: they solve at every
+assignment of the inputs, so an entry read from the wrong position fails.
+
 ## Stages
 
 Every stage is one PR with its tests. Branches: `table-lowering-N-<slug>-experimental`,
@@ -248,6 +317,9 @@ returns None.
 Tests:
 
 - a sum of single-buffer terms is exact, with no table across two buffers;
+- one table over two inputs of different sizes, for an expression that is not symmetric
+  in them, is exact: a list and an index in different orders fail it;
+- a variable with gaps in its domain reads the entry of its value;
 - a Piecewise cost, a function with no numpy name and a relayout charge are exact;
 - two menu lengths on one division are refused; a variable with gaps in its domain gets a
   position; a domain past the cap is no input;
@@ -265,9 +337,16 @@ Tests:
 - A node takes the cheaper of one table over its inputs and the form built from its parts
   (rule 3).
 
-Tests: a Max over three buffers is exact with no table as large as the joint table;
-equal values share a rank before pairing; a pair past the cap is refused; a function of a
-short list adds no index; the smaller form in entries wins, one case each way.
+Tests:
+
+- a Max over three buffers is exact with no table as large as the joint table, and each
+  operand lands on the rung of its clamped value;
+- a menu with repeated values reads the same entry through its rank as through its
+  division;
+- a product of two lists of different sizes, not symmetric in them, is exact;
+- equal values share a rank before pairing; a pair past the cap is refused;
+- a function of a short list adds no index;
+- the smaller form in entries wins, one case each way.
 
 ### Stage 5: rule 2
 
