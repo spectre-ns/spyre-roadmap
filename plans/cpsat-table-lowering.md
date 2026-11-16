@@ -108,9 +108,8 @@ that turn out affine and cost nothing, so it runs high.
   computed in numpy before the solve, and `index` is a CP-SAT expression that the inputs
   determine. The solver never chooses an index.
 - *Entries* are the table entries a form puts in the model. The cap bounds one table.
-- Values stay float through every merge of lists. A list is rounded once onto
-  `COST_SCALE` when it becomes an objective term. The two forms that work on integer sums
-  instead are the switched product with a fractional factor and a Min/Max kept linear.
+- Lists are float from the leaves up. CP-SAT holds positions only, until a list is
+  collapsed into a linear term (next section).
 
 The four rules that keep lists short:
 
@@ -170,19 +169,52 @@ node's list is made from its arguments' lists.
   Min. A value clamped to the bound can never be the result, so sharing the bound's rung
   changes nothing.
 
-**Into the objective.** A float list is rounded once, `table[i] = rint(COST_SCALE *
-values[i])`, and read by `add_element(index, table, target)`. The domain of `target` is
-the set of entries, and the objective adds `target`. A list affine in its index needs no
-lookup: it is `table[0] + step * index`.
+**Collapsing float lists into linear terms.** Every list is float: the leaf lists over
+the menus, and each list made from them. CP-SAT cannot hold a float, so below a linear
+term it holds positions only (divisions, ranks, rungs, pair and fold positions), and no
+cost value. A *linear term* is where a list must become a CP-SAT integer: a term of the
+objective's sum, a term of an operand of a Min/Max kept linear, or a term of the sum
+inside a switched product. There the list is collapsed, in this order:
+
+1. Every float multiplier above the list is applied to it in numpy: the term's
+   coefficient, the constant factors of a product, and a coefficient pushed through a
+   linear Min/Max, where a negative one turns Min into Max.
+2. Lists on one index in the same sum are added.
+3. The list is rounded once, `table[i] = rint(COST_SCALE * values[i])`. An entry past
+   2^50 is refused, so a sum of thousands of entries stays inside int64.
+4. It is read by `add_element(index, table, target)`, and the linear term is `target`.
+   A list is affine when its rounded entries are, so `table[0] + step * index` equals
+   the table entry for entry.
+
+No integer made by a collapse is multiplied by a float afterwards, with the one exception
+below. A unit is 1/`COST_SCALE` of the cost. Each collapsed list is within half a unit of
+its float value, a sum of T lists and a constant is within (T + 1) / 2 units, and a
+linear Min/Max is within the largest bound among its operands.
+
+The exception is rule 4, where a factor too wide to pair multiplies a sum that is already
+collapsed:
+
+- a 0/1 literal: the product is the sum or 0, and nothing is added;
+- whole values `v`: the product is `v * w` exactly, so the sum's bound times `|v|`;
+- fractional values: `floor(p * w / q)`, which adds `|w| / (2q) + 1` units, with `q`
+  from 2^16 to 2^24.
+
+Collapsing this form too means pairing every list of the sum with the factor's values. It
+is exact to half a unit per list and costs the factor's number of values times the
+entries. #6315 measured that form at 26 to 27 s against 5 to 6 s for the switch on the 14B
+and 24B auto-tiling prefill objectives. The plan keeps the switch. The largest error
+measured over the 50 objectives is 1.2e-7 of the cost.
 
 **Worked example**, each form checked with CP-SAT at every assignment. Buffer a has
 `split_a = [1, 2, 4]` over `division_a` in `0..2`. Buffer b has `split_b = [1, 3]` over
 `division_b` in `0..1`.
 
-1. *One table over both*, `12 / (split_a * split_b)`. Sizes (3, 2) give strides (2, 1),
-   the list is `[12, 4, 6, 2, 3, 1]`, and `joint == 2*division_a + division_b`. At
-   `division_a = 1`, `division_b = 1` the joint index is 3 and the entry is 2, which is
-   12 / (2 * 3).
+1. *One table over both*, `10 / (split_a * split_b) ** 0.5`. Sizes (3, 2) give strides
+   (2, 1) and `joint == 2*division_a + division_b`. The float list is
+   `[10, 5.7735, 7.0711, 4.0825, 5, 2.8868]`. Collapsed, it is
+   `[10240, 5912, 7241, 4180, 5120, 2956]`. At `division_a = 1`, `division_b = 1` the
+   joint index is 3 and the entry is 4180: 10 / 6 ** 0.5 is 4.0825, and times 1024 that
+   is 4180.46. The worst entry is 0.46 units off.
 2. *Max by rung*, `Max(split_a / 2, split_b)`. The operand lists are `[0.5, 1, 2]` and
    `[1, 3]`. A Max is never under the largest operand minimum, 1, so 0.5 is clamped to 1.
    The ladder is `[1, 2, 3]`, the rungs are `[0, 0, 1]` for a and `[0, 2]` for b. At
@@ -191,6 +223,11 @@ lookup: it is `table[0] + step * index`.
 3. *Rank*. A menu `tile_a = [1, 2, 1]` gives `8 / tile_a = [8, 4, 8]`. `distinct` is
    `[4, 8]` and `rank_of` is `[1, 0, 1]`: divisions 0 and 2 share rank 1, and
    `distinct[rank_of[d]]` is the value at every division `d`.
+
+4. *Collapse order*, at `split_a = 2`. For `7 * split_a ** 0.5` the entry is 10137, the
+   rounding of 7 * 1448.15; rounding first and multiplying after gives 7 * 1448 = 10136.
+   For `split_a ** 0.5 + split_a ** 0.7` the one entry is 3112, the rounding of
+   1448.15 + 1663.49; collapsing each list alone gives 1448 + 1663 = 3111.
 
 The *exact* tests of every stage are the check on this mapping: they solve at every
 assignment of the inputs, so an entry read from the wrong position fails.
@@ -212,8 +249,8 @@ each on the one before.
 | 8 | `config.cpsat_table_lowering`, the solver's choice, printer fallback, docs | yes |
 
 In the tests below, *exact* means: the lowered objective, solved at every assignment of
-the inputs, equals `COST_SCALE` times the expression evaluated by sympy, within one unit
-per table.
+the inputs, equals `COST_SCALE` times the expression evaluated by sympy, within the bound
+stated under "Collapsing float lists into linear terms".
 
 ### Stage 1: numpy values (`cost_expr_numpy.py`)
 
@@ -304,9 +341,10 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
   when the domain has gaps. A domain past the cap is not an input.
 - A node whose inputs fit the cap is one table over them, read through a joint index in
   the order `values_on_grid` uses.
-- The objective is a constant plus one list per index. Terms on one index add into one
-  list. A list affine in its index is a linear term with no table, and a constant list is
-  a number.
+- The objective is a constant plus one list per index. Lists are collapsed here and
+  nowhere below: the coefficient is applied and terms on one index are added in float,
+  then the list is rounded once. A list affine in its index is a linear term with no
+  table, and a constant list is a number.
 - The whole objective is planned before anything is added to the model.
 - `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap)` returns the
   objective, or None with the model untouched.
@@ -317,6 +355,10 @@ returns None.
 Tests:
 
 - a sum of single-buffer terms is exact, with no table across two buffers;
+- a coefficient is applied before the rounding: `7 * split ** 0.5` at split 2 is 10137,
+  not 7 * 1448;
+- terms on one index are added before the rounding: `split ** 0.5 + split ** 0.7` at
+  split 2 is one entry, 3112, not 1448 + 1663;
 - one table over two inputs of different sizes, for an expression that is not symmetric
   in them, is exact: a list and an index in different orders fail it;
 - a variable with gaps in its domain reads the entry of its value;
@@ -360,26 +402,30 @@ crossed ladders pass; no fold when the crossed lists fit.
 
 - A Min/Max too wide to index, or whose table is over twice its linear form, stays a
   `lin_min`/`lin_max` over linear operands.
-- A negative coefficient turns Min into Max.
+- A coefficient on the Min/Max is applied to its operands' lists before they are
+  collapsed. A negative one turns Min into Max.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
   `lin_max`, CP-SAT's presolve ran out of memory (`bad_alloc` past 40 GB on a Qwen3 0.6B
   prefill objective).
 
 Tests: a Min of two sums of residency literals stays linear and is exact, with no table
 over its inputs; a near tie keeps the table; a negative coefficient gives a `lin_max`;
-each operand is a single variable.
+a fractional coefficient on a linear Min is within the largest operand's bound; each
+operand is a single variable.
 
 ### Stage 7: rule 4
 
 - A product whose factor cannot pair with the rest is switched on the factor's value.
   Whole values take one equality per value. Fractional values take the floor pair of
-  Stage 2.
+  Stage 2. This is the one form where a float multiplies a sum already collapsed, with
+  the bound stated under "Collapsing float lists into linear terms".
 - A 0/1 literal, one minus it, or a multiple of either, times a term is the two-value
   case: the term is lowered with the literal fixed on, and no table reads the literal. A
   relayout charge is its literal times a price by division.
 - A gate whose rest is constant is a coefficient on the literal.
 
-Tests: a factor times a Min too wide to pair is exact, also inside a Min; a relayout
+Tests: a fractional factor times a sum of lists with fractional entries is within the
+rule 4 bound; a factor times a Min too wide to pair is exact, also inside a Min; a relayout
 charge and a gated term are exact with no table larger than the menu; a constant rest adds
 no table; two wide factors are refused with the model untouched; a product too wide for
 its factor's precision is refused.
