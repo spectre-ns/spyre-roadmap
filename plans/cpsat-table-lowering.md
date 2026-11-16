@@ -42,6 +42,8 @@ is free to differ.
 - **Off by default.** Stages 1 to 7 add files nothing imports. Stage 8 adds the flag.
 - **Behaviour, not code.** The stages below say what each layer does. #6315 is cited for
   its results only.
+- **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
+  moves, combine and compact, and the table constraint is measured against them.
 
 ## Estimates
 
@@ -356,6 +358,112 @@ flowchart TD
     Q4 -- no --> A5["not lowered<br/>the printer takes the whole objective"]
 ```
 
+## When the final table no longer names its inputs
+
+After a roll-up, the constraint that produces a cost is `cost == table[index]`, and
+`index` is a derived position. No decision variable appears in it. What ties the cost to
+the plan is the chain of constraints behind that position. This section says how the
+chain is built and what it must guarantee.
+
+**Example.** `Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)` reads three buffers:
+`split_a = [1, 2, 4]`, `split_b = [1, 3]` and `split_c = [1, 2, 2, 4]`.
+
+```mermaid
+flowchart LR
+    subgraph IN["decision variables: the only ones chosen"]
+        DA["division_a"]
+        DB["division_b"]
+        DC["division_c"]
+    end
+    subgraph POS["derived positions: fixed by the inputs, never chosen"]
+        RA["rung_a == rungs_a[division_a]"]
+        RB["rung_b == rungs_b[division_b]"]
+        RM["rank_m == max(rung_a, rung_b)"]
+        RC["rank_c == rank_of_c[division_c]"]
+        P["pair == 3*rank_m + rank_c"]
+    end
+    subgraph LT["linear term"]
+        C["cost == table[pair]"]
+    end
+    DA --> RA
+    DB --> RB
+    DC --> RC
+    RA --> RM
+    RB --> RM
+    RM -- combine --> P
+    RC -- combine --> P
+    P --> C
+```
+
+- The Max is read by rung, as above: the ladder is `[1, 1.7321, 2]`, `rungs_a` is
+  `[0, 0, 2]` and `rungs_b` is `[0, 1]`.
+- The factor `1 + 1 / split_c` is `[2, 1.5, 1.5, 1.25]`. Its distinct values are
+  `[1.25, 1.5, 2]` and `rank_of_c` is `[2, 1, 1, 0]`.
+- The final table is the outer product of the ladder and the distinct values, collapsed:
+  `[1280, 1536, 2048, 2217, 2660, 3547, 2560, 3072, 4096]`.
+
+At `division_a = 1`, `division_b = 1`, `division_c = 3` the rungs are 0 and 1, `rank_m`
+is 1, `rank_c` is 0, `pair` is 3 and the cost is 2217. The float value is 2217.03. The
+last constraint, `cost == table[pair]`, names none of the three divisions.
+
+**Two moves make every position.**
+
+- *Combine*: `parent == left * size(right) + right`. A linear equality that turns two
+  positions into one position in the larger table.
+- *Compact*: `short == remap[parent]`, one `add_element`. It renumbers a position onto
+  the rows that are distinct or that can occur.
+
+| Form | Moves |
+|---|---|
+| one table over several inputs | combine all the inputs |
+| rank | compact one list |
+| product of two lists | compact each, then combine |
+| Min/Max by rung | compact each operand to its rung, then take the min or max |
+| fold | combine the state with the next group, compact, repeat |
+
+The min or max over rungs is a compact that needs no table, because a ladder keeps order.
+
+**One constraint for both moves.** `add_allowed_assignments([left, right, out], rows)`
+lists the rows directly, and `out` is the next position up or the cost. It needs no
+strides, a domain with gaps needs no position lookup, and a row that cannot occur is left
+out. On the example it replaces the six constraints of the diagram with two:
+`[division_a, division_b, rank_m]` with 6 rows and `[rank_m, division_c, cost]` with 12.
+
+Both forms were run on the example and agree at all 24 assignments. Which solves faster on
+real objectives is not measured. Both sit behind one helper. The default is combine and
+compact, and the last PR reports both on the replay.
+
+**What the chain must guarantee.** Let D be the decision variables a term reads.
+
+1. *Determined.* Once D has values, every position and the cost have one feasible value.
+   A position is never a choice, so the lowering adds no decisions to the search.
+2. *Total.* Every assignment of D the model allowed before still has a feasible chain.
+   The lowering never forbids a plan. A table constraint missing a row that can occur
+   would break this without any error.
+3. *Complete.* Walking the chain back from the cost reaches every variable of D that the
+   term's value depends on.
+4. *Correct.* The cost is the term's float value at that assignment, within the collapse
+   bound.
+
+On the example, in both forms: the model has 24 solutions, one per assignment of the
+three divisions; minimizing and maximizing the cost at a fixed assignment give the same
+value; and the worst error is 0.43 units.
+
+**How the plan keeps them.**
+
+- A position is made only by a combine or a compact of positions that are determined, so
+  it is determined.
+- A remap has an entry for every value of its parent, and a table constraint has a row
+  for every combination its parents can take.
+- Every list carries its index and the set of decision variables behind that index.
+  Combine takes the union of the two sets, and compact keeps the set. At a linear term
+  the set is checked against the variables the term reads: one may be missing only when
+  the term's value does not change with it.
+- A list and its index are made by one operation, in one order.
+- A position is made once and shared. Two terms that roll up the same sub-table read the
+  same variable.
+- The plan is read from the decision variables only. Positions are never read back.
+
 ## How a table maps onto CP-SAT
 
 This is the reference for the section above: every way a list is made, and what it
@@ -456,9 +564,11 @@ each on the one before.
 | 7 | rule 4: switched products and literal gates | yes |
 | 8 | `config.cpsat_table_lowering`, the solver's choice, printer fallback, docs | yes |
 
-In the tests below, *exact* means: the lowered objective, solved at every assignment of
-the inputs, equals `COST_SCALE` times the expression evaluated by sympy, within the bound
-stated under "Collapsing float lists into linear terms".
+In the tests below, *exact* means: at every assignment of the inputs the lowered
+objective is solved by minimizing and by maximizing. Both are feasible, they agree, and
+the value equals `COST_SCALE` times the expression evaluated by sympy, within the bound
+stated under "Collapsing float lists into linear terms". That checks a chain is
+determined, total and correct.
 
 ### Stage 1: numpy values (`cost_expr_numpy.py`)
 
@@ -544,6 +654,8 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 
 ### Stage 3: inputs, indexes, tables, linear sums
 
+- Positions are made by two moves only, combine and compact, behind one helper. Each list
+  carries the decision variables behind its index.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
   their index. Any other variable is indexed by its domain, through a position lookup
   when the domain has gaps. A domain past the cap is not an input.
@@ -563,6 +675,9 @@ returns None.
 Tests:
 
 - a sum of single-buffer terms is exact, with no table across two buffers;
+- the lowered model has as many solutions as its inputs have assignments;
+- a term whose chain misses a variable it depends on is refused when the objective is
+  planned;
 - a coefficient is applied before the rounding: `7 * split ** 0.5` at split 2 is 10137,
   not 7 * 1448;
 - terms on one index are added before the rounding: `split ** 0.5 + split ** 0.7` at
@@ -586,6 +701,8 @@ Tests:
 - A function of an indexed node keeps that node's index.
 - A node takes the cheaper of one table over its inputs and the form built from its parts
   (rule 3).
+- The same helper can build a roll-up as one table constraint, for the measurement in the
+  last PR.
 
 Tests:
 
@@ -596,7 +713,9 @@ Tests:
 - a product of two lists of different sizes, not symmetric in them, is exact;
 - equal values share a rank before pairing; a pair past the cap is refused;
 - a function of a short list adds no index;
-- the smaller form in entries wins, one case each way.
+- the smaller form in entries wins, one case each way;
+- a three-buffer roll-up, a Max by rung times a ranked factor, is exact in both forms,
+  and its last lookup names no division.
 
 ### Stage 5: rule 2
 
@@ -682,8 +801,9 @@ After Stage 8, posted on that PR:
    exact cost #6315 reaches, and no objective is further from exact than 1.2e-7. A
    different plan at that cost is a tie.
 2. **Size and time, reported.** Entries, largest table, lowering time and solve time per
-   capture, beside the table in Estimates. A capture with more entries or a slower solve
-   than #6315 is explained in the PR.
+   capture, beside the table in Estimates, for combine and compact and for the table
+   constraint. A capture with more entries or a slower solve than #6315 is explained in
+   the PR.
 3. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`:
    `test_scratchpad_solver.py`, `test_scratchpad_use.py`, `test_cost_model_replication.py`
    and `test_solver_relayout_decision.py`. #6315's CI ran every shard with the tables on
