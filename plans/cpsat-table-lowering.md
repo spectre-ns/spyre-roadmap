@@ -25,7 +25,12 @@ computed with numpy functions, and the code arrives in layers, each with its own
   function by name. A node with no numpy function is evaluated through lambdify.
 - **A stack of PRs**, one per stage, off torch-spyre `main`. #6315 stays open as the
   reference result and closes when the flag reproduces it.
-- **Off by default.** Stages 1 to 7 add files nothing imports. Stage 8 adds the flag.
+- **Off by default.** Stages 1 to 9 add files nothing imports. Stage 10 adds the flag.
+- **Base mechanics first, then one optimization per stage, integration last
+  (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
+  node, and cannot lower a real objective: its one table would hold 10^13.4 to 10^401
+  entries. Stages 2 to 8 each add one optimization. Stages 9 and 10 integrate with the
+  printer's maps and then with the solver.
 - **Behaviour, not code.** The stages below say what each layer does. #6315 is cited for
   its results only.
 - **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
@@ -118,13 +123,16 @@ lists that turn out affine and cost nothing, so it runs high.
 
 **What it says about the stages.**
 
-- Stage 3 lowers 6465 of the 6521 narrow terms as one table each; the other 56 read
-  four or more literals. It lowers none of the 50 objectives end to end: each has at
-  least one term whose inputs pass the cap, and the lowering is all or nothing.
-- Entry count is decided in Stages 4 to 7, on 1 to 4 terms per objective.
+- Stage 1, one table per node, lowers none of the 50 objectives: the root's table is
+  over every input, 10^13.4 to 10^401 entries.
+- Stage 2, linear sums, lowers 6465 of the 6521 narrow terms as one table each; the
+  other 56 read four or more literals. It lowers none of the 50 objectives end to end:
+  each has at least one term whose inputs pass the cap, and the lowering is all or
+  nothing.
+- Entry count is decided in Stages 3 to 7, on 1 to 4 terms per objective.
 - Lowering time matters most where the model is smallest. At the default config a decode
   block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. How much of that the
-  numpy evaluator of Stage 1 saves is not measured, and the last PR reports it.
+  numpy evaluator of Stage 1 saves is not measured, and Stage 9's replay reports it.
 
 ## How a table is read
 
@@ -370,8 +378,8 @@ Two more reductions are not in this graph. A fold (rule 2) reads a product of Mi
 factors over shared inputs by the tuples of rungs that can occur together. A switch
 (rule 4) leaves a factor too wide to pair out of every table. On the model blocks one
 table over the widest term alone would hold 3.6e4 to 7.5e18 entries, and #6315's lowering
-of the whole objective holds 396 to 21998 (Estimates). The last PR reports entries per
-capture with each reduction.
+of the whole objective holds 396 to 21998 (Estimates). Stage 9's replay reports
+entries per capture with each reduction.
 
 Two subsections below add what the graph does not show: a buffer with several symbols on
 one division, and one table over several integer variables. Every table in this section
@@ -536,14 +544,14 @@ lookups, the max, the factor's rank and the cost lookup, with two:
 
 Both forms were run on the roll-up and agree at all 24 assignments. Which solves faster
 on real objectives is not measured. The table constraint is a second emitter,
-`AllowedEmitter`, which the replay of the last PR runs in place of `CpEmitter` on the
+`AllowedEmitter`, which Stage 9's replay runs in place of `CpEmitter` on the
 plan `TableLowering` returns (Architecture). The plan it builds is the same one. Where
 `CpEmitter` builds a position from two others by compacts and a combine,
 `AllowedEmitter` lists the rows, read off `CpIndex.positions`, and where a cost is read
 on such a position it puts the rounded cost in the rows as `out`. So the walk, rule 3
 and the cap count entries the same way under both, and the two models differ only in
-their constraints. Which steps one table constraint takes in is settled in Stage 4. The
-default is combine and compact, and the last PR reports both on the replay.
+their constraints. Which steps one table constraint takes in is settled in Stage 8. The
+default is combine and compact, and Stage 9's replay reports both.
 
 **What the chain must guarantee.** Let D be the decision variables a term reads.
 
@@ -1128,7 +1136,7 @@ input, what `TableLowering` reads. The sketch has three layers:
 
 The emitter is not injected: the entry point always builds with `CpEmitter`.
 `AllowedEmitter`, the table-constraint build ("One constraint for both moves"), is
-there only for the measurement in the last PR, and the replay builds the plan with it
+there only for the measurement in Stage 9's replay, which builds the plan with it
 directly, `AllowedEmitter(model).linear(plan)`, three lines it can write itself. If the
 measurement favours the table constraint, it replaces `CpEmitter` in the entry point;
 a parameter no production caller sets is not added for it.
@@ -1542,7 +1550,7 @@ realized. At visit 12 one table is the cheaper list for the Max. Its parent then
 that list with a 6-entry remap, where rungs would have cost 5 and needed no rank: 19
 entries against 18 for the Max by rung, paired with the ranked factor. The walk could
 instead keep both candidates on a `CpNode` for its reader to choose, since nothing is in
-the model yet. The plan starts with the rule at the node, and the last PR reports
+the model yet. The plan starts with the rule at the node, and Stage 9's replay reports
 entries per capture.
 
 **Checked.** A sketch of this walk was run on 15 expressions: the graph of "The process,
@@ -1558,30 +1566,65 @@ was visited once: 10 visits for an expression of 15 nodes.
 
 | Stage | Adds to the architecture |
 |---|---|
-| 1 | `numpy_value`, and its one-node step, which `visit_op` finds for each operation |
-| 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, `CpLinearNode`, `lower`'s normalization, list, pass 1 and rewrite, `CpEmitter` and the steps `Input`, `Locate`, `Unit`, `Combine` and `Compact`, `inputs_from_maps`, the entry point with its copy and swap back, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
-| 4 | the table from a node's parts: rank and pair, a Max's or Min's table by rung with `Extreme`, the choice by entries, and `AllowedEmitter` |
+| 1 | each node's numpy step and `values_on_grid`; the values (`IndexMap` with `Input`, `Locate`, `Unit` and `Combine`, `CpIndex`, `CpLinear`, `CpTable`); `CpNode`, the list and pass 2; `tabulate` for a leaf, for children on one index and for one table over the inputs; `CpEmitter` for positions, rounding and lookups; `TableLoweringError` |
+| 2 | `CpLinearNode` for an Add and a Mul, pass 1, their linear forms, the choice between a node's table and its linear form, and the affine case of `CpEmitter.table` |
+| 3 | the table from a node's parts: `Compact`, ranks and pairs, and the choice between it and one table over the inputs |
+| 4 | a Max and a Min as `CpLinearNode`s with a table by rung: `Extreme`, ladders, rungs, clamping |
 | 5 | a Mul's table by fold |
-| 6 | the linear form of a Max or Min, and of a constant times one child in a Mul |
-| 7 | the switch and the gate in a Mul's linear form, and a `RelayoutCharge`'s gate |
-| 8 | nothing: the flag chooses between this lowering and the printer, and a refusal raises |
+| 6 | the linear form of a Max or Min: `lin_max` and `lin_min`, margin 2, operands behind proxies |
+| 7 | the switch and the gate in a Mul's linear form, and a `RelayoutCharge` as a `CpLinearNode` with its gate |
+| 8 | `AllowedEmitter` |
+| 9 | `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
+| 10 | nothing in the module: the flag, the solver's call and the docs |
 
 ## Stages
 
 Every stage is one PR with its tests. Branches: `table-lowering-N-<slug>-experimental`,
-each on the one before.
+each on the one before. Stage 1 builds the mechanics that lower an expression from its
+inputs, naively. Stages 2 to 8 each add one optimization. Stages 9 and 10 integrate:
+first with the printer's maps, then with the solver behind the flag.
 
-| # | PR adds | Needs ortools |
+| # | PR adds | What it lowers |
 |---|---|---|
-| 1 | numpy values of a cost expression: `cost_expr_numpy.py` | no |
-| 2 | pure helpers: ladders, rungs, fold, scaling | no |
-| 3 | inputs, indexes, one table per node, linear sums | yes |
-| 4 | rule 1 and parts: Min/Max by rung, ranks, pairs, functions of a list | yes |
-| 5 | rule 2: fold of Min/Max factors over shared inputs | yes |
-| 6 | rule 3 in the objective: linear Min/Max where the table is larger | yes |
-| 7 | rule 4: switched products and literal gates | yes |
-| 8 | `config.cpsat_table_lowering`, the solver's choice, the raise on a refusal, docs | yes |
+| 1 | the base mechanics: inputs and an expression to a CP-SAT objective, one table per node | an expression whose inputs fit the cap together; no real objective |
+| 2 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
+| 3 | ranks and pairs: a node's table from its parts | products of short lists over several buffers |
+| 4 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
+| 5 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
+| 6 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes |
+| 7 | rule 4: switched products and literal gates | a factor too wide to pair, residency gates, relayout charges |
+| 8 | the table constraint, `AllowedEmitter`, built beside `CpEmitter` | the same plans, as table constraints |
+| 9 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
+| 10 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, docs | every compile, with the flag on |
+
+**At the start, real objectives do not lower.** Stage 1 makes one table per node, so the
+root's table is over every input the objective reads. On the 50 replayed objectives that
+is 14 to 544 inputs and 10^13.4 to 10^401 entries, and 10^29.5 to 10^60.5 on the default
+and auto-tiling model blocks, against a cap of 8192. Stage 2 keeps the sum linear, which
+lowers 6465 of the 6521 narrow terms as one table each, but each objective still has a
+wide term past the cap (Estimates). Stages 3 to 7 are for those 1 to 4 wide terms. Real
+objectives are first lowered end to end at Stage 9, which maps the printer's inputs; at
+#6315's tip, with all four rules, all 50 lower.
+
+**On the graph of "The process, step by step"**, at its own menus and at the real menus
+of "On real menus", after each stage that applies to it:
+
+| After stage | Entries, small menus | Entries, real menus | Largest table, real menus |
+|---|---|---|---|
+| 1 | 24 | 4620 | 4620 |
+| 2 | 24 | 4620 | 4620 |
+| 3 | 24 | 4620 | 4620 |
+| 4 | 23 | 152 | 36 |
+| 6 | 23 | 152 | 36 |
+
+Every row was run through CP-SAT at every assignment: one solution per assignment, and
+within the collapse bound. Stages 2 and 3 change nothing here, because the Max reads all
+three divisions and its only form is one table over them: the root's linear form holds
+those 4620 entries and the other lists besides, more than one table over the root, and
+rule 3 keeps the table. Once Stage 4 reads the Max by rung, the linear sum and the
+ranked product pay at once. Stage 6 changes nothing either: the `lin_max`, 52 entries,
+is not under half of the rung form's 64. Stages 5 and 7 do not apply to this graph. The
+reductions compound, so a stage is measured with the ones before it on.
 
 In the tests below, *exact* means: at every assignment of the inputs the lowered
 objective is solved by minimizing and by maximizing. Both are feasible, they agree, and
@@ -1589,10 +1632,15 @@ the value equals `COST_SCALE` times the expression evaluated by sympy, within th
 stated under "Collapsing float lists into linear terms". That checks a chain is
 determined, total and correct.
 
-### Stage 1: numpy values (`cost_expr_numpy.py`)
+### Stage 1: the base mechanics
 
-One function, `numpy_value(expr, env)`, a loop over `postorder_traversal(expr)`, each
-node once, with no recursion. Values are kept in a dict by node; no node is changed:
+Inputs and an expression in, a CP-SAT objective out, with no optimization:
+`TableLowering(inputs, cap=cap).lower(expr)`, then `CpEmitter(model).linear(plan)`.
+Tests build the inputs by hand, as in "Using the interfaces".
+
+**numpy values (`cost_expr_numpy.py`).** One function, `numpy_value(expr, env)`, a loop
+over `postorder_traversal(expr)`, each node once, with no recursion. Values are kept in a
+dict by node; no node is changed:
 
 1. a symbol is its array in `env`, a number is a float, `True` and `False` are
    themselves;
@@ -1631,6 +1679,29 @@ numbers, `decode_delivery_price_*` (`cost_model.py:1426-1449`) and `RelayoutChar
 (`plan_solver.py:487`). ITE and `False` are latent: they need auto tiling or cost
 parameters other than production's.
 
+**The lowering (`cpsat_table_lowering.py`).**
+
+- The values: `IndexMap` with `Input`, `Locate`, `Unit` and `Combine`; `CpIndex`, which
+  computes its size from its parts; `CpLinear`, here a constant and one list on one
+  position; `CpTable`; and `TableLoweringError`.
+- The walk: `TableLowering` makes the list, `sympy.postorder_traversal` with its repeats
+  dropped, and runs pass 2 over it. Every node is a `CpNode`. There is no pass 1 yet,
+  since no node has a linear form.
+- `tabulate` has three cases: a leaf is its input's column, or a number on `Unit`; a
+  node whose children share a position applies its numpy step to their lists
+  elementwise; any other node is one table over the inputs of its free symbols,
+  `values_on_grid` on their combined positions, in that order. A node whose inputs pass
+  the cap has no table, and its `visit_op` raises `TableLoweringError` naming it.
+- The root is read as its table: the objective is one lookup.
+- `CpEmitter` builds each position once, rounds a list once onto `COST_SCALE`, reads it
+  with one `add_element`, makes a constant list a number, and refuses an entry past
+  2^50.
+- The whole objective is planned before anything is added to the model.
+
+After this stage an expression whose inputs fit the cap together is lowered exactly.
+Anything wider raises, and on a real objective the root, or a wide term below it, is
+always wider. Nothing imports the module until Stage 10, so the raise reaches no compile.
+
 Tests, `tests/inductor/test_cost_expr_numpy.py`:
 
 - every override, and every by-name function the cost model uses, against exact sympy
@@ -1649,138 +1720,128 @@ Tests, `tests/inductor/test_cost_expr_numpy.py`:
   `test_cost_model_replication.py` already use) never reach lambdify, and agree with
   `sympy.lambdify(modules="math")`, the annealer's evaluator (`sa_cooptimizer.py:849`).
 
-### Stage 2: pure helpers (`cpsat_table_lowering.py`, first slice)
-
-Functions of numbers and lists, with no CP-SAT model:
-
-- the ladder of a Min/Max: the values it can return, ascending, and the bound past which
-  an operand's value is clamped;
-- rungs: each of a list's clamped values as its position on a ladder, or None when one is
-  not on it;
-- the reachable fold: for Min/Max factors given as rungs over their inputs, the tuples of
-  rungs that occur together and the steps that compute which one occurs, or None past
-  the cap;
-- scaling: one rounding of a float list onto `COST_SCALE`;
-- the switch scale: for a factor with fractional values, the power of two `q` that holds
-  each value as `p/q` with every product inside int64.
-
 Tests, `tests/inductor/test_cpsat_table_lowering.py`:
-
-- a Min's ladder drops the values above its smallest operand maximum; a Max mirrors it;
-- values equal to 12 digits share a rung; a value off the ladder gives None;
-- the Min of rungs is the rung of the Min (seeded random operands);
-- the fold numbers only the tuples that occur together; a constant operand seeds its
-  start state; operands sharing an input join one group; a step past the cap is refused;
-- scaling rounds once;
-- the switch scale is 1 for whole values and otherwise keeps `p * w` under 2^60;
-- the pair `q*P <= p*w`, `q*P >= p*w - (q-1)` admits only `P = (p*w) // q`, negatives
-  included.
-
-### Stage 3: inputs, indexes, tables, linear sums
-
-- Architecture arrives: `CpNode` and `CpLinearNode` with `visit_op`, `lower` with its
-  normalization, list, pass 1 and rewrite, and `CpEmitter`. `tabulate` makes the table
-  of a leaf, of a node whose children share an index, and of a node whose inputs fit one
-  table. An Add and a `RelayoutCharge` get their linear forms.
-- Positions are made by `IndexMap` steps: `Input`, `Locate`, `Unit`, `Combine` and
-  `Compact` here, `Extreme` in Stage 4. A `CpIndex` computes its size from its parts.
-- `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
-  share its division as their index. Any other variable is indexed by its domain:
-  `Input` with its offset, or `Locate`, a position lookup, when the domain has gaps. A
-  domain past the cap is not an input. Mapping the inputs adds nothing to the model: a
-  `Locate`'s lookup is built by the emitter, when a list reads it.
-- A node whose inputs fit the cap is one table over them, read through a joint index in
-  the order `values_on_grid` uses.
-- The objective is a constant plus one list per index. Lists are collapsed here and
-  nowhere below: the coefficient is applied and terms on one index are added in float,
-  then the list is rounded once. A list affine in its index is a linear term with no
-  table, and a constant list is a number.
-- The whole objective is planned before anything is added to the model.
-- `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=...)` copies the
-  model and returns the objective, an `int` when it is constant. On any failure it
-  swaps the copy back and raises `TableLoweringError`, and nothing else.
-
-After this stage a sum whose terms each fit one table is lowered exactly. Anything else
-raises. Nothing imports the module until Stage 8, so the raise reaches no compile.
-
-Tests:
 
 - the walk visits a node after its arguments, and a subexpression two terms share once,
   with one `CpNode`; the expression is the same object, equal to a copy taken before;
-- pass 1 marks every parent before its children: a node under a power is not marked, a
-  node shared by a power and a sum is, and a node not marked builds no linear form;
-- the rewrite makes a `CpLinearNode` for an Add, Mul, Max, Min or `RelayoutCharge` and a
-  `CpNode` for every other class, each holding its sympy node; `lower` does not change
-  the expression passed in; an operation with no numpy function is evaluated through
-  lambdify; a `CpNode` read with `as_linear` is its table as one list;
-- every list `tabulate` returns has the length of its index; a `CpIndex` refuses parts
-  its step does not take, a `CpTable` takes `values` and `index` only, and a list in a
-  form cannot be written to;
-- every index takes, at every assignment, the position `CpIndex.positions` gives; two
+- every list `tabulate` returns has the length of its position; a `CpIndex` refuses
+  parts its step does not take, a `CpTable` takes `values` and `index` only, and a list
+  in a form cannot be written to;
+- every position takes, at every assignment, the value `CpIndex.positions` gives; two
   equal `CpIndex`es made apart are built once;
-- a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
+- one table over two inputs of different sizes, for an expression that is not symmetric
+  in them, is exact: a list and a position in different orders fail it;
+- a variable with gaps in its domain reads the entry of its value, through `Locate`, and
+  so does one whose domain starts above 0;
+- a Piecewise cost, a function with no numpy name and a relayout charge, one table over
+  its literal and its division, are exact;
 - a coefficient is applied before the rounding: `7 * split ** 0.5` at split 2 is 10137,
   not 7 * 1448;
-- terms on one index are added before the rounding: `split ** 0.5 + split ** 0.7` at
-  split 2 is one entry, 3112, not 1448 + 1663;
-- one table over two inputs of different sizes, for an expression that is not symmetric
-  in them, is exact: a list and an index in different orders fail it;
-- a variable with gaps in its domain reads the entry of its value, and so does one whose
-  domain starts above 0;
-- a Piecewise cost, a function with no numpy name and a relayout charge are exact;
-- two menu lengths on one division are refused; a variable with gaps in its domain gets a
-  position; a domain past the cap is no input;
-- an affine list adds no table; a constant list adds no variable;
-- an entry too large for int64 sums is refused, also when other lists were built first;
-- a relayout of a buffer this solve does not divide costs 0;
-- a failure in the walk or in the build leaves the model equal to its copy, and a
-  constant made during the failed build is not reused by the next one;
-- an exception of another type raised inside the lowering leaves as
-  `TableLoweringError`, with the original as its cause, and the error carries its `node`
-  and `reason`.
+- a constant list adds no variable, and a constant objective is an int;
+- an entry too large for int64 sums is refused with `TableLoweringError`;
+- a symbol with no input raises, naming it;
+- the naive lowering explodes: a sum of single-buffer terms over three buffers whose
+  menus multiply past the cap raises `TableLoweringError` naming the sum. Stage 2 lowers
+  the same sum.
 
-### Stage 4: rule 1 and parts
+### Stage 2: linear sums
 
-All of this stage is in `tabulate`: the second candidate, the form from a node's parts,
-and the choice between the two.
+The first optimization, the one that keeps a sum's terms apart: "the sum stays linear",
+"lists on one index are added" and "an affine list needs no table" of "How the tables
+are kept small", with the collapse of "Collapsing float lists into linear terms".
 
-- A Min/Max of indexed operands is indexed by rung (rule 1).
-- Equal values share one rank, and a product of two short lists is one table over the
-  pair of their ranks.
-- A function of an indexed node keeps that node's index.
-- A node takes the cheaper of one table over its inputs and the form built from its parts
-  (rule 3).
-- `AllowedEmitter`, a second emitter, builds the same plan with table constraints, its
-  rows read off `CpIndex.positions`, for the measurement in the last PR.
+- An Add and a Mul become `CpLinearNode`s, and pass 1 arrives to mark the nodes a linear
+  reader can reach.
+- An Add's linear form is its children's `as_linear` merged: constants added, lists on
+  one position added elementwise in float. A Mul's is a constant factor times its one
+  other child's `as_linear`, the lists scaled in float.
+- `as_linear` on a `CpLinearNode` picks its table or its linear form, whichever has
+  fewer entries, the table on a tie (rule 3, without the Min/Max margin yet).
+- `CpEmitter.table` reads a list affine in its position as a linear expression, with no
+  table.
+
+After this stage a sum whose terms each fit the cap is lowered exactly, with no table
+across two of its terms' inputs. On real objectives that is 6465 of the 6663 terms, and
+still no whole objective: each has a wide term past the cap.
 
 Tests:
 
-- a Max over three buffers is exact with no table as large as the joint table, and each
-  operand lands on the rung of its clamped value;
+- pass 1 marks every parent before its children: a node under a power is not marked, a
+  node shared by a power and a sum is, and a node not marked builds no linear form;
+- the rewrite makes a `CpLinearNode` for an Add or a Mul and a `CpNode` for every other
+  class, each holding its sympy node; a `CpNode` read with `as_linear` is its table as
+  one list;
+- the sum that raised in Stage 1 is exact, with no table across two buffers;
+- terms on one position are added before the rounding: in
+  `split_a ** 0.5 + split_a ** 0.7 + split_b`, the two terms on `split_a` are one list,
+  3112 at `split_a = 2`, not 1448 + 1663;
+- a coefficient on a sum is applied to its lists before the rounding;
+- an affine list adds no table;
+- a node takes its one table where that has fewer entries than its linear form.
+
+### Stage 3: ranks and pairs
+
+`tabulate` gains its second candidate, the table from a node's parts, and the choice
+between the two (rule 3): "equal values share a rank".
+
+- Each child's list is compacted to its distinct values, a `Compact` on its position;
+  the positions are combined, and the node's numpy step is applied across them. A
+  product of two short lists over two buffers is one table over the pair of their
+  ranks.
+- A node takes the cheaper, in entries, of one table over its inputs and the table from
+  its parts.
+
+Tests:
+
 - a menu with repeated values reads the same entry through its rank as through its
   division;
 - a product of two lists of different sizes, not symmetric in them, is exact;
 - equal values share a rank before pairing; a pair past the cap is refused;
-- a function of a short list adds no index;
-- the smaller form in entries wins, one case each way;
-- a three-buffer roll-up, a Max by rung times a ranked factor, is exact under both
-  emitters, with the same cost at every assignment, and its last lookup names no
-  division.
+- a function of a short list adds no position;
+- the smaller form in entries wins, one case each way.
 
-### Stage 5: rule 2
+### Stage 4: rule 1, a Min/Max by rung
+
+A Max and a Min become `CpLinearNode`s, with one more candidate from their parts: by
+rung (rule 1), with clamping. "The Max is read by rung" and "values past the bound are
+clamped" of "How the tables are kept small".
+
+- The ladder of a Min/Max: the values it can return, ascending, and the bound past which
+  an operand's value is clamped.
+- Rungs: each of an operand's clamped values as its position on the ladder, a `Compact`;
+  then `Extreme`, the max or min of the rungs.
+
+Tests:
+
+- a Min's ladder drops the values above its smallest operand maximum; a Max mirrors it;
+- values equal to 12 digits share a rung; a value off the ladder gives none;
+- the Min of rungs is the rung of the Min (seeded random operands);
+- a Max over three buffers is exact with no table as large as one table over them, and
+  each operand lands on the rung of its clamped value;
+- the graph of "The process, step by step" at the real menus is exact at all 4620
+  assignments in 152 entries, where Stage 3 needs 4620.
+
+### Stage 5: rule 2, the fold
 
 Min/Max factors of one product, over shared inputs, become one indexed value over the
 reachable tuples of their rungs, when crossing their lists would pass the cap. It is one
-more form from a node's parts, for a Mul in `CpLinearNode.visit_op`.
+more candidate from a Mul's parts.
 
-Tests: a product of four Max factors over three shared buffers is exact under a cap their
-crossed ladders pass; no fold when the crossed lists fit.
+- The reachable fold: for Min/Max factors given as rungs over their inputs, the tuples of
+  rungs that occur together and the steps that compute which one occurs, or none past
+  the cap. Each step is a combine and a compact.
 
-### Stage 6: rule 3 in the objective
+Tests:
 
-A Max and a Min gain their linear form in `CpLinearNode.visit_op`, and a reader picks
-between it and the table.
+- the fold numbers only the tuples that occur together; a constant operand seeds its
+  start state; operands sharing an input join one group; a step past the cap is refused;
+- a product of four Max factors over three shared buffers is exact under a cap their
+  crossed ladders pass; no fold when the crossed lists fit.
+
+### Stage 6: rule 3 in the objective, a Min/Max kept linear
+
+A Max and a Min gain their linear form, and a reader picks between it and the table.
 
 - A Min/Max too wide to index, or whose table is over twice its linear form, stays a
   `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
@@ -1797,30 +1858,73 @@ Tests: a Min of two sums of residency literals stays linear and is exact, with n
 over its inputs; a near tie keeps the table; a negative coefficient gives a `lin_max`;
 a fractional coefficient on a linear Min is within the largest operand's bound; each
 operand is a single variable; a Max too wide to index under a power, a log or a division
-raises with the model untouched, and the same Max under a sum, a constant and a Min stays
-linear.
+raises, and the same Max under a sum, a constant and a Min stays linear.
 
-### Stage 7: rule 4
+### Stage 7: rule 4, switches and gates
 
-A Mul gains its switch and gate in `CpLinearNode.visit_op`, and a `RelayoutCharge` its
+A Mul gains its switch and gate, and a `RelayoutCharge` becomes a `CpLinearNode` with its
 gate.
 
 - A product whose factor cannot pair with the rest is switched on the factor's value.
-  Whole values take one equality per value. Fractional values take the floor pair of
-  Stage 2. This is the one form where a float multiplies a sum already collapsed, with
-  the bound stated under "Collapsing float lists into linear terms".
+  Whole values take one equality per value. Fractional values take the floor pair below.
+  This is the one form where a float multiplies a sum already collapsed, with the bound
+  stated under "Collapsing float lists into linear terms".
+- The switch scale: for a factor with fractional values, the power of two `q` that holds
+  each value as `p/q` with every product inside int64; the floor pair
+  `q*P <= p*w`, `q*P >= p*w - (q-1)` then makes `P = (p*w) // q`.
 - A 0/1 literal, one minus it, or a multiple of either, times a term is the two-value
   case: the term is lowered with the literal fixed on, and no table reads the literal. A
   relayout charge is its literal times a price by division.
 - A gate whose rest is constant is a coefficient on the literal.
 
-Tests: a fractional factor times a sum of lists with fractional entries is within the
-rule 4 bound; a factor times a Min too wide to pair is exact, also inside a Min; a
-relayout charge and a gated term are exact with no table larger than the menu; a constant
-rest adds no table; two wide factors raise with the model untouched; a product too wide
-for its factor's precision raises.
+Tests: the switch scale is 1 for whole values and otherwise keeps `p * w` under 2^60;
+the floor pair admits only `P = (p*w) // q`, negatives included; a fractional factor
+times a sum of lists with fractional entries is within the rule 4 bound; a factor times
+a Min too wide to pair is exact, also inside a Min; a relayout charge and a gated term
+are exact with no table larger than the menu; a constant rest adds no table; two wide
+factors raise; a product too wide for its factor's precision raises.
 
-### Stage 8: the flag
+### Stage 8: the table constraint
+
+`AllowedEmitter`, a second emitter, builds the same plan with
+`add_allowed_assignments` ("One constraint for both moves"): its rows are read off
+`CpIndex.positions`, and a cost read on a rolled-up position goes into the rows. Which
+steps one table constraint takes in is settled here. `CpEmitter` stays the default, and
+Stage 9's replay measures both.
+
+Tests: a three-buffer roll-up, a Max by rung times a ranked factor, is exact under both
+emitters, with the same cost at every assignment, and its last lookup names no division;
+under `AllowedEmitter` the model has one solution per assignment, so no row that can
+occur is missing.
+
+### Stage 9: integration with the printer's maps
+
+- `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
+  share its division as their position. Any other variable is indexed by its domain:
+  `Input` with its offset, or `Locate`, a position lookup, when the domain has gaps. A
+  domain past the cap is not an input. Mapping the inputs adds nothing to the model: a
+  `Locate`'s lookup is built by the emitter, when a list reads it.
+- `lower`'s normalization: a relayout charge on a source this solve does not divide
+  becomes 0.
+- `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=...)` copies the
+  model and returns the objective, an `int` when it is constant. On any failure it
+  swaps the copy back and raises `TableLoweringError`, and nothing else.
+
+Real objectives lower end to end from here. Nothing imports the module yet, so the
+replay of "Verification" calls the entry point directly.
+
+Tests:
+
+- two menu lengths on one division are refused; a variable with gaps in its domain gets
+  a position; a domain past the cap is no input;
+- a relayout of a buffer this solve does not divide costs 0;
+- a failure in the walk or in the build leaves the model equal to its copy, and a
+  constant made during the failed build is not reused by the next one;
+- an exception of another type raised inside the lowering leaves as
+  `TableLoweringError`, with the original as its cause, and the error carries its `node`
+  and `reason`.
+
+### Stage 10: integration with the solver, the flag
 
 - `config.py`, beside `cpsat_time_limit_seconds` (`:407`), in the style of `ktir_emitter`
   (`:137`):
@@ -1865,26 +1969,29 @@ Each PR:
   files are listed in
   `tests/configs/torch_spyre_tests/inductor/test_cpsat_table_lowering_config.yaml`.
 - `git commit -s`, the Apache header on new files, `feat(scratchpad): ...` subjects.
-- Stages 1 to 7: `git diff main --stat` shows new files only.
+- Stages 1 to 9: `git diff main --stat` shows new files only.
 
-After Stage 8, posted on that PR:
+After Stage 9, posted on that PR, with the replay calling `lower_cost_with_tables`:
 
 1. **Same results as #6315.** Replay the 50 captured objectives
    (`~/pr6301-review/replay.py`, #6315's results in `~/pr6301-review/tableonly/`). Every
    capture is `OPTIMAL` at the exact cost #6315 reaches, and no objective is further from
-   exact than 1.2e-7. A different plan at that cost is a tie.
+   exact than 1.2e-7. A different plan at that cost is a tie. None may raise
+   `TableLoweringError`.
 2. **Size and time, reported.** Entries, largest table, lowering time and solve time per
-   capture, beside the table in Estimates, for combine and compact and for the table
-   constraint. Entries also with each reduction of "How the tables are kept small" turned
-   off alone. A capture with more entries or a slower solve than #6315 is explained in
-   the PR.
+   capture, beside the table in Estimates, for `CpEmitter` and for `AllowedEmitter`.
+   Entries also with each stage's optimization turned off alone. A capture with more
+   entries or a slower solve than #6315 is explained in the PR.
+
+After Stage 10, posted on that PR:
+
 3. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`:
    `test_scratchpad_solver.py`, `test_scratchpad_use.py`,
    `test_cost_model_replication.py` and `test_solver_relayout_decision.py`. #6315's CI
    ran every shard with the tables on the default path and all passed; its one red job
-   was a card fault (`DdrInitRetryLimitExceeded`). No suite and none of the 50 replayed
-   objectives may raise `TableLoweringError`: a refusal fails the run, since with the
-   flag on it fails a compile.
+   was a card fault (`DdrInitRetryLimitExceeded`). No suite may raise
+   `TableLoweringError`: a refusal fails the run, since with the flag on it fails a
+   compile.
 4. **Flag off.** The same suites with no flag, unchanged.
 
 ## Next step
