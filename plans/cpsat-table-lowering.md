@@ -611,9 +611,10 @@ and each of those makes its CP-SAT variables itself, on first request:
 ```python
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 import numpy as np
 import sympy
@@ -628,19 +629,22 @@ class TableLoweringError(Exception):
     """
 
 
-class IndexMap(Protocol):
+class IndexMap(ABC):
     """One mapping step, injected into a CpIndex: from the positions of its parts to a
-    position 0 .. size - 1. A new kind of step is a new IndexMap; CpIndex and the walk
-    do not change."""
+    position 0 .. size - 1. Each kind of step is a subclass; CpIndex and the walk do not
+    change when one is added."""
 
     @property
+    @abstractmethod
     def entries(self) -> int:
         """The table entries the step puts in the model, 0 for an arithmetic step."""
 
+    @abstractmethod
     def __call__(self, *parts: np.ndarray) -> np.ndarray:
         """The step in numpy: the position for each combination of the parts' positions,
         broadcast across the parts."""
 
+    @abstractmethod
     def cp_expr(
         self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
     ) -> cp_model.LinearExprT:
@@ -648,34 +652,80 @@ class IndexMap(Protocol):
 
 
 @dataclass(frozen=True)
-class Input:
-    """IndexMap of a variable's own position, d -> d: no parts, no entries, and the
-    variable as its CP-SAT expression. The variable is already in the model."""
+class Input(IndexMap):
+    """A variable's own position, d -> d. The variable is already in the model."""
 
     var: cp_model.IntVar
 
+    @property
+    def entries(self) -> int:
+        """0."""
+
+    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+        """The identity on the variable's positions, its one argument."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
+    ) -> cp_model.LinearExprT:
+        """var, with no parts."""
+
 
 @dataclass(frozen=True)
-class Combine:
-    """IndexMap (left, right) -> left * right_size + right: one linear expression, no
-    entries."""
+class Combine(IndexMap):
+    """(left, right) -> left * right_size + right."""
 
     right_size: int
 
+    @property
+    def entries(self) -> int:
+        """0."""
+
+    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+        """left * right_size + right, broadcast."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
+    ) -> cp_model.LinearExprT:
+        """The linear expression left * right_size + right: no variable, no constraint."""
+
 
 @dataclass(frozen=True)
-class Compact:
-    """IndexMap parent -> remap[parent]: one add_element, len(remap) entries."""
+class Compact(IndexMap):
+    """parent -> remap[parent]."""
 
     remap: tuple[int, ...]
 
+    @property
+    def entries(self) -> int:
+        """len(remap)."""
+
+    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+        """np.asarray(remap)[parent]."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
+    ) -> cp_model.LinearExprT:
+        """A new variable in 0 .. size - 1 and add_element(parent, remap, variable)."""
+
 
 @dataclass(frozen=True)
-class Extreme:
-    """IndexMap (rung_1, ..., rung_k) -> their max, or min: one lin_max or lin_min, no
-    entries. Exact because a ladder keeps order."""
+class Extreme(IndexMap):
+    """(rung_1, ..., rung_k) -> their max, or min. Exact because a ladder keeps order."""
 
     is_max: bool
+
+    @property
+    def entries(self) -> int:
+        """0."""
+
+    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+        """np.maximum, or np.minimum, across the rungs."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
+    ) -> cp_model.LinearExprT:
+        """A new variable in 0 .. size - 1 and one add_max_equality, or
+        add_min_equality, over the rungs."""
 
 
 @dataclass(frozen=True)
@@ -818,7 +868,8 @@ The sketch is the public interface only: signatures and docstrings, with the bod
 to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for one, so
 a refusal leaves the model untouched. `cp_expr` makes them after the walk, when the
 objective's form requests them, each once. `Input`, `Combine`, `Compact` and `Extreme`
-each implement the three members of `IndexMap`; the sketch shows their fields only.
+subclass the abstract `IndexMap` and override its three members, so a step missing one
+cannot be made.
 Inside `TableLowering`, the dispatch to one
 method per node class, the
 methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
