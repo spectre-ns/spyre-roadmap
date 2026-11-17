@@ -234,41 +234,12 @@ them one integer table. These are the only tables that hold a cost:
 The rung tables hold positions, not costs: `rungs_a = [0, 0, 4]`, `rungs_b = [0, 3]` and
 `rungs_c = [0, 1, 1, 2]`.
 
-```mermaid
-flowchart LR
-    subgraph IN["decision variables"]
-        DA["division_a in 0..2"]
-        DB["division_b in 0..1"]
-        DC["division_c in 0..3"]
-    end
-    subgraph POS["positions: fixed by the inputs"]
-        P["pair == 2*division_a + division_b"]
-        RA["rung_a == rungs_a[division_a]"]
-        RB["rung_b == rungs_b[division_b]"]
-        RC["rung_c == rungs_c[division_c]"]
-        RK["rank == max(rung_a, rung_b, rung_c)"]
-    end
-    subgraph LT["linear terms"]
-        C1["cost_1 == table_1[division_a]"]
-        C2["cost_2 == table_2[pair]"]
-        C3["cost_3 == table_3[rank]"]
-    end
-    OBJ["minimize cost_1 + cost_2 + cost_3"]
-    DA --> C1
-    DA --> P
-    DB --> P
-    P --> C2
-    DA --> RA
-    DB --> RB
-    DC --> RC
-    RA --> RK
-    RB --> RK
-    RC --> RK
-    RK --> C3
-    C1 --> OBJ
-    C2 --> OBJ
-    C3 --> OBJ
-```
+The order of the collapse matters. At `split_a = 2`:
+
+- `7 * split_a ** 0.5` is 10137, the rounding of 7 * 1448.15. Rounding first and
+  multiplying after gives 7 * 1448 = 10136.
+- `split_a ** 0.5 + split_a ** 0.7` is one entry, 3112, the rounding of
+  1448.15 + 1663.49. Collapsing each list alone gives 1448 + 1663 = 3111.
 
 The graph had 13 nodes. The model gets six lookups with 23 entries, one linear equality
 and one max.
@@ -281,10 +252,78 @@ The example was run through CP-SAT at all 24 assignments of the three divisions.
 model has 24 solutions, minimizing and maximizing agree at each, and the worst error is
 1.16 units over the three tables.
 
-The subsections below take the steps one at a time on smaller examples: a leaf (step 1),
-terms over one buffer and their tables (steps 2 and 5), nodes over several variables
-(step 3) and a Max (step 4). Every table in this section was run through CP-SAT at every
-assignment of its inputs, and each came back within half a unit of the float value.
+### How the tables are kept small
+
+The starting point is one table over every input the objective reads, the product of the
+menus. Each reduction below cuts it at one node of the walk:
+
+| Reduction | Where | What it saves |
+|---|---|---|
+| The sum stays linear | the sum | entries add over the terms instead of multiplying over the inputs |
+| Lists on one index are added | the sum | one list per index, not one per term |
+| An affine list needs no table | the collapse | a list linear in its index is `table[0] + step * index`; a constant list is a number |
+| Equal values share a rank | a node over several indexes | a product pairs distinct values, not divisions |
+| A Min/Max is read by rung (rule 1) | a Min/Max | a ladder of the values it can return, and one remap per operand |
+| Values past the bound are clamped | a Min/Max | the ladder drops the values the Min/Max can never return |
+
+**How the walk chooses.** A node over several indexes has two candidates, one table over
+its inputs and the form from its parts, and `tabulate` keeps the one with fewer entries
+(rule 3). Both sizes are known before any list is computed: one table is the product of
+its inputs' sizes, and the form from its parts is its list (the product of the parts'
+distinct values, or the ladder) plus the remaps under its index. A candidate past the cap
+is never evaluated. In the objective a Min/Max stays a `lin_min`/`lin_max` only when that
+needs under half the entries of its table.
+
+**On the graph above.** Its menus are 3, 2 and 4 long, and one table over all three is 24
+entries. The reductions bring that to 23, so on menus this short they barely matter.
+
+**On real menus.** The same graph, with each symbol replaced by a split of the default
+Granite 3.3 8B decode capture: `split_a` is `buf6`'s d1 split (21 divisions, 6 values),
+`split_b` is `buf13`'s d0 split (11 divisions, 6 values) and `split_c` is `buf7`'s d1
+split (20 divisions, 6 values). One table over the three divisions is 21 * 11 * 20 =
+4620 entries. The reductions, turned on one at a time in the order of the first table, and
+each turned off alone with the others on:
+
+| Reduction | Entries, built up | Largest table | Entries without it |
+|---|---|---|---|
+| none: one table over the three divisions | 4620 | 4620 | |
+| the sum stays linear | 325 | 231 | 1857 |
+| lists on one index are added | 304 | 231 | 173 |
+| an affine list needs no table | 304 | 231 | 152 |
+| equal values share a rank | 141 | 36 | 315 |
+| the Max is read by rung | 153 | 36 | 141 |
+| values past the bound are clamped | 152 | 36 | 153 |
+
+- *The sum* keeps its four terms apart: two lists of 21 on `division_a`, the product's
+  231, and the Max. One table for the Max would still be 4620 entries, so it stays a
+  `lin_max` over its operand lists of 21, 11 and 20 (rule 3).
+- *Lists on one index*: the two terms on `division_a` become one list of 21.
+- *Affine lists*: this graph has none. Any list of two values is affine, so a residency
+  literal times a constant never needs a table. A quarter of the terms read no division,
+  only residency literals (Estimates).
+- *Ranks* take the product from 21 * 11 = 231 entries to 6 * 6 = 36, plus the two remaps
+  of 21 and 11. A division menu is longer than the values one split takes.
+- *Rungs* cost 12 entries here: the rung form is 64 entries against a 52-entry
+  `lin_max`. Rule 3 keeps the table, because 52 is not under half of 64. This is the one
+  step where the walk does not take the fewest entries.
+- *Clamping* drops one value from the ladder: `split_a / 2` at split 1 is 0.5, below 1,
+  the smallest value the Max can return.
+
+Every row was run through CP-SAT at all 4620 assignments: one solution per assignment,
+minimizing and maximizing agree at each, and the worst error stays within the collapse
+bound.
+
+Two more reductions are not in this graph. A fold (rule 2) reads a product of Min/Max
+factors over shared inputs by the tuples of rungs that can occur together. A switch
+(rule 4) leaves a factor too wide to pair out of every table. On the model blocks one
+table over the widest term alone would hold 3.6e4 to 7.5e18 entries, and #6315's lowering
+of the whole objective holds 396 to 21998 (Estimates). The last PR reports entries per
+capture with each reduction.
+
+Two subsections below add what the graph does not show: a buffer with several symbols on
+one division, and one table over several integer variables. Every table in this section
+was run through CP-SAT at every assignment of its inputs, and each came back within half a
+unit of the float value.
 
 ### What a position is: a buffer's menu
 
@@ -306,62 +345,6 @@ Equal values can share a position. The list above is `[8, 4, 4, 1]`, its distinc
 are `[1, 4, 8]`, and `rank_of = [2, 1, 1, 0]` gives each division its rank:
 `rank == rank_of[division_a]`. A product pairs ranks, so repeated values do not widen its
 table.
-
-### Two inputs: `f(x)**2 + g(y)**0.5`
-
-`x` is `split_a` with menu `[1, 2, 4]`, chosen by `division_a`. `y` is `split_b` with
-menu `[1, 3]`, chosen by `division_b`. Take `f(x) = 3/x` and `g(y) = y`. Each term reads
-one input, so each is its own table on its own index, and no table spans both.
-
-```mermaid
-flowchart LR
-    subgraph NP["numpy, before the solve"]
-        FX["f(x)**2 at x = 1, 2, 4<br/>9, 2.25, 0.5625"] --> TF["table_f<br/>9216, 2304, 576"]
-        GY["g(y)**0.5 at y = 1, 3<br/>1, 1.7321"] --> TG["table_g<br/>1024, 1774"]
-    end
-    subgraph CP["CP-SAT"]
-        DA["division_a in 0..2"] -- index --> EF["cost_f == table_f[division_a]"]
-        DB["division_b in 0..1"] -- index --> EG["cost_g == table_g[division_b]"]
-        EF --> OBJ["minimize cost_f + cost_g"]
-        EG --> OBJ
-    end
-    TF -- entries --> EF
-    TG -- entries --> EG
-```
-
-| `division_a` | `x` | `f(x)**2` | entry |
-|---|---|---|---|
-| 0 | 1 | 9 | 9216 |
-| 1 | 2 | 2.25 | 2304 |
-| 2 | 4 | 0.5625 | 576 |
-
-| `division_b` | `y` | `g(y)**0.5` | entry |
-|---|---|---|---|
-| 0 | 1 | 1 | 1024 |
-| 1 | 3 | 1.7321 | 1774 |
-
-At `division_a = 1`, `division_b = 1` the objective is 2304 + 1774 = 4078, and the float
-value is 4077.62. Two variables and two constraints are added to the model. The square
-and the root never reach CP-SAT.
-
-### One input: the terms share a table
-
-`f(x)**2 + g(x)**0.5`, both on `split_a`. The two float lists are added before the
-rounding, so there is one table, one rounding and one constraint,
-`cost == table[division_a]`:
-
-| `division_a` | `x` | `f(x)**2` | `g(x)**0.5` | sum | entry |
-|---|---|---|---|---|---|
-| 0 | 1 | 9 | 1 | 10 | 10240 |
-| 1 | 2 | 2.25 | 1.4142 | 3.6642 | 3752 |
-| 2 | 4 | 0.5625 | 2 | 2.5625 | 2624 |
-
-The order of the collapse matters. At `split_a = 2`:
-
-- `7 * split_a ** 0.5` is 10137, the rounding of 7 * 1448.15. Rounding first and
-  multiplying after gives 7 * 1448 = 10136.
-- `split_a ** 0.5 + split_a ** 0.7` is one entry, 3112, the rounding of
-  1448.15 + 1663.49. Collapsing each list alone gives 1448 + 1663 = 3111.
 
 ### Several variables: offsets and strides
 
@@ -402,63 +385,6 @@ numpy fills the table in the same order, last variable fastest:
 
 The table has 4 * 2 * 3 = 24 entries. The sizes multiply, so this form is only for a term
 whose variables fit the cap together.
-
-### A product across two inputs
-
-`f(x)**2 * g(y)**0.5` cannot be two tables: its value depends on both inputs at once. Its
-list is the outer product of the two lists, and its index is the pair of their positions.
-
-```mermaid
-flowchart LR
-    DA["division_a in 0..2"] -- "times 2" --> P["pair == 2*division_a + division_b<br/>0..5"]
-    DB["division_b in 0..1"] -- "times 1" --> P
-    P --> EL["cost == table[pair]"]
-    T["outer product, collapsed<br/>9216, 15963, 2304, 3991, 576, 998"] -- entries --> EL
-```
-
-| `division_a` | `division_b` | pair | float | entry |
-|---|---|---|---|---|
-| 0 | 0 | 0 | 9 | 9216 |
-| 0 | 1 | 1 | 15.5885 | 15963 |
-| 1 | 0 | 2 | 2.25 | 2304 |
-| 1 | 1 | 3 | 3.8971 | 3991 |
-| 2 | 0 | 4 | 0.5625 | 576 |
-| 2 | 1 | 5 | 0.9743 | 998 |
-
-### A term with structure: positions below, the value on top
-
-`Max(split_a / 2, split_b ** 0.5)`. One table over both inputs would also do here. With
-more operands and longer menus it would not, and the Max is read by rung instead.
-
-```mermaid
-flowchart LR
-    subgraph NP["numpy, before the solve"]
-        LA["split_a / 2<br/>0.5, 1, 2"] --> RA["rungs_a<br/>0, 0, 2"]
-        LB["split_b ** 0.5<br/>1, 1.7321"] --> RB["rungs_b<br/>0, 1"]
-        LAD["ladder, float<br/>1, 1.7321, 2"] --> TAB["table<br/>1024, 1774, 2048"]
-    end
-    subgraph CP["CP-SAT: positions only, until the last lookup"]
-        DA["division_a"] --> EA["rung_a == rungs_a[division_a]"]
-        DB["division_b"] --> EB["rung_b == rungs_b[division_b]"]
-        EA --> MX["rank == max(rung_a, rung_b)"]
-        EB --> MX
-        MX --> EC["cost == table[rank]"]
-    end
-    RA -. entries .-> EA
-    RB -. entries .-> EB
-    TAB -. entries .-> EC
-```
-
-- The operand lists are `[0.5, 1, 2]` and `[1, 1.7321]`. A Max is never under the largest
-  operand minimum, 1, so 0.5 is clamped to 1.
-- The ladder is the values the Max can return, ascending: `[1, 1.7321, 2]`.
-- Each operand's list becomes its rungs on the ladder, `[0, 0, 2]` and `[0, 1]`. These
-  are positions, not costs.
-- CP-SAT looks up each rung, takes their max, and only then reads a cost.
-
-At `division_a = 1`, `division_b = 1` the rungs are 0 and 1, the rank is 1, and the cost
-is 1774, which is Max(1, 1.7321) times 1024. Below the last lookup CP-SAT holds positions
-only. The float ladder is collapsed once, at the top.
 
 ### Which form a node takes
 
@@ -512,8 +438,8 @@ flowchart LR
     P --> C
 ```
 
-- The Max is read by rung, as above: the ladder is `[1, 1.7321, 2]`, `rungs_a` is
-  `[0, 0, 2]` and `rungs_b` is `[0, 1]`.
+- The Max is read by rung, as in step 4 of the process: 0.5 is clamped to 1, the ladder
+  is `[1, 1.7321, 2]`, `rungs_a` is `[0, 0, 2]` and `rungs_b` is `[0, 1]`.
 - The factor `1 + 1 / split_c` is `[2, 1.5, 1.5, 1.25]`. Its distinct values are
   `[1.25, 1.5, 2]` and `rank_of_c` is `[2, 1, 1, 0]`.
 - The final table is the outer product of the ladder and the distinct values, collapsed:
@@ -835,8 +761,9 @@ candidates on a node for its reader to choose, since nothing is in the model yet
 plan starts with the rule at the node, and the last PR reports entries per capture.
 
 **Checked.** A sketch of this walk was run on 15 expressions: the graph of "The process,
-step by step", the sums, the product, the Max and the roll-up of the sections above, a buffer with three symbols, a Piecewise over
-two buffers, a shared subexpression, and a sum and a Max too wide for one table. It has
+step by step" and the roll-up, smaller sums, a product and a Max, a buffer with three
+symbols, a Piecewise over two buffers, a shared subexpression, and a sum and a Max too
+wide for one table. It has
 no fold and no switch. Each is exact as Stages defines it, each model has one solution
 per assignment of its inputs, and the tables printed above come back, the roll-up's in
 sympy's order. On the roll-up the worst error is 0.43 units. A node shared by two terms
@@ -1127,7 +1054,8 @@ After Stage 8, posted on that PR:
    different plan at that cost is a tie.
 2. **Size and time, reported.** Entries, largest table, lowering time and solve time per
    capture, beside the table in Estimates, for combine and compact and for the table
-   constraint. A capture with more entries or a slower solve than #6315 is explained in
+   constraint. Entries also with each reduction of "How the tables are kept small" turned
+   off alone. A capture with more entries or a slower solve than #6315 is explained in
    the PR.
 3. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`:
    `test_scratchpad_solver.py`, `test_scratchpad_use.py`, `test_cost_model_replication.py`
