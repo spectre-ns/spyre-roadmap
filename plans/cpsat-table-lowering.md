@@ -1071,6 +1071,17 @@ class CpEmitter:
         is one literal per factor value."""
 
 
+def inputs_from_maps(
+    sym_map: Mapping[str, Any], buffer_map: Mapping[str, Any], *, cap: int
+) -> Inputs:
+    """Each symbol of the printer's two maps as its column on its input: a buffer's
+    symbol over its division's menu, on Input; a literal [0, 1] on itself; another
+    integer variable its domain's values, on Input with its offset, or on Locate when
+    the domain has gaps. A domain past cap is no input. Reads the variables the maps
+    hold and adds nothing to a model. Raises TableLoweringError for two menu lengths
+    on one division."""
+
+
 def lower_cost_with_tables(
     model: cp_model.CpModel,
     sym_map: Mapping[str, Any],
@@ -1083,7 +1094,7 @@ def lower_cost_with_tables(
     """cost_expr as a CP-SAT objective in COST_SCALE units, from tables and linear
     forms; an int when the objective is constant.
 
-    Copies model, maps the inputs from the two maps, plans cost_expr with
+    Copies model, maps the inputs with inputs_from_maps, plans cost_expr with
     TableLowering and builds the plan with emitter(model). When any of that fails, the
     copy is swapped back, so model is as it was, and TableLoweringError is raised: from
     the original exception when that was of another type."""
@@ -1110,8 +1121,8 @@ numpy side and its CP-SAT side take the same arguments, and `CpIndex.positions` 
 its sympy node as `expr`, injected by the rewrite and only read, and its `visit_op`
 lowers it, dispatching on `expr`'s class. The order of the two passes, the `CpNode`
 classes and `tabulate` are the design, and the other names may change. `sym_map` and
-`buffer_map` are the printer's two maps, and the entry point maps them to `Inputs`: each
-symbol's column on its input ("How a table maps onto CP-SAT"). The sketch and the two
+`buffer_map` are the printer's two maps, and `inputs_from_maps` maps them to `Inputs`:
+each symbol's column on its input ("How a table maps onto CP-SAT"). The sketch and the
 examples below pass mypy 1.13 and 2.1.0, the version the repo pins, with torch-spyre's
 settings (`pyproject.toml:131`) and `empty-body` disabled: every docstring-only body
 trips that check, and nothing else is reported.
@@ -1137,15 +1148,68 @@ objective = lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=81
 model.minimize(objective)
 ```
 
-Inside, `lower` builds the objects below. Here they are built by hand for the graph of
-"The process, step by step", with the values of its tables. `div_a`, `div_b` and `div_c`
-are the three buffers' division variables, already in `model`:
+The entry point is where the three layers meet: `inputs_from_maps` gives the values,
+`TableLowering` the plan, and the emitter the model, with the copy around all three. Its
+body is all of it:
 
 ```python
-# positions: IndexMap steps over the inputs; each size comes from its parts
+def lower_cost_with_tables(
+    model: cp_model.CpModel,
+    sym_map: Mapping[str, Any],
+    buffer_map: Mapping[str, Any],
+    cost_expr: sympy.Basic,
+    *,
+    cap: int,
+    emitter: type[CpEmitter] = CpEmitter,
+) -> CpExpr:
+    copy = model.clone()
+    try:
+        inputs = inputs_from_maps(sym_map, buffer_map, cap=cap)  # values, no model
+        plan = TableLowering(inputs, cap=cap).lower(cost_expr)   # the walk, no model
+        return emitter(model).linear(plan)                       # the only CP-SAT calls
+    except Exception as exc:
+        model.proto.copy_from(copy.proto)                        # the swap back
+        model.rebuild_constant_map()
+        if isinstance(exc, TableLoweringError):
+            raise
+        raise TableLoweringError(None, f"{type(exc).__name__}: {exc}") from exc
+```
+
+On the graph of "The process, step by step", the same three steps by hand. `div_a`,
+`div_b` and `div_c` are the three buffers' division variables, already in `model`, and
+the inputs are what `inputs_from_maps` makes of them:
+
+```python
+split_a, split_b, split_c = sympy.symbols("split_a split_b split_c", positive=True)
+root = (
+    7 * split_a ** 0.5 + split_a ** 0.7 + 9 * split_a ** -2 * split_b ** 0.5
+    + sympy.Max(split_a / 2, split_b ** 0.5, split_c ** 0.25)
+)
+
+# inputs: each symbol's column, on its division's position
 division_a = CpIndex(Input(div_a, size=3))
 division_b = CpIndex(Input(div_b, size=2))
 division_c = CpIndex(Input(div_c, size=4))
+inputs = {
+    split_a: CpTable(values=np.array([1.0, 2.0, 4.0]), index=division_a),
+    split_b: CpTable(values=np.array([1.0, 3.0]), index=division_b),
+    split_c: CpTable(values=np.array([1.0, 2.0, 2.0, 4.0]), index=division_c),
+}
+
+# the walk: both passes over root, in numpy, with no model
+plan = TableLowering(inputs, cap=8192).lower(root)
+# plan.lists: one list on division_a, the product's on a pair, the Max's on a rank
+# plan.entries == 23: the three lists, 14 entries, and the three rung remaps, 9
+
+# the build: the one rounding, and the only CP-SAT calls
+objective = CpEmitter(model).linear(plan)
+```
+
+Inside `lower`, pass 2 makes the plan's positions and lists from the inputs. Here they
+are built by hand, the plan as `lower` returns it for `root`:
+
+```python
+# positions: IndexMap steps over the inputs; each size comes from its parts
 pair = CpIndex(Combine(), (division_a, division_b))      # 2*div_a + div_b, size 6
 rung_a = CpIndex(Compact((0, 0, 4), size=5), (division_a,))
 rung_b = CpIndex(Compact((0, 3), size=5), (division_b,))
@@ -1153,10 +1217,10 @@ rung_c = CpIndex(Compact((0, 1, 1, 2), size=5), (division_c,))
 rank = CpIndex(Extreme(is_max=True), (rung_a, rung_b, rung_c))
 
 # tables: a node's float values, made in numpy with their index
-split_a, split_b = np.array([1.0, 2.0, 4.0]), np.array([1.0, 3.0])
-a_half = CpTable(values=split_a ** 0.5, index=division_a)
-a_07 = CpTable(values=split_a ** 0.7, index=division_a)
-product = CpTable(values=np.outer(9 * split_a ** -2.0, split_b ** 0.5).ravel(), index=pair)
+a, b = inputs[split_a].values, inputs[split_b].values
+a_half = CpTable(values=a ** 0.5, index=division_a)
+a_07 = CpTable(values=a ** 0.7, index=division_a)
+product = CpTable(values=np.outer(9 * a ** -2.0, b ** 0.5).ravel(), index=pair)
 ladder = CpTable(values=np.array([1.0, 2 ** 0.25, 2 ** 0.5, 3 ** 0.5, 2.0]), index=rank)
 
 # the tables read linearly and merged, as the Add's visit_op does: float, not rounded
@@ -1166,30 +1230,30 @@ form = CpLinear(lists={
     rank: ladder.values,
 })
 # form.lists[division_a] is about [8.0, 11.524, 16.639], added in float
-
-# the one rounding, and the only CP-SAT calls
-objective = CpEmitter(model).linear(form)
+# form holds the lists of plan, on equal indexes
 ```
 
-`CpEmitter(model).linear(form)` rounds each list and reads it with one `add_element` on
+`TableLowering` makes these reads node by node. The root is a `CpLinearNode` holding the
+Add, and `as_linear` on each of its four children returns one of the reads above.
+`split_a ** 0.7` is a `CpNode`, its step `np.power`, read as its table. The other three
+are `CpLinearNode`s, each read as its table: `7 * split_a ** 0.5` on a tie, 3 entries
+either way, and the product and the Max because rule 3 prefers it. The Max's linear
+form, a `lin_max` over three operand lists of 3, 2 and 4 entries, would need 9 entries
+against the table's 14. 9 is not under half of 14, so margin 2 keeps the table. The
+Add's linear form then adds the two lists on `division_a` into one. The walk sketch of
+"Pass 1" (no fold, no switch) lowers `root` to these three lists on these three indexes,
+and rounds them to the three tables of "The process, step by step".
+
+`CpEmitter(model).linear(plan)` rounds each list and reads it with one `add_element` on
 the list's position: `[8192, 11801, 17038]` on `div_a`, the product's six entries on the
 pair, and the ladder's five on the rank. Each position is built once, when a list first
 reads it: `div_a`, the linear `2 * div_a + div_b`, three `add_element` rung lookups and
 one `add_max_equality`. The objective is the sum of the three targets, the model of the
-step-by-step table. With the bodies filled in as the docstrings say and run in ortools,
-it gives 17566 at `div_a = 1`, `div_b = 1`, `div_c = 3` and is within 1.16 units of the
-float value at all 24 assignments, the figures of that section; `form.entries` is 23,
-and `pair.positions` and `rank.positions` equal the CP-SAT positions at every
-assignment.
-
-Through the nodes, the same objective is
-`CpEmitter(model).linear(TableLowering(inputs, cap=8192).lower(root))`. The root is a
-`CpLinearNode` holding the Add, and `as_linear` on each of its four children returns the
-reads above. `split_a ** 0.7` is a `CpNode`, its step `np.power`, read as its table. The
-other three are `CpLinearNode`s, each read as its table: `7 * split_a ** 0.5` on a tie,
-3 entries either way, and the product and the Max because rule 3 prefers it. The Max's
-linear form, a `lin_max` over three operand lists of 3, 2 and 4 entries, would need 9
-entries against the table's 14. 9 is not under half of 14, so margin 2 keeps the table.
+step-by-step table. With the bodies of the values and the emitter filled in as the
+docstrings say and run in ortools, `form` gives 17566 at `div_a = 1`, `div_b = 1`,
+`div_c = 3` and is within 1.16 units of the float value at all 24 assignments, the
+figures of that section; `form.entries` is 23, and `pair.positions` and
+`rank.positions` equal the CP-SAT positions at every assignment.
 
 - **One `CpNode` per sympy node, in the same graph.** Pass 2 makes a node's `CpNode` from
   its children's, which it made earlier: a `CpLinearNode` for an Add, Mul, Max, Min or
@@ -1454,7 +1518,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 |---|---|
 | 1 | `numpy_value`, and its one-node step, which `visit_op` finds for each operation |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, `CpLinearNode`, `lower`'s normalization, list, pass 1 and rewrite, `CpEmitter` and the steps `Input`, `Locate`, `Unit`, `Combine` and `Compact`, the entry point with its copy and swap back, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
+| 3 | `CpNode`, `CpLinearNode`, `lower`'s normalization, list, pass 1 and rewrite, `CpEmitter` and the steps `Input`, `Locate`, `Unit`, `Combine` and `Compact`, `inputs_from_maps`, the entry point with its copy and swap back, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
 | 4 | the table from a node's parts: rank and pair, a Max's or Min's table by rung with `Extreme`, the choice by entries, and `AllowedEmitter` |
 | 5 | a Mul's table by fold |
 | 6 | the linear form of a Max or Min, and of a constant times one child in a Mul |
@@ -1578,10 +1642,10 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
   table. An Add and a `RelayoutCharge` get their linear forms.
 - Positions are made by `IndexMap` steps: `Input`, `Locate`, `Unit`, `Combine` and
   `Compact` here, `Extreme` in Stage 4. A `CpIndex` computes its size from its parts.
-- Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
-  their index. Any other variable is indexed by its domain: `Input` with its offset, or
-  `Locate`, a position lookup, when the domain has gaps. A domain past the cap is not an
-  input. Mapping the inputs adds nothing to the model: a `Locate`'s lookup is built by
+- `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
+  share its division as their index. Any other variable is indexed by its domain:
+  `Input` with its offset, or `Locate`, a position lookup, when the domain has gaps. A
+  domain past the cap is not an input. Mapping the inputs adds nothing to the model: a `Locate`'s lookup is built by
   the emitter, when a list reads it.
 - A node whose inputs fit the cap is one table over them, read through a joint index in
   the order `values_on_grid` uses.
