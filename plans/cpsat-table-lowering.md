@@ -671,12 +671,26 @@ class CpTable:
 
 @dataclass
 class CpLinear:
-    """A node read linearly, float until cp_expr collapses it."""
+    """A node read linearly: the float form that cp_expr collapses into a CP-SAT
+    LinearExpr. Nothing in it is rounded until then."""
 
     constant: float = 0.0
     lists: dict[CpIndex, np.ndarray] = field(default_factory=dict)   # one list per index
     extrema: list[tuple[bool, list[CpLinear]]] = field(default_factory=list)  # is_min, operands
     switched: list[tuple[CpTable, CpLinear]] = field(default_factory=list)    # rule 4
+
+    def __add__(self, other: CpLinear) -> CpLinear:
+        """The sum, still in float: constants added, lists on one index added
+        elementwise into one list, extrema and switches kept side by side. So
+        split ** 0.5 + split ** 0.7 is one list, rounded once to 3112 at split 2,
+        where rounding each first would give 1448 + 1663 = 3111."""
+
+    def __mul__(self, coeff: float) -> CpLinear:
+        """Every list, the constant and every operand scaled in float before any
+        rounding, so 7 * split ** 0.5 at split 2 is 10137, not 7 * 1448. A negative
+        coeff turns each lin_min into a lin_max and back."""
+
+    __rmul__ = __mul__
 
     @property
     def entries(self) -> int:
@@ -684,8 +698,9 @@ class CpLinear:
 
     def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
         """The form as a CP-SAT expression, made in model on the first call and
-        memoized. Each list is collapsed once onto COST_SCALE and read with one element
-        lookup on its index's cp_expr: a number when the list is constant, a linear
+        memoized. The one rounding: each list is collapsed once onto COST_SCALE and read
+        with one element lookup on its index's cp_expr, so a sum of T lists and a
+        constant is within (T + 1) / 2 units of its float value: a number when the list is constant, a linear
         expression when it is affine. Each lin_min or lin_max is over operands behind
         proxy variables, and each switch is one literal per factor value."""
 
