@@ -653,9 +653,10 @@ class CpIndex:
         element lookup, or a min or max of rungs. Its parts are made first."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CpTable:
-    """A node read as a table: values[index], made together and never apart."""
+    """A node read as a table: values[index], made together and never apart. Compared by
+    identity, values being an array."""
 
     values: np.ndarray                # the value at each position, float until collapsed
     index: CpIndex
@@ -667,6 +668,13 @@ class CpTable:
     def entries(self) -> int:
         """Its list plus the remaps under its index: what rule 3 compares, and what the
         cap bounds."""
+
+    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
+        """values[index] as a CP-SAT expression, made in model on the first call and
+        memoized: the list rounded once onto COST_SCALE, then a number when it is
+        constant, a linear expression in index.cp_expr(model) when it is affine, and
+        otherwise one add_element on index.cp_expr(model) into a new variable whose
+        domain is the rounded values."""
 
 
 @dataclass
@@ -698,11 +706,11 @@ class CpLinear:
 
     def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
         """The form as a CP-SAT expression, made in model on the first call and
-        memoized. The one rounding: each list is collapsed once onto COST_SCALE and read
-        with one element lookup on its index's cp_expr, so a sum of T lists and a
-        constant is within (T + 1) / 2 units of its float value: a number when the list is constant, a linear
-        expression when it is affine. Each lin_min or lin_max is over operands behind
-        proxy variables, and each switch is one literal per factor value."""
+        memoized. Each list, already summed per index, becomes
+        CpTable(values, index).cp_expr(model): the one rounding, so a sum of T lists and
+        a constant is within (T + 1) / 2 units of its float value. Each lin_min or
+        lin_max is over operands behind proxy variables, and each switch is one literal
+        per factor value."""
 
 
 @dataclass(eq=False)
