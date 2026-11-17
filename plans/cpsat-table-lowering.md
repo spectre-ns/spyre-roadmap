@@ -715,21 +715,20 @@ class CpNode:
 class TableLowering:
     """One cost expression, lowered to tables and linear forms, then to CP-SAT."""
 
-    def __init__(self, inputs: Inputs, cap: int) -> None:
-        """inputs maps each symbol to its input and column; cap bounds one table."""
+    def __init__(self, model: cp_model.CpModel, inputs: Inputs, cap: int) -> None:
+        """model receives the objective's variables; inputs maps each symbol to its
+        input and column; cap bounds one table."""
 
-    def lower(self, root: sympy.Basic) -> CpNode:
-        """Run both passes and return the root's CpNode.
+    def lower(self, root: sympy.Basic) -> cp_model.LinearExprT:
+        """root as a CP-SAT objective in COST_SCALE units.
 
         Pass 1 iterates preorder_traversal and sets linear_ok, repeats kept. Pass 2
         iterates postorder_traversal and gives each node, once, its candidate table and
-        linear form, reading its children with as_table and as_linear. Writes nothing
-        to a model. Raises TableLoweringError at the first node left with neither.
+        linear form, reading its children with as_table and as_linear. Only then does
+        it return the root's as_linear().cp_expr(model), which makes just the variables
+        that form requests. Every refusal raises TableLoweringError during the passes,
+        before any variable is made, so the model is untouched when it raises.
         """
-
-    def build_model(self, model: cp_model.CpModel, root: CpNode) -> cp_model.LinearExprT:
-        """root.as_linear().cp_expr(model): only the variables that form requests
-        are made."""
 
 
 def lower_cost_with_tables(
@@ -896,8 +895,8 @@ This is the table of "Which form a node takes", read from the leaves up.
 
 ### From the walk to the model
 
-The walk ends with the root's `CpNode`. `build_model` is the only code that calls
-CP-SAT, and it makes a variable only when a form requests it:
+The walk ends with the root's `CpNode`. The last step of `lower` is the only code that
+calls CP-SAT, and it makes a variable only when a form requests it:
 
 1. **Request.** `root.as_linear().cp_expr(model)`. Each form pulls in what it reads,
    and nothing else reaches the model: a table used only to compute a parent's table in
@@ -981,7 +980,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 |---|---|
 | 1 | `numpy_value`, and its one-node step that `tabulate` applies to lists |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, pass 1, pass 2, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the pass that builds the model, and `tabulate` for a leaf, for one index and for one table over the inputs |
+| 3 | `CpNode`, pass 1, pass 2, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the `cp_expr` methods that make the model's variables, and `tabulate` for a leaf, for one index and for one table over the inputs |
 | 4 | `tabulate` from a node's parts: by rung, rank and pair, and the choice by entries |
 | 5 | `tabulate` from a node's parts: the fold |
 | 6 | the linear form of `visit_Min` and `visit_Max`, and a constant times one child in `visit_Mul` |
@@ -1099,7 +1098,7 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 ### Stage 3: inputs, indexes, tables, linear sums
 
 - The two passes of Architecture arrive: `CpNode`, pass 1, pass 2, `generic_visit`,
-  `visit_Add`, `visit_RelayoutCharge` and the pass that builds the model. `tabulate`
+  `visit_Add`, `visit_RelayoutCharge` and the `cp_expr` methods. `tabulate`
   realizes a leaf, a node whose children share an index, and a node whose inputs fit one
   table.
 - Positions are made by two moves only, combine and compact, behind one helper.
