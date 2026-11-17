@@ -805,6 +805,11 @@ class CpLinear:
     extrema: list[tuple[bool, list[CpLinear]]] = field(default_factory=list)  # is_min, operands
     switched: list[tuple[CpTable, CpLinear]] = field(default_factory=list)    # rule 4
 
+    @classmethod
+    def of(cls, table: CpTable) -> CpLinear:
+        """A table read linearly: CpLinear(lists={table.index: table.values}), or
+        CpLinear(constant=v) when the table is one value v on the Unit position."""
+
     def __add__(self, other: CpLinear) -> CpLinear:
         """The sum, still in float: constants added, lists on one index added
         elementwise into one list, extrema and switches kept side by side. So
@@ -863,9 +868,7 @@ class CpNode:
         """The node read as a table. Raises TableLoweringError when it has none."""
 
     def as_linear(self) -> CpLinear:
-        """The node read linearly: its table as one list,
-        CpLinear(lists={table.index: table.values}), or its constant when expr is a
-        number."""
+        """The node read linearly: CpLinear.of(self.as_table())."""
 
 
 @dataclass(eq=False)
@@ -978,10 +981,8 @@ product = CpTable(np.outer(9 * split_a ** -2.0, split_b ** 0.5).ravel(), pair)
 ladder = CpTable(np.array([1.0, 2 ** 0.25, 2 ** 0.5, 3 ** 0.5, 2.0]), rank)  # the Max
 
 # reading tables linearly: CpLinear arithmetic, in float, nothing rounded yet
-def read(t: CpTable) -> CpLinear:
-    return CpLinear(lists={t.index: t.values})
-
-form = 7 * read(a_half) + read(a_07) + read(product) + read(ladder)
+form = (7 * CpLinear.of(a_half) + CpLinear.of(a_07)
+        + CpLinear.of(product) + CpLinear.of(ladder))
 # form.lists[division_a] is about [8.0, 11.524, 16.639]: two terms, one list
 
 # the one rounding, and the only CP-SAT calls
