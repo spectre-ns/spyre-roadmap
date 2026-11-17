@@ -119,42 +119,193 @@ Before the solve starts, numpy computes every cost value in floating point. CP-S
 evaluates the expression. It works out which entry of each table applies, and one
 `add_element` constraint per linear term reads that entry.
 
-```mermaid
-flowchart LR
-    subgraph NP["Before the solve: numpy, float"]
-        E["cost expression<br/>a sum of terms"]
-        L["float list per term<br/>one value per position"]
-        C["collapse<br/>multiply, add, round once"]
-        T["integer table"]
-        E --> L --> C --> T
-    end
-    subgraph CP["In the model: CP-SAT, integer"]
-        D["decision variables<br/>divisions, literals, integers"]
-        I["index<br/>offsets and strides, linear"]
-        EL["element<br/>cost == table[index]"]
-        O["objective<br/>sum of the cost variables"]
-        D --> I --> EL --> O
-    end
-    T -- entries --> EL
+### The expression graph
+
+The cost is an expression graph: a sum at the root, operations inside, and symbols and
+numbers at the leaves. The example for this section has four terms over three buffers:
+
+```
+7 * split_a ** 0.5  +  split_a ** 0.7  +  9 * split_a ** -2 * split_b ** 0.5
+    +  Max(split_a / 2, split_b ** 0.5, split_c ** 0.25)
 ```
 
-For each term of the objective:
+```mermaid
+flowchart TD
+    SUM["sum"]
+    M7["7 * split_a ** 0.5"]
+    P7["split_a ** 0.7"]
+    PROD["product, times 9"]
+    MAX["Max"]
+    P5["split_a ** 0.5"]
+    PM2["split_a ** -2"]
+    PB["split_b ** 0.5"]
+    HA["split_a / 2"]
+    PC["split_c ** 0.25"]
+    A(["split_a"])
+    B(["split_b"])
+    C(["split_c"])
+    SUM --> M7
+    SUM --> P7
+    SUM --> PROD
+    SUM --> MAX
+    M7 --> P5
+    P5 --> A
+    P7 --> A
+    PROD --> PM2
+    PROD --> PB
+    PM2 --> A
+    MAX --> HA
+    MAX --> PB
+    MAX --> PC
+    HA --> A
+    PB --> B
+    PC --> C
+```
 
-1. **Find what it reads.** Each symbol belongs to one CP-SAT variable: a buffer's split
-   and tile symbols to that buffer's division, a residency symbol to its literal, any
-   other symbol to its integer variable.
-2. **Tabulate.** numpy evaluates the term at every assignment of those variables. The
-   result is a float list with one value per position. Squares, roots, logs and
-   divisions all happen here.
-3. **Index.** Each variable gives a position, and the positions combine into one index
-   through constant offsets and strides. The index is a linear expression.
-4. **Collapse.** The float list is multiplied by what stands above it, added to the other
-   lists on its index, and rounded once onto `COST_SCALE`. That is the integer table.
-5. **Look up.** `add_element(index, table, cost)` makes `cost == table[index]`. The
-   objective is the sum of the cost variables.
+- **Leaves.** Each symbol belongs to one decision variable. `split_a` has the menu
+  `[1, 2, 4]`, and `division_a` picks from it. `split_b` has `[1, 3]` under
+  `division_b`, and `split_c` has `[1, 2, 2, 4]` under `division_c`. Numbers are drawn
+  inside the node that uses them.
+- **Inner nodes.** Seven nodes read one buffer, the product reads two, and the Max reads
+  three.
+- **Sharing.** It is a graph, not a tree. `split_a` is read by four nodes and
+  `split_b ** 0.5` by two. A shared node is handled once.
 
-Every table in this section was run through CP-SAT at every assignment of its inputs, and
-each came back within half a unit of the float value.
+### From the leaves to the root
+
+The lowering goes over the graph from the leaves to the root, in the order Architecture
+gives. Below the sum, every node becomes a float list: its value at each position of an
+index. Once a node has its list, the nodes under it are not needed again, because their
+values are inside it. At the sum, what is left of each term is collapsed into an integer
+table.
+
+1. **A leaf becomes a column.** `split_a` is the list `[1, 2, 4]` and its index is
+   `division_a`: position `d` holds the split at candidate division `d`. `split_b` and
+   `split_c` are the same over their own divisions. A residency symbol is `[0, 1]` on
+   its literal, and any other integer symbol is its domain's values on its own variable.
+2. **A node over one buffer stays on that buffer.** numpy applies the node to its
+   child's list, entry by entry. `split_a ** 0.5` is `[1, 1.4142, 2]`, and 7 times it is
+   `[7, 9.8995, 14]`, both still on `division_a`. Powers, roots, logs and divisions all
+   happen here.
+3. **The product joins two indexes.** Its children are on `division_a` and
+   `division_b`. Its list is their outer product times 9, 3 * 2 = 6 values. Its index is
+   the pair of their positions, `pair == 2*division_a + division_b`, which costs one
+   linear equality and no lookup.
+4. **The Max is read by rung.** Its operands are on three buffers, and one table over
+   them would hold 3 * 2 * 4 = 24 entries. The Max gets a ladder instead: the five
+   values it can return, ascending. Each operand's list becomes its rungs on the ladder.
+   `split_a / 2` is `[0.5, 1, 2]`. The Max is never under 1, the largest operand
+   minimum, so 0.5 counts as 1 and the rungs are `[0, 0, 4]`. CP-SAT looks up the three
+   rungs, and `rank` is their max.
+5. **The sum stays a sum, and its lists are collapsed.** A sum is linear, so it needs no
+   list of its own. One list over all three buffers would again hold 24 entries here,
+   and the product of every menu on a real objective. Its four terms are lists on three
+   indexes. The two on `division_a` are added in float. Each of the three lists is then
+   multiplied by `COST_SCALE`, rounded once, and read by one `add_element`. The
+   objective is the sum of the three cost variables.
+
+How each node is collapsed:
+
+| Node | Step | Its float list | Its index | It adds to the model |
+|---|---|---|---|---|
+| `split_a` | 1 | 1, 2, 4 | `division_a` | nothing |
+| `split_b` | 1 | 1, 3 | `division_b` | nothing |
+| `split_c` | 1 | 1, 2, 2, 4 | `division_c` | nothing |
+| `split_a ** 0.5` | 2 | 1, 1.4142, 2 | `division_a` | nothing |
+| `7 * split_a ** 0.5` | 2 | 7, 9.8995, 14 | `division_a` | nothing |
+| `split_a ** 0.7` | 2 | 1, 1.6245, 2.639 | `division_a` | nothing |
+| `split_a ** -2` | 2 | 1, 0.25, 0.0625 | `division_a` | nothing |
+| `split_a / 2` | 2 | 0.5, 1, 2 | `division_a` | nothing |
+| `split_b ** 0.5` | 2 | 1, 1.7321 | `division_b` | nothing |
+| `split_c ** 0.25` | 2 | 1, 1.1892, 1.1892, 1.4142 | `division_c` | nothing |
+| the product | 3 | 9, 15.5885, 2.25, 3.8971, 0.5625, 0.9743 | `pair` | `pair == 2*division_a + division_b` |
+| the Max | 4 | the ladder: 1, 1.1892, 1.4142, 1.7321, 2 | `rank` | three rung lookups, 3 + 2 + 4 entries, and `rank == max(rung_a, rung_b, rung_c)` |
+| the sum | 5 | none: it stays linear | | three tables, 3 + 6 + 5 entries, and three lookups |
+
+Every node below the sum ends inside one of three lists, and the collapse makes each of
+them one integer table. These are the only tables that hold a cost:
+
+| Table | Index | The list, in float | Entries |
+|---|---|---|---|
+| `table_1` | `division_a` | 8, 11.524, 16.639: the two terms on `split_a`, added | 8192, 11801, 17038 |
+| `table_2` | `pair` | the product's list | 9216, 15963, 2304, 3991, 576, 998 |
+| `table_3` | `rank` | the ladder | 1024, 1218, 1448, 1774, 2048 |
+
+The rung tables hold positions, not costs: `rungs_a = [0, 0, 4]`, `rungs_b = [0, 3]` and
+`rungs_c = [0, 1, 1, 2]`.
+
+```mermaid
+flowchart LR
+    subgraph IN["decision variables"]
+        DA["division_a in 0..2"]
+        DB["division_b in 0..1"]
+        DC["division_c in 0..3"]
+    end
+    subgraph POS["positions: fixed by the inputs"]
+        P["pair == 2*division_a + division_b"]
+        RA["rung_a == rungs_a[division_a]"]
+        RB["rung_b == rungs_b[division_b]"]
+        RC["rung_c == rungs_c[division_c]"]
+        RK["rank == max(rung_a, rung_b, rung_c)"]
+    end
+    subgraph LT["linear terms"]
+        C1["cost_1 == table_1[division_a]"]
+        C2["cost_2 == table_2[pair]"]
+        C3["cost_3 == table_3[rank]"]
+    end
+    OBJ["minimize cost_1 + cost_2 + cost_3"]
+    DA --> C1
+    DA --> P
+    DB --> P
+    P --> C2
+    DA --> RA
+    DB --> RB
+    DC --> RC
+    RA --> RK
+    RB --> RK
+    RC --> RK
+    RK --> C3
+    C1 --> OBJ
+    C2 --> OBJ
+    C3 --> OBJ
+```
+
+The graph had 13 nodes. The model gets six lookups with 23 entries, one linear equality
+and one max.
+
+At `division_a = 1`, `division_b = 1`, `division_c = 3`: `cost_1` is 11801. `pair` is 3
+and `cost_2` is 3991. The rungs are 0, 3 and 2, `rank` is 3 and `cost_3` is 1774. The
+objective is 17566, and the float value is 17564.84.
+
+The example was run through CP-SAT at all 24 assignments of the three divisions. The
+model has 24 solutions, minimizing and maximizing agree at each, and the worst error is
+1.16 units over the three tables.
+
+The subsections below take the steps one at a time on smaller examples: a leaf (step 1),
+terms over one buffer and their tables (steps 2 and 5), nodes over several variables
+(step 3) and a Max (step 4). Every table in this section was run through CP-SAT at every
+assignment of its inputs, and each came back within half a unit of the float value.
+
+### What a position is: a buffer's menu
+
+A buffer does not have one variable per split. It has a menu of candidate divisions, and
+one variable, its division, that picks a row. Each symbol of the buffer is a column:
+
+| `division_a` | `split_a_d0` | `split_a_d1` | `tile_a` | a term, `8 / (split_a_d0 * tile_a)` |
+|---|---|---|---|---|
+| 0 | 1 | 1 | 1 | 8 |
+| 1 | 2 | 1 | 1 | 4 |
+| 2 | 2 | 2 | 1 | 4 |
+| 3 | 4 | 1 | 2 | 1 |
+
+A term over any of the buffer's symbols is a list with one value per row. Its index is
+`division_a` itself, with no offset and no stride: position `d` holds the value at
+candidate division `d`.
+
+Equal values can share a position. The list above is `[8, 4, 4, 1]`, its distinct values
+are `[1, 4, 8]`, and `rank_of = [2, 1, 1, 0]` gives each division its rank:
+`rank == rank_of[division_a]`. A product pairs ranks, so repeated values do not widen its
+table.
 
 ### Two inputs: `f(x)**2 + g(y)**0.5`
 
@@ -211,27 +362,6 @@ The order of the collapse matters. At `split_a = 2`:
   multiplying after gives 7 * 1448 = 10136.
 - `split_a ** 0.5 + split_a ** 0.7` is one entry, 3112, the rounding of
   1448.15 + 1663.49. Collapsing each list alone gives 1448 + 1663 = 3111.
-
-### What a position is: a buffer's menu
-
-A buffer does not have one variable per split. It has a menu of candidate divisions, and
-one variable, its division, that picks a row. Each symbol of the buffer is a column:
-
-| `division_a` | `split_a_d0` | `split_a_d1` | `tile_a` | a term, `8 / (split_a_d0 * tile_a)` |
-|---|---|---|---|---|
-| 0 | 1 | 1 | 1 | 8 |
-| 1 | 2 | 1 | 1 | 4 |
-| 2 | 2 | 2 | 1 | 4 |
-| 3 | 4 | 1 | 2 | 1 |
-
-A term over any of the buffer's symbols is a list with one value per row. Its index is
-`division_a` itself, with no offset and no stride: position `d` holds the value at
-candidate division `d`.
-
-Equal values can share a position. The list above is `[8, 4, 4, 1]`, its distinct values
-are `[1, 4, 8]`, and `rank_of = [2, 1, 1, 0]` gives each division its rank:
-`rank == rank_of[division_a]`. A product pairs ranks, so repeated values do not widen its
-table.
 
 ### Several variables: offsets and strides
 
@@ -704,8 +834,8 @@ against the 18 of the chain drawn in that section. The walk could instead keep b
 candidates on a node for its reader to choose, since nothing is in the model yet. The
 plan starts with the rule at the node, and the last PR reports entries per capture.
 
-**Checked.** A sketch of this walk was run on 14 expressions: the sums, the product, the
-Max and the roll-up of the sections above, a buffer with three symbols, a Piecewise over
+**Checked.** A sketch of this walk was run on 15 expressions: the graph of "The process,
+step by step", the sums, the product, the Max and the roll-up of the sections above, a buffer with three symbols, a Piecewise over
 two buffers, a shared subexpression, and a sum and a Max too wide for one table. It has
 no fold and no switch. Each is exact as Stages defines it, each model has one solution
 per assignment of its inputs, and the tables printed above come back, the roll-up's in
