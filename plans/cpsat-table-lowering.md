@@ -31,12 +31,13 @@ computed with numpy functions, and the code arrives in layers, each with its own
   moves, combine and compact, and the table constraint is measured against them.
 - **Two passes: parents first, then children first (2026-11-17).** A first pass visits
   every parent before its children and marks the nodes a linear reader can reach. The
-  visitor then visits each node after its arguments, and one function, `tabulate`,
-  realizes a node. Pass 1 iterates `sympy.preorder_traversal`, pass 2
-  `sympy.postorder_traversal`; nothing recurses. Each sympy node gets a `CpNode`, its
-  CP-SAT counterpart, which a parent reads as a table or linearly; no sympy node is
-  changed. Reads and CP-SAT variables are made when first requested and memoized. See
-  Architecture.
+  second makes each node's `CpNode` after its children's and realizes it. Pass 1
+  iterates `sympy.preorder_traversal`, pass 2 `sympy.postorder_traversal`; nothing
+  recurses. Each sympy node gets a `CpNode`, its CP-SAT counterpart, of the subclass
+  that holds its sympy class's lowering (`CpAdd`, `CpMul`, `CpMax`, `CpMin`,
+  `CpRelayoutCharge`, or `CpNode` itself), which a parent reads as a table or linearly;
+  no sympy node is changed. Reads and CP-SAT variables are made when first requested
+  and memoized. See Architecture.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
   #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
@@ -619,6 +620,7 @@ from typing import Any
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
+from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 
 class TableLoweringError(Exception):
@@ -813,9 +815,10 @@ class CpLinear:
 
 @dataclass(eq=False)
 class CpNode:
-    """The CP-SAT counterpart of one sympy node, which it never changes: a node with no
-    linear form of its own, such as a symbol, a number, Pow, log, floor, Piecewise, a
-    relational or a function.
+    """The CP-SAT counterpart of one sympy node, which it never changes. This base class
+    is a node with no linear form of its own: a symbol, a number, Pow, log, floor,
+    Piecewise, a relational or a function. Each sympy class with a lowering of its own
+    has a subclass below, chosen by node_class.
 
     The CpNodes form the same graph as the sympy nodes: children holds the CpNodes of
     the sympy node's children, made before it, and a subexpression shared by two
@@ -828,9 +831,20 @@ class CpNode:
     expr: sympy.Basic                 # the sympy node, read only
     children: tuple[CpNode, ...]      # its children's CpNodes, in children_of order
 
+    def realize(self, lowering: TableLowering) -> None:
+        """Pass 2 on this node, once, after its children: make its candidates. Here the
+        candidate table: one table over its inputs or parts_table, whichever has fewer
+        entries (rule 3), or none when neither fits the cap. Raises TableLoweringError
+        when the node ends with no candidate."""
+
+    def parts_table(self, lowering: TableLowering) -> CpTable | None:
+        """The table from its children's tables. On one shared index, the node's numpy
+        step elementwise, with no new position. Otherwise each child's table ranked to
+        its distinct values, the ranks combined, and the step applied across them."""
+
     def as_table(self) -> CpTable:
-        """The node read as a table, from pass 2's candidate. Raises TableLoweringError
-        when no table of it fits the cap."""
+        """The node read as a table: the candidate. Raises TableLoweringError when no
+        table of it fits the cap."""
 
     def as_linear(self) -> CpLinear:
         """The node read linearly: as_table() as one list,
@@ -838,11 +852,19 @@ class CpNode:
 
 
 @dataclass(eq=False)
-class CpLinearNode(CpNode):
-    """A node that can be linear in its children: Add, Mul, Min, Max or RelayoutCharge.
-    Pass 2 makes one for these classes, a CpNode for every other."""
+class CpLinearNode(CpNode, ABC):
+    """A node that can be linear in its children."""
 
     linear_ok: bool                   # pass 1: a linear reader can reach it
+
+    def realize(self, lowering: TableLowering) -> None:
+        """CpNode.realize, then, when linear_ok, the candidate linear form from
+        linear_form."""
+
+    @abstractmethod
+    def linear_form(self) -> CpLinear | None:
+        """Its own linear form, from its children's as_linear, or None when it has
+        none."""
 
     def as_linear(self) -> CpLinear:
         """The node read linearly, by rule 3: its own linear form when it has no table
@@ -851,6 +873,75 @@ class CpLinearNode(CpNode):
         Min/Max (margin 2). Looks at the table candidate rather than calling as_table,
         which would raise where the linear form must win. Raises TableLoweringError
         when it has neither."""
+
+
+class CpAdd(CpLinearNode):
+    """sympy.Add."""
+
+    def linear_form(self) -> CpLinear | None:
+        """sum(child.as_linear() for child in children): lists on one index added in
+        float."""
+
+
+class CpMul(CpLinearNode):
+    """sympy.Mul."""
+
+    def parts_table(self, lowering: TableLowering) -> CpTable | None:
+        """CpNode.parts_table, or, for Min/Max factors over shared inputs, the fold of
+        the tuples of rungs that occur together (rule 2), whichever has fewer entries."""
+
+    def linear_form(self) -> CpLinear | None:
+        """k * child.as_linear() when every other factor is a constant k. Otherwise the
+        product switched on one factor's table (rule 4), a 0/1 literal being a gate.
+        None when two factors are too wide to pair."""
+
+
+class CpMax(CpLinearNode):
+    """sympy.Max."""
+
+    def parts_table(self, lowering: TableLowering) -> CpTable | None:
+        """By rung (rule 1): the ladder of the values it can return, each child's table
+        remapped onto its rungs by a Compact, and an Extreme over them."""
+
+    def linear_form(self) -> CpLinear | None:
+        """CpLinear(extrema=[(False, [child.as_linear() for child in children])])."""
+
+
+class CpMin(CpLinearNode):
+    """sympy.Min: CpMax with min for max, and lin_min for lin_max."""
+
+    def parts_table(self, lowering: TableLowering) -> CpTable | None:
+        """By rung, as CpMax.parts_table."""
+
+    def linear_form(self) -> CpLinear | None:
+        """CpLinear(extrema=[(True, [child.as_linear() for child in children])])."""
+
+
+class CpRelayoutCharge(CpLinearNode):
+    """RelayoutCharge(is_lx, division, *prices). Its children are its literal and its
+    division; its prices are data."""
+
+    def realize(self, lowering: TableLowering) -> None:
+        """The number 0 as its table when this solve does not divide the source,
+        otherwise CpLinearNode.realize."""
+
+    def linear_form(self) -> CpLinear | None:
+        """Its literal gating its price list on the division: one switch on the
+        literal."""
+
+
+NODE_CLASSES: dict[type, type[CpNode]] = {
+    sympy.Add: CpAdd,
+    sympy.Mul: CpMul,
+    sympy.Max: CpMax,
+    sympy.Min: CpMin,
+    RelayoutCharge: CpRelayoutCharge,
+}
+
+
+def node_class(expr: sympy.Basic) -> type[CpNode]:
+    """The CpNode class for expr: NODE_CLASSES of the first class along
+    type(expr).__mro__ that has one, else CpNode."""
 
 
 class TableLowering:
@@ -864,9 +955,9 @@ class TableLowering:
         """root as a CP-SAT objective in COST_SCALE units.
 
         Pass 1 iterates preorder_traversal and marks the sympy nodes a linear reader can
-        reach, repeats kept. Pass 2 iterates postorder_traversal and makes each node's
-        CpNode once, from its children's CpNodes, with its candidate table and linear
-        form, reading the children with as_table and as_linear. Only then does
+        reach, repeats kept. Pass 2 iterates postorder_traversal and, once per node,
+        makes its CpNode of node_class(expr) from its children's CpNodes and calls its
+        realize. Only then does
         it return the root's as_linear().cp_expr(model), which makes just the variables
         that form requests. Every refusal raises TableLoweringError during the passes,
         before any variable is made, so the model is untouched when it raises.
@@ -890,12 +981,10 @@ a refusal leaves the model untouched. `cp_expr` makes them after the walk, when 
 objective's form requests them, each once. `Input`, `Combine`, `Compact` and `Extreme`
 subclass the abstract `IndexMap` and override its three members, so a step missing one
 cannot be made.
-Inside `TableLowering`, the dispatch to one
-method per node class, the
-methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
-`visit_RelayoutCharge`), `tabulate` and the reader that applies rule 3 are private, and
-the sections below describe them. The order of the two passes, `CpNode` and `tabulate`
-are the design, and the other names may change. `Inputs` is the map from each symbol to
+Each sympy class's lowering lives on its `CpNode` subclass: `realize`, `parts_table`
+and `linear_form`, chosen by `node_class`. The sections below describe them. The order
+of the two passes, the `CpNode` classes and `tabulate`, the private helper `realize`
+calls, are the design, and the other names may change. `Inputs` is the map from each symbol to
 its input and column ("How a table maps onto CP-SAT"), and `sym_map` and `buffer_map`
 are the printer's two maps. With `Inputs` as an empty class the sketch passes mypy with
 torch-spyre's settings (`pyproject.toml:131`), the bodies being empty.
@@ -984,16 +1073,17 @@ against the table's 14. 9 is not under half of 14, so margin 2 keeps the table.
   nodes, 3 to 11 per distinct node, in at most 0.1 s. Expressions are 6 to 17 deep, so
   recursion would not overflow; the loops are chosen for clarity and so that no depth
   can.
-- **One method per class.** A private dispatch looks for `visit_<Class>` along the
-  node's class and its bases, and falls back to `generic_visit`. The bases matter:
-  `Integer(1)` is class `One` and `Rational(1, 2)` is `Half`. The printer on `main` dispatches the same
-  way through sympy's `Printer` (`cpsat_expr_printer.py:186`), but each of its methods
-  prints its own arguments.
+- **One class per sympy class.** `node_class` looks along the sympy node's class and its
+  bases for an entry of `NODE_CLASSES`, and falls back to `CpNode`. The bases matter:
+  `Integer(1)` is class `One` and `Rational(1, 2)` is `Half`, and both reach `CpNode`.
+  The printer on `main` dispatches by class too, through sympy's `Printer`
+  (`cpsat_expr_printer.py:186`), but each of its methods prints its own arguments; a
+  `CpNode` only reads its children, which are already realized.
 - **Children.** A node's children are its arguments, with two exceptions. A Piecewise's
   children are the values and conditions of its arms; the walks also yield each arm's
   `ExprCondPair`, whose `CpNode` has no form of its own and is read by its Piecewise. A `RelayoutCharge`'s children are its
-  literal and its division; its prices are numbers the walks yield, and its method does
-  not read them.
+  literal and its division; its prices are numbers the walks yield, and
+  `CpRelayoutCharge` does not read them.
 - **No model.** The walk reads the expression, the inputs and the cap, and computes in
   numpy. It adds nothing to the CP-SAT model and rounds nothing.
 
@@ -1036,7 +1126,7 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
 
 ### `tabulate` realizes a node
 
-`tabulate(node, children)` makes the node's candidate `CpTable`, or none. The node's
+`CpNode.realize` makes the node's candidate `CpTable`, or none, through `tabulate`. The node's
 value is `values[index]`. The index is a `CpIndex`: an input, a combine, a compact, or
 a min or max of rungs, a recipe until its `cp_expr` makes the CP-SAT expression. A node
 is *tabulated* when it has its `CpTable`.
@@ -1054,9 +1144,10 @@ Every list of the lowering is made here, and a list is never made without its in
 4. **Children on several indexes.** There are two candidates:
    - *one table*: the node on the grid of its inputs, from `values_on_grid`, on the
      inputs combined;
-   - *from its parts*: a Min/Max by rung (rule 1), a product of Min/Max factors by fold
-     (rule 2), and any other node by compacting each child's list to its distinct
-     values, combining the positions and applying the node's numpy function across them.
+   - *from its parts*, the node's `parts_table`: by rung for `CpMax` and `CpMin`
+     (rule 1), by fold of Min/Max factors for `CpMul` (rule 2), and for any other node
+     each child's list compacted to its distinct values, the positions combined and the
+     node's numpy function applied across them.
 5. **The cheaper one.** The candidate with fewer entries is the table (rule 3). Its
    entries are its list plus the remaps under its index. A candidate's size is known
    before its list is computed, so one past the cap is never evaluated. With no
@@ -1064,29 +1155,29 @@ Every list of the lowering is made here, and a list is never made without its in
 
 ### A node that is not one list
 
-A sum, a product and a Min/Max can be read without being one list, so their methods
-give the `CpNode` a second candidate beside the table. A *linear form*, a `CpLinear`, is
+A sum, a product and a Min/Max can be read without being one list, so their classes
+give the node a second candidate beside the table, from `linear_form`. A *linear form*, a `CpLinear`, is
 a constant, one float list per index, and the `lin_min`, `lin_max` and switched terms
 inside it. It is float, as the tables are.
 
-| Method | Makes | Table | Linear form |
-|---|---|---|---|
-| `generic_visit`: symbols, numbers, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | `CpNode` | `tabulate` | none: `as_linear` is the table as one list |
-| `visit_Add` | `CpLinearNode` | `tabulate` | the children's `as_linear` added, where lists on one index become one list |
-| `visit_Mul` | `CpLinearNode` | `tabulate` | constants times one child: that child's `as_linear`, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
-| `visit_Min`, `visit_Max` | `CpLinearNode` | `tabulate` | `lin_min` or `lin_max` over the children's `as_linear` |
-| `visit_RelayoutCharge` | `CpLinearNode` | `tabulate`, or the number 0 when this solve does not divide the source | its literal as a gate on the price list |
+| Class | Table | Linear form |
+|---|---|---|
+| `CpNode`: symbols, numbers, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | one table or `parts_table` | none: `as_linear` is the table as one list |
+| `CpAdd` | the same | the children's `as_linear` added, where lists on one index become one list |
+| `CpMul` | the same, or the fold of Min/Max factors (rule 2) | constants times one child: that child's `as_linear`, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
+| `CpMax`, `CpMin` | the same, or by rung (rule 1) | `lin_max` or `lin_min` over the children's `as_linear` |
+| `CpRelayoutCharge` | the same, or the number 0 when this solve does not divide the source | its literal as a gate on the price list |
 
 - **The reader picks the read.** Pass 1 tells a node whether a linear reader can reach
   it, but not which read that reader will make, so the `CpNode` keeps its candidates.
   `tabulate` calls `as_table` on its children. A linear form calls `as_linear` on every
   child: a plain `CpNode` returns its table as one list, and a `CpLinearNode` its own
   linear form or its table, whichever has fewer entries; a Min/Max keeps its linear
-  form only under half the entries of its table (rule 3). The objective reads the root with `as_linear`. Only `visit_Add`,
-  `visit_Mul`, `visit_Min` and `visit_Max` call `as_linear`. They and
-  `visit_RelayoutCharge` build a linear candidate, on a marked node only.
-  `generic_visit` calls `as_table` only: under `Max(...) ** 0.5` the Max is read as its
-  table, and a Max with no table raises there.
+  form only under half the entries of its table (rule 3). The objective reads the root
+  with `as_linear`. Only `CpAdd`, `CpMul`, `CpMax` and `CpMin` call `as_linear` on their
+  children; they and `CpRelayoutCharge` build a linear candidate, on a marked node
+  only. A plain `CpNode` calls `as_table` only: under `Max(...) ** 0.5` the Max is read
+  as its table, and a Max with no table raises there.
 - **Multipliers go down in float.** Scaling a linear form multiplies its lists in numpy.
   Through a `lin_min` or `lin_max` it scales the operands, and a negative factor turns
   one into the other.
@@ -1188,12 +1279,12 @@ was visited once: 10 visits for an expression of 15 nodes.
 |---|---|
 | 1 | `numpy_value`, and its one-node step that `tabulate` applies to lists |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, `CpLinearNode`, pass 1, pass 2, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the `cp_expr` methods that make the model's variables, and `tabulate` for a leaf, for one index and for one table over the inputs |
-| 4 | `tabulate` from a node's parts: by rung, rank and pair, and the choice by entries |
-| 5 | `tabulate` from a node's parts: the fold |
-| 6 | the linear form of `visit_Min` and `visit_Max`, and a constant times one child in `visit_Mul` |
-| 7 | the switch and the gate in `visit_Mul`, and the gate of `visit_RelayoutCharge` |
-| 8 | nothing: the flag chooses between this visitor and the printer, and a refusal raises |
+| 3 | `CpNode`, `CpLinearNode`, `CpAdd`, `CpRelayoutCharge`, `node_class`, pass 1, pass 2, the `cp_expr` methods that make the model's variables, and `tabulate` for a leaf, for one index and for one table over the inputs |
+| 4 | `parts_table`: `CpNode`'s rank and pair, `CpMax` and `CpMin` by rung, and the choice by entries |
+| 5 | `CpMul.parts_table`: the fold |
+| 6 | `CpMax.linear_form` and `CpMin.linear_form`, and a constant times one child in `CpMul.linear_form` |
+| 7 | the switch and the gate in `CpMul.linear_form`, and the gate of `CpRelayoutCharge` |
+| 8 | nothing: the flag chooses between this lowering and the printer, and a refusal raises |
 
 ## Stages
 
@@ -1305,8 +1396,8 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 
 ### Stage 3: inputs, indexes, tables, linear sums
 
-- The two passes of Architecture arrive: `CpNode`, `CpLinearNode`, pass 1, pass 2,
-  `generic_visit`, `visit_Add`, `visit_RelayoutCharge` and the `cp_expr` methods.
+- The two passes of Architecture arrive: `CpNode`, `CpLinearNode`, `CpAdd`,
+  `CpRelayoutCharge`, `node_class`, pass 1, pass 2 and the `cp_expr` methods.
   `tabulate` realizes a leaf, a node whose children share an index, and a node whose
   inputs fit one table.
 - Positions are made by injected `IndexMap` steps: `Input`, `Combine` and `Compact` here,
@@ -1355,8 +1446,8 @@ Tests:
 
 ### Stage 4: rule 1 and parts
 
-All of this stage is inside `tabulate`: its second candidate, the form from a node's
-parts, and the choice between the two.
+All of this stage is in `parts_table` and `tabulate`: the second candidate, the form
+from a node's parts, and the choice between the two.
 
 - A Min/Max of indexed operands is indexed by rung (rule 1).
 - Equal values share one rank, and a product of two short lists is one table over the
@@ -1384,15 +1475,14 @@ Tests:
 
 Min/Max factors of one product, over shared inputs, become one indexed value over the
 reachable tuples of their rungs, when crossing their lists would pass the cap. It is one
-more form from a node's parts inside `tabulate`.
+more form from a node's parts, in `CpMul.parts_table`.
 
 Tests: a product of four Max factors over three shared buffers is exact under a cap their
 crossed ladders pass; no fold when the crossed lists fit.
 
 ### Stage 6: rule 3 in the objective
 
-`visit_Min` and `visit_Max` gain their linear form, and a reader picks between it and
-the table.
+`CpMax` and `CpMin` gain `linear_form`, and a reader picks between it and the table.
 
 - A Min/Max too wide to index, or whose table is over twice its linear form, stays a
   `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
@@ -1414,7 +1504,7 @@ linear.
 
 ### Stage 7: rule 4
 
-`visit_Mul` and `visit_RelayoutCharge` gain their linear forms.
+`CpMul` and `CpRelayoutCharge` gain their switch and gate in `linear_form`.
 
 - A product whose factor cannot pair with the rest is switched on the factor's value.
   Whole values take one equality per value. Fractional values take the floor pair of
