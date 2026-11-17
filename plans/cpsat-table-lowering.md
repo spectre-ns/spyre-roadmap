@@ -810,21 +810,6 @@ class CpLinear:
         """A table read linearly: CpLinear(lists={table.index: table.values}), or
         CpLinear(constant=v) when the table is one value v on the Unit position."""
 
-    def __add__(self, other: CpLinear) -> CpLinear:
-        """The sum, still in float: constants added, lists on one index added
-        elementwise into one list, extrema and switches kept side by side. So
-        split ** 0.5 + split ** 0.7 is one list, rounded once to 3112 at split 2,
-        where rounding each first would give 1448 + 1663 = 3111."""
-
-    def __mul__(self, coeff: float) -> CpLinear:
-        """Every list, the constant and every operand scaled in float before any
-        rounding, so 7 * split ** 0.5 at split 2 is 10137, not 7 * 1448. A negative
-        coeff turns each lin_min into a lin_max and back. coeff is a number: two
-        CpLinear are never multiplied. A product of non-constant factors is one table,
-        a pair of ranks, or a switch on one factor's values (rule 4)."""
-
-    __rmul__ = __mul__
-
     @property
     def entries(self) -> int:
         """The entries its lists, operands and switches put in the model."""
@@ -881,12 +866,20 @@ class CpLinearNode(CpNode):
     def visit_op(self, lowering: TableLowering) -> None:
         """CpNode.visit_op, with one more candidate table from expr's own parts: by rung
         for a Max or Min (rule 1), the fold of Min/Max factors for a Mul (rule 2). Then,
-        when linear_ok, the linear form for expr's class: an Add, its children's
-        as_linear summed; a Mul, k * child.as_linear() through expr.as_coeff_Mul() when
-        the rest is one child, else the product switched on one factor's table (rule 4),
-        a 0/1 literal being a gate; a Max or Min, lin_max or lin_min over its children's
-        as_linear; a RelayoutCharge, its literal gating the price list in expr's
-        arguments."""
+        when linear_ok, the linear form for expr's class, built in float with nothing
+        rounded:
+
+        - an Add: its children's as_linear merged, constants added and the lists on one
+          index added elementwise into one list, so split ** 0.5 + split ** 0.7 rounds
+          once, to 3112 at split 2, not 1448 + 1663;
+        - a Mul: through expr.as_coeff_Mul(), k times the one other child's as_linear,
+          its lists, constant and operands scaled by k, so 7 * split ** 0.5 at split 2
+          is 10137, not 7 * 1448, and a negative k turns each lin_min into a lin_max;
+          with no single other child, the product switched on one factor's table
+          (rule 4), a 0/1 literal being a gate. Two linear forms are never multiplied;
+        - a Max or Min: lin_max or lin_min over its children's as_linear;
+        - a RelayoutCharge: its literal gating the price list in expr's arguments.
+        """
 
     def as_linear(self) -> CpLinear:
         """The node read linearly, by rule 3: its linear form when it has no table under
@@ -980,10 +973,13 @@ a_07 = CpTable(split_a ** 0.7, division_a)
 product = CpTable(np.outer(9 * split_a ** -2.0, split_b ** 0.5).ravel(), pair)
 ladder = CpTable(np.array([1.0, 2 ** 0.25, 2 ** 0.5, 3 ** 0.5, 2.0]), rank)  # the Max
 
-# reading tables linearly: CpLinear arithmetic, in float, nothing rounded yet
-form = (7 * CpLinear.of(a_half) + CpLinear.of(a_07)
-        + CpLinear.of(product) + CpLinear.of(ladder))
-# form.lists[division_a] is about [8.0, 11.524, 16.639]: two terms, one list
+# the tables read linearly and merged, as the Add's visit_op does: float, not rounded
+form = CpLinear(lists={
+    division_a: 7 * a_half.values + a_07.values,   # two terms on one index, one list
+    pair: product.values,
+    rank: ladder.values,
+})
+# form.lists[division_a] is about [8.0, 11.524, 16.639], added in float
 
 # the one rounding, and the only CP-SAT calls
 objective = form.cp_expr(model)
