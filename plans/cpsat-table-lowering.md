@@ -96,6 +96,13 @@ that turn out affine and cost nothing, so it runs high.
   computed in numpy before the solve, and `index` is a CP-SAT expression that the inputs
   determine. The solver never chooses an index.
 - *Entries* are the table entries a form puts in the model. The cap bounds one table.
+- `Min` and `Max` are nodes of the cost expression. `lin_max` is CP-SAT's constraint
+  `target == max(e_1, ..., e_n)` over linear expressions, which `add_max_equality` adds.
+  CP-SAT has no min constraint: `add_min_equality` adds a `lin_max` over the negated
+  expressions, and this plan calls that `lin_min`. A Min/Max node is lowered one of two
+  ways. *By rung*, `lin_max` takes the max of small integer positions, and one lookup
+  then reads the cost (rule 1). *Kept linear*, each operand is collapsed to an integer
+  cost, and `lin_max` takes the max of the costs, with no table for the Min/Max itself.
 - Lists are float from the leaves up. CP-SAT holds positions only, until a list is
   collapsed into a linear term (next section).
 
