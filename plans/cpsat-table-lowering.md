@@ -31,15 +31,15 @@ computed with numpy functions, and the code arrives in layers, each with its own
 - **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
   moves, combine and compact, and the table constraint is measured against them.
 - **Two passes: parents first, then children first (2026-11-17).** After a sympy
-  normalization (`normalize`), a first pass visits every parent before its children and
-  marks the nodes a linear reader can reach. The second (`rewrite`) rewrites the sympy
-  graph into a `CpNode` graph, children first, and calls each node's `visit_op`. Pass 1
-  iterates `sympy.preorder_traversal`, pass 2 `sympy.postorder_traversal`; nothing
-  recurses. There are two node classes, `CpNode` and `CpLinearNode`. Each holds its sympy
-  node, injected as `expr` and only read: sympy says which operation the node is, gives
-  its arguments in canonical form and its free symbols, and finds its numpy step by class
-  name, or lambdifies it. A parent reads any node as a table or linearly. No sympy node
-  is changed. Reads and CP-SAT variables are made when first requested and memoized. See
+  normalization, a first pass visits every parent before its children and marks the nodes
+  a linear reader can reach. The second rewrites the sympy graph into a `CpNode` graph,
+  children first, and calls each node's `visit_op`. Pass 1 iterates
+  `sympy.preorder_traversal`, pass 2 `sympy.postorder_traversal`; nothing recurses. There
+  are two node classes, `CpNode` and `CpLinearNode`. Each holds its sympy node, injected
+  as `expr` and only read: sympy says which operation the node is, gives its arguments in
+  canonical form and its free symbols, and finds its numpy step by class name, or
+  lambdifies it. A parent reads any node as a table or linearly. No sympy node is
+  changed. Reads and CP-SAT variables are made when first requested and memoized. See
   Architecture.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
@@ -902,22 +902,24 @@ class TableLowering:
         input and column; cap bounds one table."""
 
     def lower(self, root: sympy.Basic) -> cp_model.LinearExprT:
-        """root as a CP-SAT objective in COST_SCALE units: normalize, pass 1, rewrite,
-        then the root's as_linear().cp_expr(model), which makes just the variables that
-        form requests. Every refusal raises TableLoweringError before any variable is
-        made, so the model is untouched when it raises."""
+        """root as a CP-SAT objective in COST_SCALE units, in four steps.
 
-    def normalize(self, root: sympy.Basic) -> sympy.Basic:
-        """root with sympy-to-sympy rewrites applied by xreplace before the passes: a
-        relayout charge on a source this solve does not divide becomes 0. sympy returns
-        a new expression; the one passed in is not changed."""
+        1. Normalize: sympy-to-sympy rewrites by xreplace. A relayout charge on a source
+           this solve does not divide becomes 0. sympy returns a new expression; root is
+           not changed.
+        2. Pass 1, over preorder_traversal, repeats kept: mark the nodes a linear reader
+           can reach.
+        3. Pass 2, the rewrite, over postorder_traversal: each sympy node, once, becomes
+           a CpLinearNode for an Add, Mul, Max, Min or RelayoutCharge and a CpNode
+           otherwise, holding its children's CpNodes, and its visit_op is called. Shared
+           subexpressions stay shared. A TableLoweringError from visit_op is re-raised
+           naming the sympy node.
+        4. Return the root's as_linear().cp_expr(model), which makes just the variables
+           that form requests.
 
-    def rewrite(self, root: sympy.Basic, linear_ok: set[sympy.Basic]) -> CpNode:
-        """Pass 2: the sympy graph rewritten into the CpNode graph. A memoized bottom-up
-        map over postorder_traversal: each sympy node, once, becomes a CpLinearNode for
-        an Add, Mul, Max, Min or RelayoutCharge and a CpNode otherwise, holding its
-        children's CpNodes, and its visit_op is called. Shared subexpressions stay
-        shared. A TableLoweringError from visit_op is re-raised naming expr."""
+        Every refusal raises TableLoweringError in steps 1 to 3, before any variable is
+        made, so the model is untouched when it raises.
+        """
 
 
 def lower_cost_with_tables(
@@ -936,7 +938,7 @@ to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for 
 refusal leaves the model untouched. `cp_expr` makes them after the walk, when the
 objective's form requests them, each once. `Input`, `Combine`, `Compact` and `Extreme`
 subclass the abstract `IndexMap` and override its three members, so a step missing one
-cannot be made. Each `CpNode` holds its sympy node as `expr`, injected by `rewrite` and
+cannot be made. Each `CpNode` holds its sympy node as `expr`, injected by the rewrite and
 only read, and its `visit_op` lowers it, dispatching on `expr`'s class. `TableLowering`
 normalizes the expression, marks linear reach and rewrites the graph; the sections below
 describe the rest. The order of the two passes, the `CpNode` classes and `tabulate`, the
@@ -1031,7 +1033,7 @@ margin 2 keeps the table.
   nodes, 3 to 11 per distinct node, in at most 0.1 s. Expressions are 6 to 17 deep, so
   recursion would not overflow; the loops are chosen for clarity and so that no depth
   can.
-- **Two classes, one dispatch.** `rewrite` makes a `CpLinearNode` for an Add, Mul, Max,
+- **Two classes, one dispatch.** The rewrite makes a `CpLinearNode` for an Add, Mul, Max,
   Min or `RelayoutCharge`, looking along the sympy node's class and its bases, and a
   `CpNode` for every other; `visit_op` then dispatches on `expr`'s class. The bases
   matter: `Integer(1)` is class `One` and `Rational(1, 2)` is `Half`, and both are
@@ -1130,7 +1132,7 @@ switched terms inside it. It is float, as the tables are.
 | `CpLinearNode`, an Add | the same | the children's `as_linear` added, where lists on one index become one list |
 | `CpLinearNode`, a Mul | the same, or the fold of Min/Max factors (rule 2) | constants times one child, through `expr.as_coeff_Mul()`: that child's `as_linear`, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
 | `CpLinearNode`, a Max or Min | the same, or by rung (rule 1) | `lin_max` or `lin_min` over the children's `as_linear`, kept only under half the table's entries |
-| `CpLinearNode`, a `RelayoutCharge` | the same; `normalize` has made one on a source this solve does not divide the number 0 | its literal as a gate on the price list |
+| `CpLinearNode`, a `RelayoutCharge` | the same; normalizing has made one on a source this solve does not divide the number 0 | its literal as a gate on the price list |
 
 - **The reader picks the read.** Pass 1 tells a node whether a linear reader can reach
   it, but not which read that reader will make, so the `CpNode` keeps its candidates.
@@ -1244,7 +1246,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 |---|---|
 | 1 | `numpy_value`, and its one-node step, which `visit_op` finds for each operation |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, `CpLinearNode`, `normalize`, pass 1, `rewrite`, the `cp_expr` methods that make the model's variables, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
+| 3 | `CpNode`, `CpLinearNode`, `lower`'s normalization, pass 1 and rewrite, the `cp_expr` methods that make the model's variables, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
 | 4 | the table from a node's parts: rank and pair, a Max's or Min's table by rung, and the choice by entries |
 | 5 | a Mul's table by fold |
 | 6 | the linear form of a Max or Min, and of a constant times one child in a Mul |
@@ -1362,10 +1364,10 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 
 ### Stage 3: inputs, indexes, tables, linear sums
 
-- Architecture arrives: `CpNode` and `CpLinearNode` with `visit_op`, `normalize`, pass 1,
-  `rewrite` and the `cp_expr` methods. `tabulate` makes the table of a leaf, of a node
-  whose children share an index, and of a node whose inputs fit one table. An Add and a
-  `RelayoutCharge` get their linear forms.
+- Architecture arrives: `CpNode` and `CpLinearNode` with `visit_op`, `lower` with its
+  normalization, pass 1 and rewrite, and the `cp_expr` methods. `tabulate` makes the
+  table of a leaf, of a node whose children share an index, and of a node whose inputs
+  fit one table. An Add and a `RelayoutCharge` get their linear forms.
 - Positions are made by injected `IndexMap` steps: `Input`, `Combine` and `Compact` here,
   `Extreme` in Stage 4.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
@@ -1390,10 +1392,10 @@ Tests:
   with one `CpNode`; the expression is the same object, equal to a copy taken before;
 - pass 1 marks every parent before its children: a node under a power is not marked, a
   node shared by a power and a sum is, and a node not marked builds no linear form;
-- `rewrite` makes a `CpLinearNode` for an Add, Mul, Max, Min or `RelayoutCharge` and a
-  `CpNode` for every other class, each holding its sympy node; neither `normalize` nor
-  `rewrite` changes the expression passed in; an operation with no numpy function is
-  evaluated through lambdify; a `CpNode` read with `as_linear` is its table as one list;
+- the rewrite makes a `CpLinearNode` for an Add, Mul, Max, Min or `RelayoutCharge` and a
+  `CpNode` for every other class, each holding its sympy node; `lower` does not change
+  the expression passed in; an operation with no numpy function is evaluated through
+  lambdify; a `CpNode` read with `as_linear` is its table as one list;
 - every list `tabulate` returns has the length of its index;
 - a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
