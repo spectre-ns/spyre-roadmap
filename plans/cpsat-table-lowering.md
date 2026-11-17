@@ -33,14 +33,15 @@ computed with numpy functions, and the code arrives in layers, each with its own
 - **Two passes: parents first, then children first (2026-11-17).** After a sympy
   normalization, a first pass visits every parent before its children and marks the nodes
   a linear reader can reach. The second rewrites the sympy graph into a `CpNode` graph,
-  children first, and calls each node's `visit_op`. Pass 1 iterates
-  `sympy.preorder_traversal`, pass 2 `sympy.postorder_traversal`; nothing recurses. There
+  children first, and calls each node's `visit_op`. Both read one list,
+  `sympy.postorder_traversal` with its repeats dropped: pass 2 iterates it and pass 1
+  iterates it reversed; nothing recurses. There
   are two node classes, `CpNode` and `CpLinearNode`. Each holds its sympy node, injected
   as `expr` and only read: sympy says which operation the node is, gives its arguments in
   canonical form and its free symbols, and finds its numpy step by class name, or
   lambdifies it. A parent reads any node as a table or linearly. No sympy node is
-  changed. Reads and CP-SAT variables are made when first requested and memoized. See
-  Architecture.
+  changed. The passes return a plan with no model in it, and `CpEmitter` builds the
+  plan into CP-SAT, each position and each form once. See Architecture.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
   #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
@@ -59,6 +60,15 @@ computed with numpy functions, and the code arrives in layers, each with its own
   pinned out (`ilp_solver_ortools.py:886`, `:1449`). `TableLoweringError` subclasses none
   of `RuntimeError`, `TypeError` or `ValueError`, so that `except` cannot turn it into
   that solve. At #6315's tip all 50 replayed objectives lower without a refusal.
+- **Copy the model, swap it back when the build fails (2026-11-17).** The entry point
+  copies the model before it maps an input. When any step fails, in the walk or in the
+  build, it swaps the copy back and raises `TableLoweringError`, from the original
+  exception when that was of another type. So the model is as it was whenever the
+  lowering raises, even when the failure comes after variables were made, as an entry
+  past 2^50 does. And `TableLoweringError` is the only exception the lowering lets out:
+  a `ValueError` out of numpy, or Stage 1's `NotImplementedError`, which is a
+  `RuntimeError`, cannot reach that `except` and become the traffic solve. On the 50
+  replayed models the copy takes 0.2 to 9 ms.
 
 ## Estimates
 
@@ -232,8 +242,8 @@ table.
    happen here.
 3. **The product joins two indexes.** Its children are on `division_a` and
    `division_b`. Its list is their outer product times 9, 3 * 2 = 6 values. Its index is
-   the pair of their positions, `pair == 2*division_a + division_b`, which costs one
-   linear equality and no lookup.
+   the pair of their positions, `pair = 2*division_a + division_b`: a linear expression,
+   which costs no variable, no constraint and no lookup.
 4. **The Max is read by rung.** Its operands are on three buffers, and one table over
    them would hold 3 * 2 * 4 = 24 entries. The Max gets a ladder instead: the five
    values it can return, ascending. Each operand's list becomes its rungs on the ladder.
@@ -261,7 +271,7 @@ How each node is collapsed:
 | `split_a / 2` | 2 | 0.5, 1, 2 | `division_a` | nothing |
 | `split_b ** 0.5` | 2 | 1, 1.7321 | `division_b` | nothing |
 | `split_c ** 0.25` | 2 | 1, 1.1892, 1.1892, 1.4142 | `division_c` | nothing |
-| the product | 3 | 9, 15.5885, 2.25, 3.8971, 0.5625, 0.9743 | `pair` | `pair == 2*division_a + division_b` |
+| the product | 3 | 9, 15.5885, 2.25, 3.8971, 0.5625, 0.9743 | `pair` | nothing: `pair` is the expression `2*division_a + division_b` |
 | the Max | 4 | the ladder: 1, 1.1892, 1.4142, 1.7321, 2 | `rank` | three rung lookups, 3 + 2 + 4 entries, and `rank == max(rung_a, rung_b, rung_c)` |
 | the sum | 5 | none: it stays linear | None (CP-SAT) | three tables, 3 + 6 + 5 entries, and three lookups |
 
@@ -284,8 +294,8 @@ The order of the collapse matters. At `split_a = 2`:
 - `split_a ** 0.5 + split_a ** 0.7` is one entry, 3112, the rounding of
   1448.15 + 1663.49. Collapsing each list alone gives 1448 + 1663 = 3111.
 
-The graph had 13 nodes. The model gets six lookups with 23 entries, one linear equality
-and one max.
+The graph had 13 nodes. The model gets six lookups with 23 entries and one max. `pair`
+is a linear expression inside its lookup, with no constraint of its own.
 
 At `division_a = 1`, `division_b = 1`, `division_c = 3`: `cost_1` is 11801. `pair` is 3
 and `cost_2` is 3991. The rungs are 0, 3 and 2, `rank` is 3 and `cost_3` is 1774. The
@@ -399,7 +409,7 @@ flowchart LR
     X["x in 2..5"] --> PX["position x - 2<br/>0..3"]
     Y["y in 0..1"] --> PY["position y<br/>0..1"]
     Z["z in 0..2"] --> PZ["position z<br/>0..2"]
-    PX -- "times 6" --> IDX["index == 6*(x - 2) + 3*y + z<br/>0..23"]
+    PX -- "times 6" --> IDX["index = 6*(x - 2) + 3*y + z<br/>0..23"]
     PY -- "times 3" --> IDX
     PZ -- "times 1" --> IDX
     IDX --> EL["cost == table[index]"]
@@ -410,8 +420,9 @@ flowchart LR
   gets its position from a lookup.
 - **Stride.** A position is multiplied by the product of the sizes of the variables
   after it: 2 * 3 = 6 for `x`, 3 for `y`, 1 for `z`.
-- **Linear.** The strides are constants, so the index is a linear equality. No two
-  variables are multiplied, and CP-SAT takes it as an ordinary linear constraint.
+- **Linear.** The strides are constants, so the index is a linear expression: no two
+  variables are multiplied. CP-SAT takes it as the index of the lookup, with no variable
+  and no constraint of its own.
 
 numpy fills the table in the same order, last variable fastest:
 
@@ -440,7 +451,7 @@ the lowering raises.
 | yes | no | tabulated: a float list on an index |
 | no | yes | linear |
 | yes | yes | both forms; its reader picks one (rule 3) |
-| no | no | no form, so neither has its parent. At the root, the lowering raises `TableLoweringError` |
+| no | no | no form: its `visit_op` raises `TableLoweringError` at once, naming the node |
 
 - *A table* is one table over the node's inputs, or the form from its parts: a rank, a
   pair, a Min/Max by rung, a fold (rules 1 to 3).
@@ -477,31 +488,31 @@ node's list is made from its arguments' lists.
 |---|---|---|
 | a function of one indexed node | `f(values)`, elementwise | the same index |
 | terms on one index | the lists added elementwise | the same index |
-| one table over inputs of sizes `n1..nm` | the node on the row-major grid: assignment `(i1..im)` at position `i1*s1 + ... + im*sm`, `s_k = n_(k+1) * ... * n_m`, so the last input varies fastest | `joint == index_1*s1 + ... + index_m*sm` |
+| one table over inputs of sizes `n1..nm` | the node on the row-major grid: assignment `(i1..im)` at position `i1*s1 + ... + im*sm`, `s_k = n_(k+1) * ... * n_m`, so the last input varies fastest | the linear expression `index_1*s1 + ... + index_m*sm` |
 | rank: equal values share a position | `distinct`, the values ascending without repeats | `add_element(index, rank_of, rank)`, where `rank_of[i]` is the position of `values[i]` in `distinct` |
-| product of lists `a` and `b` of sizes `na`, `nb` | the outer product: `a[i] * b[j]` at position `i*nb + j` | `pair == rank_a*nb + rank_b` |
+| product of lists `a` and `b` of sizes `na`, `nb` | the outer product: `a[i] * b[j]` at position `i*nb + j` | the linear expression `rank_a*nb + rank_b` |
 | Min/Max by rung | the ladder, ascending | per operand `add_element(index_o, rungs_o, rung_o)`, then `rank == min(rung_o)` or `max(rung_o)` |
-| fold | one value per reachable state | per step `position == state*size + group`, then `add_element(position, next_state, state')` |
+| fold | one value per reachable state | per step `add_element(state*size + group, next_state, state')` |
 
 **Why the right entry comes back.**
 
-- Every index is fixed by an equality, an element or a min/max over indexes that are
-  fixed themselves. Once the inputs have values, each index has one feasible value, and
-  it is the position numpy used.
-- The strides of a joint table, and `nb` of a pair, are computed once and used for both
-  the numpy list and the linear equality. The inputs of a table are taken in one fixed
-  order for both.
+- Every index is an input's position, a linear expression of indexes, an element or a
+  min/max over indexes that are fixed themselves. Once the inputs have values, each index
+  has one feasible value, and it is the position numpy used.
+- The strides of a joint table, and `nb` of a pair, are read from the parts' sizes by
+  the one step that makes both the numpy position and the linear expression. The inputs
+  of a table are taken in one fixed order for both.
 - A ladder is ascending, so position keeps order: the Min of the rungs is the rung of the
   Min. A value clamped to the bound can never be the result, so sharing the bound's rung
   changes nothing.
 
 **Two moves make every position.** A position above an input is never chosen. The
 inputs fix it through a chain of constraints, and only the last link, `cost ==
-table[index]`, reads a cost. That link names no decision variable when the index is
-derived. Every other link is one of two moves:
+table[index]`, reads a cost. That link names no decision variable when its index comes
+through a compact. Every other link is one of two moves:
 
-- *Combine*: `parent == left * size(right) + right`. A linear equality that turns two
-  positions into one position in the larger table.
+- *Combine*: `left * size(right) + right`. A linear expression that turns two positions
+  into one position in the larger table. It adds no variable and no constraint.
 - *Compact*: `short == remap[parent]`, one `add_element`. It renumbers a position onto
   the rows that are distinct or that can occur.
 
@@ -519,14 +530,20 @@ The min or max over rungs is a compact that needs no table, because a ladder kee
 lists the rows directly, and `out` is the next position up or the cost. It needs no
 strides, a domain with gaps needs no position lookup, and a row that cannot occur is left
 out. On the roll-up `Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)`, over the
-menus of the graph example, it replaces the six constraints of rungs, ranks and pair with
-two: `[division_a, division_b, rank_m]` with 6 rows and `[rank_m, division_c, cost]` with
-12.
+menus of the graph example, it replaces the five constraints of the chain, two rung
+lookups, the max, the factor's rank and the cost lookup, with two:
+`[division_a, division_b, rank_m]` with 6 rows and `[rank_m, division_c, cost]` with 12.
 
 Both forms were run on the roll-up and agree at all 24 assignments. Which solves faster
-on real objectives is not measured. The table constraint is one more `IndexMap`,
-`Allowed(rows)`, injected in place of `Combine` and `Compact`. The default is combine and
-compact, and the last PR reports both on the replay.
+on real objectives is not measured. The table constraint is a second emitter,
+`AllowedEmitter`, passed to `lower_cost_with_tables` in place of `CpEmitter`
+(Architecture). The plan it builds is the same one. Where `CpEmitter` builds a position
+from two others by compacts and a combine, `AllowedEmitter` lists the rows, read off
+`CpIndex.positions`, and where a cost is read on such a position it puts the rounded
+cost in the rows as `out`. So the walk, rule 3 and the cap count entries the same way
+under both, and the two models differ only in their constraints. Which steps one table
+constraint takes in is settled in Stage 4. The default is combine and compact, and the
+last PR reports both on the replay.
 
 **What the chain must guarantee.** Let D be the decision variables a term reads.
 
@@ -573,7 +590,9 @@ inside a switched product. There the list is collapsed, in this order:
    linear Min/Max, where a negative one turns Min into Max.
 2. Lists on one index in the same sum are added.
 3. The list is rounded once, `table[i] = rint(COST_SCALE * values[i])`. An entry past
-   2^50 is refused, so a sum of thousands of entries stays inside int64.
+   2^50 is refused, so a sum of thousands of entries stays inside int64. This refusal
+   comes during the build, and the entry point swaps its copy of the model back
+   (Decisions).
 4. It is read by `add_element(index, table, target)`, and the linear term is `target`.
    A list is affine when its rounded entries are, so `table[0] + step * index` equals
    the table entry for entry.
@@ -602,15 +621,19 @@ assignment of the inputs, so an entry read from the wrong position fails.
 
 ## Architecture
 
-The lowering is two passes over the cost expression, with no recursion. The first
-iterates `sympy.preorder_traversal`, every parent before its children, and marks each
-node that a linear reader can reach. The second iterates `sympy.postorder_traversal`,
-every node after its arguments, and visits it. One function, `tabulate`, makes a node's
-table: its float list and the index that reads it.
+The lowering is two passes over the cost expression, with no recursion, then a build.
+Both passes read one list, `sympy.postorder_traversal` with its repeats dropped: the
+distinct nodes, each after its arguments. The first pass iterates it reversed, every
+parent before its children, and marks each node that a linear reader can reach. The
+second iterates it forward and visits each node. One method,
+`tabulate`, makes a node's table: its float list and the index that reads it. The passes
+return a plan, float lists on indexes with no model in it, and `CpEmitter` builds the
+plan into the model.
 
 sympy nodes are immutable, and the lowering never changes one. Each node it meets gets a
-`CpNode`, its CP-SAT counterpart. A parent reads it as a `CpTable` or as a `CpLinear`,
-and each of those makes its CP-SAT variables itself, on first request:
+`CpNode`, its CP-SAT counterpart. A parent reads its `table`, a `CpTable`, or reads it
+linearly, as a `CpLinear`. Neither holds a model: the emitter makes their CP-SAT
+variables, each once:
 
 ```python
 from __future__ import annotations
@@ -618,25 +641,41 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any
 
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
 
+CpExpr = cp_model.LinearExprT                    # a CP-SAT linear expression, or an int
+Values = Mapping[cp_model.IntVar, np.ndarray]    # each variable's value per assignment
+
 
 class TableLoweringError(Exception):
-    """An objective the tables cannot lower, naming the node left with no form and why.
+    """An objective the tables cannot lower. node is the sympy node left with no form,
+    or None for a refusal outside the walk; reason says why.
 
-    Subclasses none of RuntimeError, TypeError and ValueError, so the except around the
-    objective in _minimize_cost_expr cannot turn it into the traffic-objective solve.
+    The only exception lower_cost_with_tables lets out. It subclasses none of
+    RuntimeError, TypeError and ValueError, so the except around the objective in
+    _minimize_cost_expr cannot turn it into the traffic-objective solve.
     """
+
+    def __init__(self, node: sympy.Basic | None, reason: str) -> None:
+        super().__init__(reason if node is None else f"{reason}: {node}")
+        self.node = node
+        self.reason = reason
 
 
 class IndexMap(ABC):
-    """One mapping step, injected into a CpIndex: from the positions of its parts to a
-    position 0 .. size - 1. Each kind of step is a subclass; CpIndex and the walk do not
-    change when one is added."""
+    """One mapping step of a CpIndex: from its parts' positions to a position
+    0 .. size - 1, in numpy and in CP-SAT. Each kind of step is a subclass; CpIndex,
+    the walk and the emitter do not change when one is added."""
+
+    @abstractmethod
+    def size_from(self, parts: Sequence[CpIndex]) -> int:
+        """The number of positions the step maps onto. Raises ValueError for parts it
+        does not take: the wrong count, or sizes its own data does not fit."""
 
     @property
     @abstractmethod
@@ -644,180 +683,260 @@ class IndexMap(ABC):
         """The table entries the step puts in the model, 0 for an arithmetic step."""
 
     @abstractmethod
-    def __call__(self, *parts: np.ndarray) -> np.ndarray:
-        """The step in numpy: the position for each combination of the parts' positions,
-        broadcast across the parts."""
+    def positions(
+        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
+    ) -> np.ndarray:
+        """The step in numpy: index's position at each assignment in values, from its
+        parts' positions there. A leaf step reads its variable's values."""
 
     @abstractmethod
     def cp_expr(
-        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
-    ) -> cp_model.LinearExprT:
-        """The step in model, from its parts' CP-SAT expressions."""
+        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
+    ) -> CpExpr:
+        """The step in model: the same position as a CP-SAT expression, from its
+        parts' expressions. A leaf step reads its variable."""
 
 
 @dataclass(frozen=True)
 class Input(IndexMap):
-    """A variable's own position, d -> d. The variable is already in the model."""
+    """A leaf: a variable's own position, v -> v - lo, for a domain lo .. lo + size - 1
+    with no gaps. A division or a literal has lo 0. The variable is already in the
+    model."""
 
     var: cp_model.IntVar
+    size: int
+    lo: int = 0
+
+    def size_from(self, parts: Sequence[CpIndex]) -> int:
+        """size, with no parts."""
 
     @property
     def entries(self) -> int:
         """0."""
 
-    def __call__(self, *parts: np.ndarray) -> np.ndarray:
-        """The identity on the variable's positions, its one argument."""
+    def positions(
+        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
+    ) -> np.ndarray:
+        """values[var] - lo."""
 
     def cp_expr(
-        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
-    ) -> cp_model.LinearExprT:
-        """var, with no parts."""
+        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
+    ) -> CpExpr:
+        """var - lo: no variable, no constraint."""
+
+
+@dataclass(frozen=True)
+class Locate(IndexMap):
+    """A leaf: the position of a variable whose domain has gaps, v -> its place in
+    domain, the domain's values ascending."""
+
+    var: cp_model.IntVar
+    domain: tuple[int, ...]
+
+    def size_from(self, parts: Sequence[CpIndex]) -> int:
+        """len(domain), with no parts."""
+
+    @property
+    def entries(self) -> int:
+        """len(domain)."""
+
+    def positions(
+        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
+    ) -> np.ndarray:
+        """np.searchsorted(domain, values[var])."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
+    ) -> CpExpr:
+        """A new variable pos in 0 .. size - 1 and add_element(pos, domain, var). The
+        values are distinct, so one position fits."""
+
+
+@dataclass(frozen=True)
+class Unit(IndexMap):
+    """A leaf: the one position of a constant, on no input."""
+
+    def size_from(self, parts: Sequence[CpIndex]) -> int:
+        """1, with no parts."""
+
+    @property
+    def entries(self) -> int:
+        """0."""
+
+    def positions(
+        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
+    ) -> np.ndarray:
+        """Position 0."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
+    ) -> CpExpr:
+        """0."""
 
 
 @dataclass(frozen=True)
 class Combine(IndexMap):
-    """(left, right) -> left * right_size + right. right_size is a constant, the right
-    part's size, so this is linear: no two variables are multiplied."""
+    """(left, right) -> left * right.size + right. The right part's size is a
+    constant, read from index.parts, so this is linear: no two variables are
+    multiplied."""
 
-    right_size: int
+    def size_from(self, parts: Sequence[CpIndex]) -> int:
+        """left.size * right.size, for exactly two parts."""
 
     @property
     def entries(self) -> int:
         """0."""
 
-    def __call__(self, *parts: np.ndarray) -> np.ndarray:
-        """left * right_size + right, broadcast."""
+    def positions(
+        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
+    ) -> np.ndarray:
+        """left * right.size + right."""
 
     def cp_expr(
-        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
-    ) -> cp_model.LinearExprT:
-        """The linear expression left * right_size + right: no variable, no constraint."""
+        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
+    ) -> CpExpr:
+        """The linear expression left * right.size + right: no variable, no
+        constraint."""
 
 
 @dataclass(frozen=True)
 class Compact(IndexMap):
-    """parent -> remap[parent]."""
+    """parent -> remap[parent], onto 0 .. size - 1: a rank's distinct values, or a
+    ladder's rungs."""
 
     remap: tuple[int, ...]
+    size: int
+
+    def size_from(self, parts: Sequence[CpIndex]) -> int:
+        """size, for one part of len(remap) positions and a remap inside
+        0 .. size - 1."""
 
     @property
     def entries(self) -> int:
         """len(remap)."""
 
-    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+    def positions(
+        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
+    ) -> np.ndarray:
         """np.asarray(remap)[parent]."""
 
     def cp_expr(
-        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
-    ) -> cp_model.LinearExprT:
+        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
+    ) -> CpExpr:
         """A new variable in 0 .. size - 1 and add_element(parent, remap, variable)."""
 
 
 @dataclass(frozen=True)
 class Extreme(IndexMap):
-    """(rung_1, ..., rung_k) -> their max, or min. Exact because a ladder keeps order."""
+    """(rung_1, ..., rung_k) -> their max, or min. Exact because a ladder keeps
+    order."""
 
     is_max: bool
+
+    def size_from(self, parts: Sequence[CpIndex]) -> int:
+        """The rungs' one size, for one part or more, all of that size."""
 
     @property
     def entries(self) -> int:
         """0."""
 
-    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+    def positions(
+        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
+    ) -> np.ndarray:
         """np.maximum, or np.minimum, across the rungs."""
 
     def cp_expr(
-        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
-    ) -> cp_model.LinearExprT:
+        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
+    ) -> CpExpr:
         """A new variable in 0 .. size - 1 and one add_max_equality, or
         add_min_equality, over the rungs."""
 
 
 @dataclass(frozen=True)
-class Unit(IndexMap):
-    """The one position of a constant, size 1, on no input."""
-
-    @property
-    def entries(self) -> int:
-        """0."""
-
-    def __call__(self, *parts: np.ndarray) -> np.ndarray:
-        """Position 0."""
-
-    def cp_expr(
-        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
-    ) -> cp_model.LinearExprT:
-        """0, with no parts."""
-
-
-@dataclass(frozen=True)
 class CpIndex:
-    """A map from the inputs' positions to a position in one table, 0 .. size - 1: its
+    """A map from the inputs' values to a position in one table, 0 .. size - 1: its
     mapping applied to its parts.
 
-    Made from Input leaves by injected IndexMap steps alone, so the final index of a
-    term is a function of every input it was made from. The walk interns it: two nodes
-    that make the same position get the same CpIndex object, so its expression is made
-    once.
+    A value, with no model in it. Two nodes that make the same position make equal
+    CpIndexes, which hash alike, so an emitter builds the position once. Made from the
+    leaf steps by IndexMap steps alone, so the final index of a term is a function of
+    every input it was made from.
     """
 
-    size: int
     mapping: IndexMap
     parts: tuple[CpIndex, ...] = ()
 
-    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
-        """mapping.cp_expr on the parts' cp_expr, made in model on the first call and
-        memoized. Its parts are made first."""
+    def __post_init__(self) -> None:
+        """Refuses parts its mapping does not take, by asking for size."""
+
+    @cached_property
+    def size(self) -> int:
+        """mapping.size_from(parts): computed, never passed in."""
+
+    def positions(self, values: Values) -> np.ndarray:
+        """The numpy side: its position at each assignment in values, its parts'
+        positions first. CpEmitter.index is the CP-SAT side of the same map."""
 
 
-@dataclass(eq=False, kw_only=True)
+@dataclass(frozen=True, eq=False)
+class LinearExtreme:
+    """A Min/Max kept linear (rule 3): lin_max, or lin_min, over linear operands."""
+
+    is_max: bool
+    operands: tuple[CpLinear, ...]
+
+
+@dataclass(frozen=True, eq=False)
+class Switch:
+    """A product switched on one factor's values (rule 4): factor times rest."""
+
+    factor: CpTable
+    rest: CpLinear
+
+
+@dataclass(frozen=True, eq=False, kw_only=True)
 class CpLinear:
-    """A node read linearly: the float form that cp_expr collapses into a CP-SAT
-    LinearExpr. Nothing in it is rounded until then. Compared by identity, its lists
-    being arrays."""
+    """A node read linearly: the float form an emitter collapses into a CP-SAT
+    expression. Nothing in it is rounded, and nothing in it changes once it is made:
+    merging and scaling make a new form. Compared by identity, its lists being
+    arrays."""
 
     constant: float = 0.0
-    lists: dict[CpIndex, np.ndarray] = field(default_factory=dict)   # one list per index
-    extrema: list[tuple[bool, list[CpLinear]]] = field(default_factory=list)  # is_min, operands
-    switched: list[tuple[CpTable, CpLinear]] = field(default_factory=list)    # rule 4
-
-    @property
-    def entries(self) -> int:
-        """The entries its lists, operands and switches put in the model."""
-
-    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
-        """The form as a CP-SAT expression, made in model on the first call and
-        memoized. Each list, already summed per index, becomes
-        CpTable(values=list, index=index).cp_expr(model): the one rounding, so a sum of
-        T lists and a constant is within (T + 1) / 2 units of its float value. Each
-        lin_min or lin_max is over operands behind proxy variables, and each switch is
-        one literal per factor value."""
-
-
-@dataclass(eq=False, kw_only=True)
-class CpTable(CpLinear):
-    """A node read as a table: values[index], made together and never apart. It is also
-    a CpLinear, one list on one index, so a table is read linearly as it is."""
-
-    values: np.ndarray                # the value at each position, float until collapsed
-    index: CpIndex
+    lists: Mapping[CpIndex, np.ndarray] = field(default_factory=dict)  # one per index
+    extrema: tuple[LinearExtreme, ...] = ()
+    switched: tuple[Switch, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuses a list whose length is not index.size, and sets lists to
-        {index: values}."""
+        """Refuses a list whose length is not its index's size, and marks each list
+        read-only."""
 
     @property
     def entries(self) -> int:
-        """Its list plus the remaps under its index: what rule 3 compares, and what the
-        cap bounds."""
+        """The entries the form puts in the model: its lists, the remaps under their
+        indexes, each once, and its operands' and switches' entries. What rule 3
+        compares. Counted before any rounding, so a list that turns out affine or
+        constant still counts in full."""
 
-    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
-        """values[index] as a CP-SAT expression, made in model on the first call and
-        memoized: the list rounded once onto COST_SCALE, then a number when it is
-        constant (a number's table, on the Unit position, always is), a linear
-        expression in index.cp_expr(model) when it is affine, and otherwise one
-        add_element on index.cp_expr(model) into a new variable whose domain is the
-        rounded values. The case CpLinear.cp_expr reduces each list to."""
+
+class CpTable(CpLinear):
+    """A node read as a table: values[index], made together and never apart. It is a
+    CpLinear with one list on one index and nothing else, so a table is read linearly
+    as it is. Its entries, the list plus the remaps under its index, are what the cap
+    bounds."""
+
+    def __init__(self, *, values: np.ndarray, index: CpIndex) -> None:
+        super().__init__(lists={index: values})
+
+    @property
+    def values(self) -> np.ndarray:
+        """Its one list: the value at each position, float until collapsed."""
+
+    @property
+    def index(self) -> CpIndex:
+        """The index of its one list."""
+
+
+Inputs = Mapping[sympy.Symbol, CpTable]          # each symbol's column, on its input
 
 
 @dataclass(eq=False)
@@ -827,32 +946,31 @@ class CpNode:
     expr is the sympy node, injected and only read: it says which operation the node
     is, gives its arguments in sympy's canonical form, its free symbols, and the class
     name its numpy step is found by. The CpNodes form the same graph as the sympy
-    nodes: children holds the CpNodes of expr's children, made before it, and a
-    subexpression shared by two parents is one CpNode that both hold. A parent reads a
-    child as a table or linearly, whatever the child is. Each read is made on first
-    request and memoized, and neither touches the model.
+    nodes: children holds the CpNodes of expr's children, made and visited before it,
+    and a subexpression shared by two parents is one CpNode that both hold. visit_op
+    sets what a parent reads. A parent reads a child's table, or reads it linearly with
+    as_linear, whatever the child is. No model is involved.
     """
 
     expr: sympy.Basic                 # injected, read only; never changed
     children: tuple[CpNode, ...]      # the CpNodes of children_of(expr)
     linear_ok: bool = False           # pass 1: a linear reader can reach it; only a
                                       # CpLinearNode builds a linear form from it
+    table: CpTable | None = field(default=None, init=False)     # set by visit_op
 
     def visit_op(self, lowering: TableLowering) -> None:
-        """Pass 2 on this node, once, after its children: its candidate table. A
-        symbol's is its input's column; a number's, its value on the Unit position. An
-        operation's is the cheaper, in entries, of two (rule 3), or none when neither
-        fits the cap: one table over the inputs of expr.free_symbols, expr evaluated on
+        """Pass 2 on this node, once, after its children: sets table. A symbol's is
+        lowering.inputs[expr]; a number's, its value on the Unit position. An
+        operation's is lowering.tabulate(self): the cheaper, in entries, of two
+        (rule 3): one table over the inputs of expr.free_symbols, expr evaluated on
         their grid; or the table from its children's tables, its numpy step applied
         across them. The step is found by type(expr)'s name (Stage 1's lookup), or is
-        lambdify of expr where numpy has none. Raises TableLoweringError when the node
-        ends with no candidate."""
-
-    def as_table(self) -> CpTable:
-        """The node read as a table. Raises TableLoweringError when it has none."""
+        lambdify of expr where numpy has none. Raises TableLoweringError(expr, reason)
+        when it ends with no table: a symbol with no input, a child with no table, or
+        no candidate under the cap."""
 
     def as_linear(self) -> CpLinear:
-        """The node read linearly: as_table(), a CpTable being a CpLinear."""
+        """The node read linearly: its table, a CpTable being a CpLinear."""
 
 
 @dataclass(eq=False)
@@ -860,59 +978,97 @@ class CpLinearNode(CpNode):
     """A node that can be linear in its children: expr is an Add, Mul, Max, Min or
     RelayoutCharge."""
 
-    def visit_op(self, lowering: TableLowering) -> None:
-        """CpNode.visit_op, with one more candidate table from expr's own parts: by rung
-        for a Max or Min (rule 1), the fold of Min/Max factors for a Mul (rule 2). Then,
-        when linear_ok, the linear form for expr's class, built in float with nothing
-        rounded:
+    linear: CpLinear | None = field(default=None, init=False)   # set by visit_op
 
-        - an Add: its children's as_linear merged, constants added and the lists on one
-          index added elementwise into one list, so split ** 0.5 + split ** 0.7 rounds
-          once, to 3112 at split 2, not 1448 + 1663;
+    def visit_op(self, lowering: TableLowering) -> None:
+        """Sets table as CpNode does, but None where CpNode would raise, and with one
+        more candidate from expr's own parts: by rung for a Max or Min (rule 1), the
+        fold of Min/Max factors for a Mul (rule 2). Then, when linear_ok, sets linear,
+        the linear form for expr's class, built in float with nothing rounded:
+
+        - an Add: its children's as_linear merged into a new form, constants added and
+          the lists on one index added elementwise into one list, so
+          split ** 0.5 + split ** 0.7 rounds once, to 3112 at split 2, not 1448 + 1663;
         - a Mul: through expr.as_coeff_Mul(), k times the one other child's as_linear,
-          its lists, constant and operands scaled by k, so 7 * split ** 0.5 at split 2
-          is 10137, not 7 * 1448, and a negative k turns each lin_min into a lin_max;
-          with no single other child, the product switched on one factor's table
-          (rule 4), a 0/1 literal being a gate. Two linear forms are never multiplied;
+          a new form with its lists, constant and operands scaled by k, so
+          7 * split ** 0.5 at split 2 is 10137, not 7 * 1448, and a negative k turns
+          each lin_min into a lin_max; with no single other child, the product switched
+          on one factor's table (rule 4), a 0/1 literal being a gate. Two linear forms
+          are never multiplied;
         - a Max or Min: lin_max or lin_min over its children's as_linear;
         - a RelayoutCharge: its literal gating the price list in expr's arguments.
+
+        Raises TableLoweringError(expr, reason) when it ends with neither.
         """
 
     def as_linear(self) -> CpLinear:
-        """The node read linearly, by rule 3: its linear form when it has no table under
-        the cap; its table as one list when it is not linear_ok; otherwise the one with
-        fewer entries, the linear form needing under half the table's when expr is a
-        Max or Min (margin 2). Looks at the table candidate rather than calling
-        as_table, which would raise where the linear form must win. Raises
-        TableLoweringError when it has neither."""
+        """The node read linearly, by rule 3: linear when table is None; table when
+        linear is None; otherwise the one with fewer entries, table on a tie, and
+        linear only under half the table's entries when expr is a Max or Min
+        (margin 2). It builds nothing."""
 
 
 class TableLowering:
-    """One cost expression, lowered to tables and linear forms, then to CP-SAT."""
+    """Plans cost expressions as tables and linear forms. It holds no model, so the
+    walk cannot write to one, and it keeps nothing between calls of lower."""
 
-    def __init__(self, model: cp_model.CpModel, inputs: Inputs, cap: int) -> None:
-        """model receives the objective's variables; inputs maps each symbol to its
-        input and column; cap bounds one table."""
+    inputs: Inputs
+    cap: int
 
-    def lower(self, root: sympy.Basic) -> cp_model.LinearExprT:
-        """root as a CP-SAT objective in COST_SCALE units, in four steps.
+    def __init__(self, inputs: Inputs, *, cap: int) -> None:
+        """inputs gives each symbol's column on its input; cap bounds one table.
+        visit_op reads both."""
+
+    def tabulate(self, node: CpNode) -> CpTable | None:
+        """node's table from its children's tables: the cheaper, in entries, of one
+        table over its inputs and the form from its parts (rule 3). None when a child
+        has no table or neither fits the cap. It never raises for those: a
+        CpLinearNode may still have its linear form."""
+
+    def lower(self, root: sympy.Basic) -> CpLinear:
+        """root as a plan, the form the objective reads, in four steps.
 
         1. Normalize: sympy-to-sympy rewrites by xreplace. A relayout charge on a source
            this solve does not divide becomes 0. sympy returns a new expression; root is
            not changed.
-        2. Pass 1, over preorder_traversal, repeats kept: mark the nodes a linear reader
-           can reach.
-        3. Pass 2, the rewrite, over postorder_traversal: each sympy node, once, becomes
-           a CpLinearNode for an Add, Mul, Max, Min or RelayoutCharge and a CpNode
-           otherwise, holding its children's CpNodes, and its visit_op is called. Shared
-           subexpressions stay shared. A TableLoweringError from visit_op is re-raised
-           naming the sympy node.
-        4. Return the root's as_linear().cp_expr(model), which makes just the variables
-           that form requests.
+        2. List: sympy.postorder_traversal with its repeats dropped, so each distinct
+           node comes once, after its arguments.
+        3. Pass 1, over the list reversed: mark the nodes a linear reader can reach.
+        4. Pass 2, the rewrite, over the list: each sympy node but an ExprCondPair
+           becomes a CpLinearNode for an Add, Mul, Max, Min or RelayoutCharge and a
+           CpNode otherwise, holding its children's CpNodes, and its visit_op is
+           called. Shared subexpressions stay shared.
 
-        Every refusal raises TableLoweringError in steps 1 to 3, before any variable is
-        made, so the model is untouched when it raises.
+        Returns the root's as_linear(). The list, the marks and the CpNodes are local
+        to the call, so one TableLowering lowers any number of roots.
         """
+
+
+class CpEmitter:
+    """Builds a plan into one CP-SAT model: the only code that calls CP-SAT. It owns
+    the model and the memo, so a position, and a form, is built once per emitter."""
+
+    def __init__(self, model: cp_model.CpModel) -> None:
+        """model receives the objective's variables and constraints."""
+
+    def index(self, index: CpIndex) -> CpExpr:
+        """index's position as a CP-SAT expression: its mapping's cp_expr on its
+        parts' expressions, parts first. Built once per equal CpIndex."""
+
+    def table(self, values: np.ndarray, index: CpIndex) -> CpExpr:
+        """values[index] as a CP-SAT expression: the list rounded once onto
+        COST_SCALE, then a number when it is constant (a number's list, on the Unit
+        position, always is), a linear expression in self.index(index) when it is
+        affine, and otherwise one add_element on self.index(index) into a new variable
+        whose domain is the rounded values. Raises TableLoweringError for an entry
+        past 2^50."""
+
+    def linear(self, form: CpLinear) -> CpExpr:
+        """form as a CP-SAT expression in COST_SCALE units, built once per form: its
+        constant, plus self.table of each list, already summed per index, so a sum of
+        T lists and a constant is within (T + 1) / 2 units of its float value. Each
+        lin_min or lin_max is over operands behind proxy variables, and each switch
+        is one literal per factor value."""
 
 
 def lower_cost_with_tables(
@@ -920,26 +1076,59 @@ def lower_cost_with_tables(
     sym_map: Mapping[str, Any],
     buffer_map: Mapping[str, Any],
     cost_expr: sympy.Basic,
+    *,
     cap: int,
-) -> cp_model.LinearExpr:
-    """cost_expr as a CP-SAT objective in COST_SCALE units, from tables and linear forms.
-    Raises TableLoweringError, with the model untouched, when it cannot."""
+    emitter: type[CpEmitter] = CpEmitter,
+) -> CpExpr:
+    """cost_expr as a CP-SAT objective in COST_SCALE units, from tables and linear
+    forms; an int when the objective is constant.
+
+    Copies model, maps the inputs from the two maps, plans cost_expr with
+    TableLowering and builds the plan with emitter(model). When any of that fails, the
+    copy is swapped back, so model is as it was, and TableLoweringError is raised: from
+    the original exception when that was of another type."""
 ```
 
 The sketch is the public interface only: signatures and docstrings, with the bodies left
-to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for one, so a
-refusal leaves the model untouched. `cp_expr` makes them after the walk, when the
-objective's form requests them, each once. `Input`, `Combine`, `Compact` and `Extreme`
-subclass the abstract `IndexMap` and override its three members, so a step missing one
-cannot be made. Each `CpNode` holds its sympy node as `expr`, injected by the rewrite and
-only read, and its `visit_op` lowers it, dispatching on `expr`'s class. `TableLowering`
-normalizes the expression, marks linear reach and rewrites the graph; the sections below
-describe the rest. The order of the two passes, the `CpNode` classes and `tabulate`, the
-private helper `visit_op` calls, are the design, and the other names may change. `Inputs`
-is the map from each symbol to its input and column ("How a table maps onto CP-SAT"), and
-`sym_map` and `buffer_map` are the printer's two maps. With `Inputs` as an empty class
-the sketch passes mypy with torch-spyre's settings (`pyproject.toml:131`), the bodies
-being empty.
+to the stages. It has three layers:
+
+- **Values.** `CpIndex`, `CpLinear` and `CpTable` are frozen and hold no model. A
+  `CpIndex` computes its size from its parts and refuses parts its step does not take,
+  so a size or a stride is written once. A `CpLinear` marks its lists read-only, so a
+  reader that merges or scales a child's list makes a new one, and a `CpTable` is
+  constructed from `values` and `index` alone.
+- **The walk.** `TableLowering` holds the inputs and the cap. It has no model, so no
+  `visit_op` can write to one, and `lower` returns the plan.
+- **The build.** `CpEmitter` holds the model and the memo. Equal `CpIndex`es are one key,
+  so a position two terms share is built once, whether or not the walk made it as one
+  object.
+
+`Input`, `Locate`, `Unit`, `Combine`, `Compact` and `Extreme` subclass the abstract
+`IndexMap` and override its four members, so a step missing one cannot be made. A step's
+numpy side and its CP-SAT side take the same arguments, and `CpIndex.positions` and
+`CpEmitter.index` apply them over the same parts in the same order. Each `CpNode` holds
+its sympy node as `expr`, injected by the rewrite and only read, and its `visit_op`
+lowers it, dispatching on `expr`'s class. The order of the two passes, the `CpNode`
+classes and `tabulate` are the design, and the other names may change. `sym_map` and
+`buffer_map` are the printer's two maps, and the entry point maps them to `Inputs`: each
+symbol's column on its input ("How a table maps onto CP-SAT"). The sketch and the two
+examples below pass mypy 1.13 and 2.1.0, the version the repo pins, with torch-spyre's
+settings (`pyproject.toml:131`) and `empty-body` disabled: every docstring-only body
+trips that check, and nothing else is reported.
+
+**The copy.** `lower_cost_with_tables` copies the model with `model.clone()` before it
+maps an input. A refusal in the walk leaves nothing to undo, because the walk has no
+model. A failure in the build can come after variables were made: an entry past 2^50 is
+found only at the rounding. So on any failure the entry point swaps the copy back,
+`model.proto.copy_from(copy.proto)` then `model.rebuild_constant_map()`, and the
+caller's variables stay valid, since the copy holds them at the same indexes. The second
+call matters: without it a constant made during the failed build stays in the model's
+constant map, and the next use of that value is `MODEL_INVALID`. An exception that is
+not a `TableLoweringError` is re-raised as one from the original, so the solver's
+`except` (Decisions) sees no `RuntimeError`, `TypeError` or `ValueError` from the
+lowering, whichever library raised it. On the 50 replayed models, 35 to 7951 variables
+and 21 to 14,341 constraints, the copy takes 0.2 to 9 ms and the swap back at most
+12 ms.
 
 **Using the interfaces.** A caller needs only the entry point:
 
@@ -953,15 +1142,15 @@ Inside, `lower` builds the objects below. Here they are built by hand for the gr
 are the three buffers' division variables, already in `model`:
 
 ```python
-# positions: injected IndexMap steps over the inputs
-division_a = CpIndex(3, Input(div_a))
-division_b = CpIndex(2, Input(div_b))
-division_c = CpIndex(4, Input(div_c))
-pair = CpIndex(6, Combine(right_size=2), (division_a, division_b))  # 2*div_a + div_b
-rung_a = CpIndex(5, Compact((0, 0, 4)), (division_a,))
-rung_b = CpIndex(5, Compact((0, 3)), (division_b,))
-rung_c = CpIndex(5, Compact((0, 1, 1, 2)), (division_c,))
-rank = CpIndex(5, Extreme(is_max=True), (rung_a, rung_b, rung_c))
+# positions: IndexMap steps over the inputs; each size comes from its parts
+division_a = CpIndex(Input(div_a, size=3))
+division_b = CpIndex(Input(div_b, size=2))
+division_c = CpIndex(Input(div_c, size=4))
+pair = CpIndex(Combine(), (division_a, division_b))      # 2*div_a + div_b, size 6
+rung_a = CpIndex(Compact((0, 0, 4), size=5), (division_a,))
+rung_b = CpIndex(Compact((0, 3), size=5), (division_b,))
+rung_c = CpIndex(Compact((0, 1, 1, 2), size=5), (division_c,))
+rank = CpIndex(Extreme(is_max=True), (rung_a, rung_b, rung_c))
 
 # tables: a node's float values, made in numpy with their index
 split_a, split_b = np.array([1.0, 2.0, 4.0]), np.array([1.0, 3.0])
@@ -979,54 +1168,59 @@ form = CpLinear(lists={
 # form.lists[division_a] is about [8.0, 11.524, 16.639], added in float
 
 # the one rounding, and the only CP-SAT calls
-objective = form.cp_expr(model)
+objective = CpEmitter(model).linear(form)
 ```
 
-`form.cp_expr(model)` asks each list's index for its expression, making each position
-once: `div_a`, the linear `2 * div_a + div_b`, three `add_element` rung lookups and one
-`add_max_equality`. It then rounds each list and reads it with one `add_element`:
-`[8192, 11801, 17038]` on `div_a`, the product's six entries on the pair, and the
-ladder's five on the rank. The objective is the sum of the three targets, the model of
-the step-by-step table. Built in ortools as written, it gives 17566 at `div_a = 1`,
-`div_b = 1`, `div_c = 3` and is within 1.16 units of the float value at all 24
-assignments, the figures of that section.
+`CpEmitter(model).linear(form)` rounds each list and reads it with one `add_element` on
+the list's position: `[8192, 11801, 17038]` on `div_a`, the product's six entries on the
+pair, and the ladder's five on the rank. Each position is built once, when a list first
+reads it: `div_a`, the linear `2 * div_a + div_b`, three `add_element` rung lookups and
+one `add_max_equality`. The objective is the sum of the three targets, the model of the
+step-by-step table. With the bodies filled in as the docstrings say and run in ortools,
+it gives 17566 at `div_a = 1`, `div_b = 1`, `div_c = 3` and is within 1.16 units of the
+float value at all 24 assignments, the figures of that section; `form.entries` is 23,
+and `pair.positions` and `rank.positions` equal the CP-SAT positions at every
+assignment.
 
-Through the nodes, the same objective is `root.as_linear().cp_expr(model)`. The root is a
+Through the nodes, the same objective is
+`CpEmitter(model).linear(TableLowering(inputs, cap=8192).lower(root))`. The root is a
 `CpLinearNode` holding the Add, and `as_linear` on each of its four children returns the
-reads above: a `CpNode` holding each power, its step `np.power`, read as its table; and
-`CpLinearNode`s holding the product and the Max, each read as its table because rule 3
-prefers it. The Max's linear form, a `lin_max` over three operand lists of 3, 2 and 4
-entries, would need 9 entries against the table's 14. 9 is not under half of 14, so
-margin 2 keeps the table.
+reads above. `split_a ** 0.7` is a `CpNode`, its step `np.power`, read as its table. The
+other three are `CpLinearNode`s, each read as its table: `7 * split_a ** 0.5` on a tie,
+3 entries either way, and the product and the Max because rule 3 prefers it. The Max's
+linear form, a `lin_max` over three operand lists of 3, 2 and 4 entries, would need 9
+entries against the table's 14. 9 is not under half of 14, so margin 2 keeps the table.
 
 - **One `CpNode` per sympy node, in the same graph.** Pass 2 makes a node's `CpNode` from
   its children's, which it made earlier: a `CpLinearNode` for an Add, Mul, Max, Min or
   `RelayoutCharge`, and a `CpNode` for every other class. So the `CpNode`s form the sympy
-  graph again with their own edges, each holding its sympy node. `TableLowering` finds a
-  node's `CpNode` through a map keyed by the sympy node, which is hashable and compares
-  by structure, so a subexpression that two terms share is one `CpNode` that both parents
+  graph again with their own edges, each holding its sympy node. `lower` finds a node's
+  `CpNode` through a map keyed by the sympy node, which is hashable and compares by
+  structure, so a subexpression that two terms share is one `CpNode` that both parents
   hold: both read one list and one position. Every result lives on the `CpNode`. The
   expression is the same object, unchanged, after the lowering.
-- **Read as a table or linearly.** Pass 2 leaves each `CpNode` with a candidate table,
-  and a `CpLinearNode` also with a candidate linear form when it is marked. A parent
-  reads any child with `as_table` or `as_linear`; on any node but a `CpLinearNode`,
-  `as_linear` is its table as one list, or its constant,
-  and each read is made on first request and memoized: a node read both ways, such as a
-  Max under a power and a sum, makes both, and a candidate no parent reads goes no
-  further. A node left with neither candidate raises `TableLoweringError` at once,
-  naming that node and why (Decisions), so the error points at the innermost node that
-  failed.
-- **Pre-order, then post-order, no recursion.** Pass 1 keeps the repeats: pre-order
-  yields a shared node once under each parent, after that parent, which is what lets a
-  mark from its second parent reach its children. Pass 2 skips them: a node's first
-  post-order occurrence comes after its whole subtree, so its children's `CpNode`s exist
-  and are done. `lower` owns both walks. A method is handed a new `CpNode`, whose
-  `children` are done, and never walks. Stage 1's `numpy_value` is the pass 2 loop with
-  arrays for results.
-- **The walks are short.** On the 50 replayed objectives each yields 589 to 71,914
-  nodes, 3 to 11 per distinct node, in at most 0.1 s. Expressions are 6 to 17 deep, so
-  recursion would not overflow; the loops are chosen for clarity and so that no depth
-  can.
+- **Read as a table or linearly.** Pass 2 leaves each `CpNode` with its `table`, and a
+  marked `CpLinearNode` also with its `linear`. Both are fields, set by `visit_op`, and
+  `None` when the node has none. A parent reads a child's `table`, or reads it linearly
+  with `as_linear`; on any node but a `CpLinearNode`, `as_linear` is its table as one
+  list, or its constant. A read is a pick between the two and builds nothing: a node
+  read both ways, such as a Max under a power and a sum, has both, and a form no parent
+  reads goes no further. A node left with neither raises `TableLoweringError` at once,
+  with that node and the reason (Decisions), so the error points at the innermost node
+  that failed.
+- **One list, read both ways, no recursion.** `postorder_traversal` yields a node after
+  its arguments, and again under each further parent. `lower` keeps the first of each,
+  `list(dict.fromkeys(sympy.postorder_traversal(root)))`, so the list has every distinct
+  node once, after its whole subtree. Pass 2 iterates it: when a node is reached, its
+  children's `CpNode`s exist and are done. Pass 1 iterates it reversed, which puts every
+  parent before each of its children, so a shared node is reached once, after all of
+  its parents. `lower` owns the list and both loops. A method is handed a new `CpNode`,
+  whose `children` are done, and never walks. Stage 1's `numpy_value` is the pass 2 loop
+  with arrays for results.
+- **The list is short.** On the 50 replayed objectives it holds 110 to 11,020 nodes,
+  and making it and running pass 1 take at most 0.08 s. The traversal itself yields 589
+  to 71,914 nodes, 3 to 11 per distinct node. Expressions are 6 to 17 deep, so recursion
+  would not overflow; the loops are chosen for clarity and so that no depth can.
 - **Two classes, one dispatch.** The rewrite makes a `CpLinearNode` for an Add, Mul, Max,
   Min or `RelayoutCharge`, looking along the sympy node's class and its bases, and a
   `CpNode` for every other; `visit_op` then dispatches on `expr`'s class. The bases
@@ -1036,13 +1230,16 @@ margin 2 keeps the table.
   class too, through sympy's `Printer` (`cpsat_expr_printer.py:186`), but each of its
   methods prints its own arguments; a node only reads its children, which are already
   visited.
-- **Children.** A node's children are its arguments, with two exceptions. A Piecewise's
-  children are the values and conditions of its arms, and its numpy step is `np.select`;
-  `TableLowering` skips each arm's `ExprCondPair`, which gets no `CpNode`. A
-  `RelayoutCharge`'s children are its literal and its division, and its prices are data
-  its `visit_op` reads from `expr`'s arguments.
+- **Children.** A node's children are `children_of(expr)`: its arguments, with two
+  exceptions. A Piecewise's children are the values and conditions of its arms, and its
+  numpy step is `np.select`; pass 2 skips each arm's `ExprCondPair`, which gets no
+  `CpNode`. A `RelayoutCharge`'s children are its literal and its division, and its
+  prices are data its `visit_op` reads from `expr`'s arguments. A price is still a
+  number in the list, so it gets a `CpNode`, one value on the `Unit` position, that no
+  parent holds unless the same number is a child elsewhere. On the 50 replayed
+  objectives up to 2,942 nodes of one list are pairs or prices that no parent holds.
 - **No model.** The walk reads the expression, the inputs and the cap, and computes in
-  numpy. It adds nothing to the CP-SAT model and rounds nothing.
+  numpy. `TableLowering` has no model to add to, and it rounds nothing.
 
 ### Pass 1: the nodes a linear reader can reach
 
@@ -1051,16 +1248,20 @@ linear nodes only (see "How a table is read"). The first pass finds those nodes 
 any list is computed:
 
 ```python
+order = list(dict.fromkeys(sympy.postorder_traversal(root)))  # each node once
 linear_ok: set[sympy.Basic] = {root}                 # the objective reads the root
-for expr in sympy.preorder_traversal(root):           # parents first, repeats kept
+for expr in reversed(order):                          # every parent before its children
     if expr in linear_ok:
         linear_ok.update(linear_children(expr))       # see "Linear children" below
 ```
 
-- **Parents first, shared nodes included.** `preorder_traversal` repeats a shared node
-  under each parent, after that parent. When the mark reaches a shared node from its
-  second parent, that occurrence's subtree is walked again, so the mark still reaches
-  its children. A pre-order that skipped nodes it had seen would lose that mark.
+- **Every parent first.** `postorder_traversal` yields a node after its arguments, and
+  again under each further parent. `dict.fromkeys` keeps the first of those, so in
+  `order` a node comes once, before every one of its parents. Reversed, it comes after
+  all of them: when the loop reaches a node, every mark it can get is already there, and
+  one visit is enough. A pre-order cannot promise that. It reaches a shared node under
+  its first parent, before the second is seen, and has to walk the shared subtree again
+  to carry a later mark down. Pass 2 iterates the same `order` forward.
 - **Linear children.** A sum's terms, a Min/Max's operands, and a product's factors, any
   of which may be the rest of a switch (rule 4). Every other node passes no mark down:
   the children of a power, a log, a floor, a Piecewise, a relational or a function are
@@ -1077,16 +1278,18 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
   log of a sum, a Piecewise and a shared subexpression, at caps where the Max does and
   does not fit. Each case gives the same model both ways, and the pass leaves out 0 to 4
   linear forms per case that no reader used. The sketch has no switch, so it marks a
-  product's factor only when the other factors are constants. Pass 1 over
-  `preorder_traversal` and pass 2 over `postorder_traversal` give the same 13 models as
-  the recursive walk, and visit the roll-up's nodes in the same order.
+  product's factor only when the other factors are constants. Both passes over the one
+  list give the same 13 models as the recursive walk, and visit the roll-up's nodes in
+  the same order. On the 50 replayed objectives the reversed list gives the same marks
+  as `preorder_traversal` with its repeats kept.
 
 ### `tabulate` makes a node's table
 
-`CpNode.visit_op` makes a node's candidate `CpTable`, or none, through `tabulate`. The
-node's value is `values[index]`. The index is a `CpIndex`: an input, a combine, a
-compact, or a min or max of rungs, a recipe until its `cp_expr` makes the CP-SAT
-expression. A node is *tabulated* when it has its `CpTable`.
+`CpNode.visit_op` makes a node's `CpTable`, or none, through `TableLowering.tabulate`.
+The node's value is `values[index]`. The index is a `CpIndex`: a leaf step (`Input`,
+`Locate` or `Unit`), a combine, a compact, or a min or max of rungs. It is a value with
+no model in it, until `CpEmitter.index` builds the CP-SAT expression. A node is
+*tabulated* when it has its `CpTable`.
 
 Every list of the lowering is made here, and a list is never made without its index.
 `tabulate` is the "one operation, in one order" of the guarantees above.
@@ -1109,14 +1312,18 @@ Every list of the lowering is made here, and a list is never made without its in
 5. **The cheaper one.** The candidate with fewer entries is the table (rule 3). Its
    entries are its list plus the remaps under its index. A candidate's size is known
    before its list is computed, so one past the cap is never evaluated. With no
-   candidate under the cap it sets neither.
+   candidate under the cap the node has no table.
+
+`tabulate` returns `None` for a node with no table and does not raise: a `CpLinearNode`
+may still have its linear form. `visit_op` raises when the node ends with neither.
 
 ### A node that is not one list
 
-A sum, a product and a Min/Max can be read without being one list, so their classes give
-the node a second candidate beside the table, from `linear_form`. A *linear form*, a
-`CpLinear`, is a constant, one float list per index, and the `lin_min`, `lin_max` and
-switched terms inside it. It is float, as the tables are.
+A sum, a product and a Min/Max can be read without being one list, so a `CpLinearNode`
+has a second field beside `table`, its `linear`. A *linear form*, a `CpLinear`, is a
+constant, one float list per index, and the `lin_min`, `lin_max` and switched terms
+inside it. It is float, as the tables are, and frozen: merging two forms or scaling one
+makes a new form and leaves the children's lists as they were.
 
 | Node, `expr` | Table | Linear form |
 |---|---|---|
@@ -1129,49 +1336,56 @@ switched terms inside it. It is float, as the tables are.
 | `CpLinearNode`, a `RelayoutCharge` | the same; normalizing has made one on a source this solve does not divide the number 0 | its literal as a gate on the price list |
 
 - **The reader picks the read.** Pass 1 tells a node whether a linear reader can reach
-  it, but not which read that reader will make, so the `CpNode` keeps its candidates.
-  `tabulate` calls `as_table` on its children. A linear form calls `as_linear` on every
-  child: a `CpNode` returns its table as one list, or its constant, and a `CpLinearNode`
-  its own linear form or its table, whichever has fewer entries; a Min/Max keeps its
-  linear form only under half the entries of its table (rule 3). The objective reads the
-  root with `as_linear`. Only a `CpLinearNode` holding an Add, Mul, Max or Min calls
-  `as_linear` on its children; it and one holding a `RelayoutCharge` build a linear
-  candidate, on a marked node only. A `CpNode` holding any other operation calls
-  `as_table` only: under `Max(...) ** 0.5` the Max is read as its table, and a Max with
-  no table raises there.
-- **Multipliers go down in float.** Scaling a linear form multiplies its lists in numpy.
-  Through a `lin_min` or `lin_max` it scales the operands, and a negative factor turns
-  one into the other.
-- **Refusal.** A node can come back with no form. Its parent then has only the forms
-  that do not read it, which is how a relayout charge on a source this solve does not
-  divide becomes 0. When the root has no linear form, `lower_cost_with_tables` raises
-  `TableLoweringError` with the node that had no form and why: no table under the cap
-  and a nonlinear parent, a pair or fold past the cap, two factors too wide to pair, an
-  entry past 2^50, or a switched factor too wide for its precision. The model is
-  untouched, because the walk never wrote to it.
+  it, but not which read that reader will make, so the `CpNode` keeps both, `table` and
+  `linear`. `tabulate` reads `table` on its children. A linear form calls `as_linear` on
+  every child: a `CpNode` returns its table as one list, or its constant, and a
+  `CpLinearNode` its `linear` or its `table`, whichever has fewer entries, the table on
+  a tie; a Min/Max keeps its linear form only under half the entries of its table
+  (rule 3). The objective reads the root with `as_linear`. Only a `CpLinearNode` holding
+  an Add, Mul, Max or Min calls `as_linear` on its children; it and one holding a
+  `RelayoutCharge` build `linear`, on a marked node only. A `CpNode` holding any other
+  operation reads `table` only: under `Max(...) ** 0.5` the Max is read as its table,
+  and where the Max has none, the power has none either and raises.
+- **Multipliers go down in float.** Scaling a linear form makes a new form, its lists
+  multiplied in numpy. Through a `lin_min` or `lin_max` it scales the operands, and a
+  negative factor turns one into the other.
+- **Refusal.** A node that ends pass 2 with neither a table nor a linear form raises
+  `TableLoweringError` from its own `visit_op`, with itself as `node` and the reason: a
+  symbol with no input, no table under the cap and no linear reader, a child with no
+  table under a nonlinear node, a pair or fold past the cap, two factors too wide to
+  pair, or a switched factor too wide for its precision. Nothing is passed up for a
+  parent to work around; a relayout charge on a source this solve does not divide is
+  already the number 0, from the normalization. One refusal comes later, in the build:
+  an entry past 2^50, found at the rounding. Whichever it is, the entry point swaps its
+  copy of the model back before the error leaves (Decisions).
 
 This is the table of "Which form a node takes", read from the leaves up.
 
 ### From the walk to the model
 
-The walk ends with the root's `CpNode`. The last step of `lower` is the only code that
-calls CP-SAT, and it makes a variable only when a form requests it:
+The walk ends with the root's `CpNode`, and `lower` returns its `as_linear()`: the plan,
+a `CpLinear` with no model in it. `CpEmitter` is the only code that calls CP-SAT, and it
+builds a variable only when the plan reads it:
 
-1. **Request.** `root.as_linear().cp_expr(model)`. Each form pulls in what it reads,
-   and nothing else reaches the model: a table used only to compute a parent's table in
-   numpy, or a candidate no parent read, adds no variable.
-2. **Positions, on request.** `CpIndex.cp_expr` makes each position once and memoizes
-   it, through its injected `IndexMap`: an `Input` is its variable, a `Combine` is a
-   linear expression, a `Compact` is one `add_element`, and an `Extreme` is one
-   `lin_max` or `lin_min`. Its parts are made first, and interning makes a shared
-   position one object. The `IndexMap` is the seam: the table constraint is another
-   one, injected without a change to the walk.
-3. **Collapse, on request.** `CpLinear.cp_expr` rounds each list once and reads it with
+1. **Request.** `CpEmitter(model).linear(plan)`. Each form pulls in what it reads, and
+   nothing else reaches the model: a table used only to compute a parent's table in
+   numpy, or a form no parent read, adds no variable.
+2. **Positions, on request.** `CpEmitter.index` builds each position once, through its
+   `IndexMap`: an `Input` is its variable less its offset, a `Locate` is one
+   `add_element`, a `Unit` is 0, a `Combine` is a linear expression, a `Compact` is one
+   `add_element`, and an `Extreme` is one `lin_max` or `lin_min`. Its parts are built
+   first. The memo is the emitter's, keyed by the `CpIndex`, and equal indexes are one
+   key, so a position two terms share is built once.
+3. **Collapse, on request.** `CpEmitter.table` rounds each list once and reads it with
    one `add_element`. An affine list is a linear expression with no table, and a
    constant list is a number.
 
 Floats become integers in step 3. The one other place is the `p/q` of a switched
 factor (rule 4).
+
+The emitter is the seam for the table constraint. `AllowedEmitter` builds the same plan
+with `add_allowed_assignments`, and neither the walk nor a `CpIndex` changes for it
+("One constraint for both moves").
 
 ### The walk on the roll-up example
 
@@ -1240,8 +1454,8 @@ was visited once: 10 visits for an expression of 15 nodes.
 |---|---|
 | 1 | `numpy_value`, and its one-node step, which `visit_op` finds for each operation |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, `CpLinearNode`, `lower`'s normalization, pass 1 and rewrite, the `cp_expr` methods that make the model's variables, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
-| 4 | the table from a node's parts: rank and pair, a Max's or Min's table by rung, and the choice by entries |
+| 3 | `CpNode`, `CpLinearNode`, `lower`'s normalization, list, pass 1 and rewrite, `CpEmitter` and the steps `Input`, `Locate`, `Unit`, `Combine` and `Compact`, the entry point with its copy and swap back, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
+| 4 | the table from a node's parts: rank and pair, a Max's or Min's table by rung with `Extreme`, the choice by entries, and `AllowedEmitter` |
 | 5 | a Mul's table by fold |
 | 6 | the linear form of a Max or Min, and of a constant times one child in a Mul |
 | 7 | the switch and the gate in a Mul's linear form, and a `RelayoutCharge`'s gate |
@@ -1359,14 +1573,16 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 ### Stage 3: inputs, indexes, tables, linear sums
 
 - Architecture arrives: `CpNode` and `CpLinearNode` with `visit_op`, `lower` with its
-  normalization, pass 1 and rewrite, and the `cp_expr` methods. `tabulate` makes the
-  table of a leaf, of a node whose children share an index, and of a node whose inputs
-  fit one table. An Add and a `RelayoutCharge` get their linear forms.
-- Positions are made by injected `IndexMap` steps: `Input`, `Combine` and `Compact` here,
-  `Extreme` in Stage 4.
+  normalization, list, pass 1 and rewrite, and `CpEmitter`. `tabulate` makes the table
+  of a leaf, of a node whose children share an index, and of a node whose inputs fit one
+  table. An Add and a `RelayoutCharge` get their linear forms.
+- Positions are made by `IndexMap` steps: `Input`, `Locate`, `Unit`, `Combine` and
+  `Compact` here, `Extreme` in Stage 4. A `CpIndex` computes its size from its parts.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
-  their index. Any other variable is indexed by its domain, through a position lookup
-  when the domain has gaps. A domain past the cap is not an input.
+  their index. Any other variable is indexed by its domain: `Input` with its offset, or
+  `Locate`, a position lookup, when the domain has gaps. A domain past the cap is not an
+  input. Mapping the inputs adds nothing to the model: a `Locate`'s lookup is built by
+  the emitter, when a list reads it.
 - A node whose inputs fit the cap is one table over them, read through a joint index in
   the order `values_on_grid` uses.
 - The objective is a constant plus one list per index. Lists are collapsed here and
@@ -1374,8 +1590,9 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
   then the list is rounded once. A list affine in its index is a linear term with no
   table, and a constant list is a number.
 - The whole objective is planned before anything is added to the model.
-- `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap)` returns the
-  objective, or raises `TableLoweringError` with the model untouched.
+- `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=...)` copies the
+  model and returns the objective, an `int` when it is constant. On any failure it
+  swaps the copy back and raises `TableLoweringError`, and nothing else.
 
 After this stage a sum whose terms each fit one table is lowered exactly. Anything else
 raises. Nothing imports the module until Stage 8, so the raise reaches no compile.
@@ -1390,7 +1607,11 @@ Tests:
   `CpNode` for every other class, each holding its sympy node; `lower` does not change
   the expression passed in; an operation with no numpy function is evaluated through
   lambdify; a `CpNode` read with `as_linear` is its table as one list;
-- every list `tabulate` returns has the length of its index;
+- every list `tabulate` returns has the length of its index; a `CpIndex` refuses parts
+  its step does not take, a `CpTable` takes `values` and `index` only, and a list in a
+  form cannot be written to;
+- every index takes, at every assignment, the position `CpIndex.positions` gives; two
+  equal `CpIndex`es made apart are built once;
 - a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
 - a coefficient is applied before the rounding: `7 * split ** 0.5` at split 2 is 10137,
@@ -1399,14 +1620,19 @@ Tests:
   split 2 is one entry, 3112, not 1448 + 1663;
 - one table over two inputs of different sizes, for an expression that is not symmetric
   in them, is exact: a list and an index in different orders fail it;
-- a variable with gaps in its domain reads the entry of its value;
+- a variable with gaps in its domain reads the entry of its value, and so does one whose
+  domain starts above 0;
 - a Piecewise cost, a function with no numpy name and a relayout charge are exact;
 - two menu lengths on one division are refused; a variable with gaps in its domain gets a
   position; a domain past the cap is no input;
 - an affine list adds no table; a constant list adds no variable;
-- an entry too large for int64 sums is refused;
+- an entry too large for int64 sums is refused, also when other lists were built first;
 - a relayout of a buffer this solve does not divide costs 0;
-- an expression it cannot lower leaves the model's variables and constraints unchanged.
+- a failure in the walk or in the build leaves the model equal to its copy, and a
+  constant made during the failed build is not reused by the next one;
+- an exception of another type raised inside the lowering leaves as
+  `TableLoweringError`, with the original as its cause, and the error carries its `node`
+  and `reason`.
 
 ### Stage 4: rule 1 and parts
 
@@ -1419,8 +1645,8 @@ and the choice between the two.
 - A function of an indexed node keeps that node's index.
 - A node takes the cheaper of one table over its inputs and the form built from its parts
   (rule 3).
-- `Allowed(rows)`, one more `IndexMap`, builds a roll-up as one table constraint, for the
-  measurement in the last PR.
+- `AllowedEmitter`, a second emitter, builds the same plan with table constraints, its
+  rows read off `CpIndex.positions`, for the measurement in the last PR.
 
 Tests:
 
@@ -1432,8 +1658,9 @@ Tests:
 - equal values share a rank before pairing; a pair past the cap is refused;
 - a function of a short list adds no index;
 - the smaller form in entries wins, one case each way;
-- a three-buffer roll-up, a Max by rung times a ranked factor, is exact in both forms,
-  and its last lookup names no division.
+- a three-buffer roll-up, a Max by rung times a ranked factor, is exact under both
+  emitters, with the same cost at every assignment, and its last lookup names no
+  division.
 
 ### Stage 5: rule 2
 
@@ -1494,12 +1721,16 @@ for its factor's precision raises.
   `cpsat_table_lowering: bool = os.environ.get("CPSAT_TABLE_LOWERING", "0") == "1"` and
   `cpsat_table_cap: int` from `CPSAT_TABLE_CAP`, default 8192. Both names are public, so
   both enter the FX graph cache key: plans can differ between lowerings.
-- `cpsat_table_lowering.py`: `cost_expr_to_cpsat`, the tables only, reading
-  `config.cpsat_table_cap` when called. A refusal raises `TableLoweringError` with the
-  node and the reason; the printer is never called with the flag on.
 - `ilp_solver_ortools.py`: the printer's import (`:134`) is unchanged.
-  `_minimize_cost_expr` (`:865`) reads the flag when called and imports the table module
-  only when it is on.
+  `_minimize_cost_expr` (`:830`) reads the flag where it calls the printer (`:865`).
+  With the flag on it imports the table module there and calls
+  `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr,
+  cap=config.cpsat_table_cap)` instead; the printer is never called with the flag on.
+  The table module has one entry point and no function of the printer's name.
+- The call stays inside the `try`. A refusal is a `TableLoweringError` with the node and
+  the reason, and so is any other failure inside the lowering, so the `except` at `:886`
+  catches neither. A constant objective comes back as an `int`, which the guard at
+  `:866` already leaves out of `minimize`.
 - Docs: rows in the env var table of `docs/source/api/torch_spyre.rst`; the file table
   and objective paragraph in `docs/source/compiler/scratchpad_planning.md` (`:300`,
   `:636-648`); `docs/source/compiler/co_optimizer.md` (`:296`, `:424-431`).
@@ -1508,6 +1739,8 @@ Tests, with `config.patch` as the suites do:
 
 - flag on: an expression the tables cannot lower raises `TableLoweringError` out of the
   solve, and is not caught at `ilp_solver_ortools.py:886` into the traffic objective;
+- flag on: a `ValueError` raised inside the lowering (patched in) leaves the solve as
+  `TableLoweringError` too, and no traffic-objective solve follows;
 - flag off: a `CpSatLayoutSolver` solve never calls the table module (patched to raise);
 - flag on: the same solve never calls the printer, ends `OPTIMAL`, and its plan's exact
   cost is no higher than the printer's plan, within one `COST_SCALE` unit per table.
