@@ -623,7 +623,6 @@ from typing import Any
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
-from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 
 class TableLoweringError(Exception):
@@ -771,16 +770,41 @@ class CpIndex:
         memoized. Its parts are made first."""
 
 
-@dataclass(frozen=True, eq=False)
-class CpTable:
-    """A node read as a table: values[index], made together and never apart. Compared by
-    identity, values being an array."""
+@dataclass(eq=False, kw_only=True)
+class CpLinear:
+    """A node read linearly: the float form that cp_expr collapses into a CP-SAT
+    LinearExpr. Nothing in it is rounded until then. Compared by identity, its lists
+    being arrays."""
+
+    constant: float = 0.0
+    lists: dict[CpIndex, np.ndarray] = field(default_factory=dict)   # one list per index
+    extrema: list[tuple[bool, list[CpLinear]]] = field(default_factory=list)  # is_min, operands
+    switched: list[tuple[CpTable, CpLinear]] = field(default_factory=list)    # rule 4
+
+    @property
+    def entries(self) -> int:
+        """The entries its lists, operands and switches put in the model."""
+
+    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
+        """The form as a CP-SAT expression, made in model on the first call and
+        memoized. Each list, already summed per index, becomes
+        CpTable(values=list, index=index).cp_expr(model): the one rounding, so a sum of
+        T lists and a constant is within (T + 1) / 2 units of its float value. Each
+        lin_min or lin_max is over operands behind proxy variables, and each switch is
+        one literal per factor value."""
+
+
+@dataclass(eq=False, kw_only=True)
+class CpTable(CpLinear):
+    """A node read as a table: values[index], made together and never apart. It is also
+    a CpLinear, one list on one index, so a table is read linearly as it is."""
 
     values: np.ndarray                # the value at each position, float until collapsed
     index: CpIndex
 
     def __post_init__(self) -> None:
-        """Refuses a list whose length is not index.size."""
+        """Refuses a list whose length is not index.size, and sets lists to
+        {index: values}."""
 
     @property
     def entries(self) -> int:
@@ -790,37 +814,10 @@ class CpTable:
     def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
         """values[index] as a CP-SAT expression, made in model on the first call and
         memoized: the list rounded once onto COST_SCALE, then a number when it is
-        constant, a linear expression in index.cp_expr(model) when it is affine, and
-        otherwise one add_element on index.cp_expr(model) into a new variable whose
-        domain is the rounded values."""
-
-
-@dataclass
-class CpLinear:
-    """A node read linearly: the float form that cp_expr collapses into a CP-SAT
-    LinearExpr. Nothing in it is rounded until then."""
-
-    constant: float = 0.0
-    lists: dict[CpIndex, np.ndarray] = field(default_factory=dict)   # one list per index
-    extrema: list[tuple[bool, list[CpLinear]]] = field(default_factory=list)  # is_min, operands
-    switched: list[tuple[CpTable, CpLinear]] = field(default_factory=list)    # rule 4
-
-    @classmethod
-    def of(cls, table: CpTable) -> CpLinear:
-        """A table read linearly: CpLinear(lists={table.index: table.values}), or
-        CpLinear(constant=v) when the table is one value v on the Unit position."""
-
-    @property
-    def entries(self) -> int:
-        """The entries its lists, operands and switches put in the model."""
-
-    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
-        """The form as a CP-SAT expression, made in model on the first call and
-        memoized. Each list, already summed per index, becomes
-        CpTable(values, index).cp_expr(model): the one rounding, so a sum of T lists and
-        a constant is within (T + 1) / 2 units of its float value. Each lin_min or
-        lin_max is over operands behind proxy variables, and each switch is one literal
-        per factor value."""
+        constant (a number's table, on the Unit position, always is), a linear
+        expression in index.cp_expr(model) when it is affine, and otherwise one
+        add_element on index.cp_expr(model) into a new variable whose domain is the
+        rounded values. The case CpLinear.cp_expr reduces each list to."""
 
 
 @dataclass(eq=False)
@@ -855,7 +852,7 @@ class CpNode:
         """The node read as a table. Raises TableLoweringError when it has none."""
 
     def as_linear(self) -> CpLinear:
-        """The node read linearly: CpLinear.of(self.as_table())."""
+        """The node read linearly: as_table(), a CpTable being a CpLinear."""
 
 
 @dataclass(eq=False)
@@ -968,10 +965,10 @@ rank = CpIndex(5, Extreme(is_max=True), (rung_a, rung_b, rung_c))
 
 # tables: a node's float values, made in numpy with their index
 split_a, split_b = np.array([1.0, 2.0, 4.0]), np.array([1.0, 3.0])
-a_half = CpTable(split_a ** 0.5, division_a)
-a_07 = CpTable(split_a ** 0.7, division_a)
-product = CpTable(np.outer(9 * split_a ** -2.0, split_b ** 0.5).ravel(), pair)
-ladder = CpTable(np.array([1.0, 2 ** 0.25, 2 ** 0.5, 3 ** 0.5, 2.0]), rank)  # the Max
+a_half = CpTable(values=split_a ** 0.5, index=division_a)
+a_07 = CpTable(values=split_a ** 0.7, index=division_a)
+product = CpTable(values=np.outer(9 * split_a ** -2.0, split_b ** 0.5).ravel(), index=pair)
+ladder = CpTable(values=np.array([1.0, 2 ** 0.25, 2 ** 0.5, 3 ** 0.5, 2.0]), index=rank)
 
 # the tables read linearly and merged, as the Add's visit_op does: float, not rounded
 form = CpLinear(lists={
