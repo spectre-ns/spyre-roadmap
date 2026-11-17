@@ -604,6 +604,12 @@ sympy nodes are immutable, and the lowering never changes one. Each node it meet
 `CpNode`, its CP-SAT counterpart, which holds what the lowering knows about the node:
 
 ```python
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import sympy
+
+
 @dataclass
 class CpNode:
     """The CP-SAT counterpart of one sympy node, which it never changes."""
@@ -613,9 +619,22 @@ class CpNode:
     linear: Linear | None = None      # pass 2: linear, built only when linear_ok
     done: bool = False
 
+
+Visit = Callable[[CpNode, list[CpNode]], None]      # sets the node's table and/or linear
+
+
+def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]: ...
+def linear_children(expr: sympy.Basic) -> tuple[sympy.Basic, ...]: ...
+def add_linear(children: list[CpNode]) -> Linear: ...
+
+
 class TableLowering:
-    def lower(self, root):
-        self.nodes = {}                                  # sympy node -> CpNode
+    def __init__(self, inputs: Inputs, cap: int) -> None:
+        self.inputs = inputs
+        self.cap = cap
+        self.nodes: dict[sympy.Basic, CpNode] = {}   # sympy node -> CpNode
+
+    def lower(self, root: sympy.Basic) -> CpNode:
         self.cp(root).linear_ok = True                   # the objective reads it linearly
         for expr in sympy.preorder_traversal(root):      # pass 1: parents first
             if self.cp(expr).linear_ok:
@@ -629,27 +648,33 @@ class TableLowering:
                 node.done = True
         return self.cp(root)
 
-    def cp(self, expr):
+    def cp(self, expr: sympy.Basic) -> CpNode:
         return self.nodes.setdefault(expr, CpNode(expr))
 
-    def method_for(self, expr):                          # sympy.Add -> visit_Add
+    def method_for(self, expr: sympy.Basic) -> Visit:    # sympy.Add -> visit_Add
         for cls in type(expr).__mro__:                   # the class, then its bases
-            method = getattr(self, f"visit_{cls.__name__}", None)
+            method: Visit | None = getattr(self, f"visit_{cls.__name__}", None)
             if method is not None:
                 return method
         return self.generic_visit                        # Pow, log, floor, ...
 
-    def generic_visit(self, node, children):
+    def tabulate(self, expr: sympy.Basic, children: list[CpNode]) -> Table | None: ...
+
+    def generic_visit(self, node: CpNode, children: list[CpNode]) -> None:
         node.table = self.tabulate(node.expr, children)
 
-    def visit_Add(self, node, children):
+    def visit_Add(self, node: CpNode, children: list[CpNode]) -> None:
         node.table = self.tabulate(node.expr, children)
         if node.linear_ok:
             node.linear = add_linear(children)
 ```
 
 The code is a sketch. The order of the two passes, `CpNode` and `tabulate` are the
-design, and the other names may change.
+design, and the other names may change. `Table` is a float list and the index that reads
+it (`tabulate`, below), `Linear` a linear form ("A node that is not one list"), and
+`Inputs` the map from each symbol to its input and column ("How a table maps onto
+CP-SAT"). With those three as empty classes, the sketch passes `mypy --strict`, sympy
+being untyped and the helpers stubs.
 
 - **One `CpNode` per sympy node.** The map is keyed by the sympy node, which is hashable
   and compares by structure, so a subexpression that two terms share has one `CpNode`:
