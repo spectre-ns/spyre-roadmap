@@ -605,13 +605,12 @@ node's table: its float list and the index that reads it.
 
 sympy nodes are immutable, and the lowering never changes one. Each node it meets gets a
 `CpNode`, its CP-SAT counterpart. A parent reads it as a `CpTable` or as a `CpLinear`,
-and `CpBuild` turns what the objective reads into CP-SAT variables, each on first
-request:
+and each of those makes its CP-SAT variables itself, on first request:
 
 ```python
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -637,8 +636,8 @@ class CpIndex:
     left * right.size + right, a linear expression; a compact, remap[parent], one
     element lookup; a min or max of rungs, one lin_min or lin_max. Made from the inputs
     by these alone, so the final index of a term is a function of every input it was
-    made from. Equal by structure, so two nodes that make the same position share one
-    CpIndex, and CpBuild makes its expression once.
+    made from. The walk interns it: two nodes that make the same position get the same
+    CpIndex object, so its expression is made once.
     """
 
     size: int
@@ -647,6 +646,11 @@ class CpIndex:
                                               # min or max: the rungs
     remap: tuple[int, ...] = ()               # compact: parent position -> position
     var: cp_model.IntVar | None = None        # input: its variable, already in the model
+
+    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
+        """The position as a CP-SAT expression, made in model on the first call and
+        memoized: an input's variable, a combine's linear expression, a compact's
+        element lookup, or a min or max of rungs. Its parts are made first."""
 
 
 @dataclass(frozen=True)
@@ -667,7 +671,7 @@ class CpTable:
 
 @dataclass
 class CpLinear:
-    """A node read linearly, float until CpBuild collapses it."""
+    """A node read linearly, float until cp_expr collapses it."""
 
     constant: float = 0.0
     lists: dict[CpIndex, np.ndarray] = field(default_factory=dict)   # one list per index
@@ -677,6 +681,13 @@ class CpLinear:
     @property
     def entries(self) -> int:
         """The entries its lists, operands and switches put in the model."""
+
+    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
+        """The form as a CP-SAT expression, made in model on the first call and
+        memoized. Each list is collapsed once onto COST_SCALE and read with one element
+        lookup on its index's cp_expr: a number when the list is constant, a linear
+        expression when it is affine. Each lin_min or lin_max is over operands behind
+        proxy variables, and each switch is one literal per factor value."""
 
 
 @dataclass
@@ -701,28 +712,6 @@ class CpNode:
         when it has neither."""
 
 
-class CpBuild:
-    """Makes CP-SAT variables in one model when a form requests them, each once."""
-
-    def __init__(self, model: cp_model.CpModel) -> None:
-        """Holds the model and a memo per position, per lookup and per linear form."""
-
-    def index(self, index: CpIndex) -> cp_model.LinearExprT:
-        """The position as a CP-SAT expression, made on first request and memoized: an
-        input's variable, a combine's linear expression, a compact's element lookup, or
-        a min or max of rungs. Its parts are requested first."""
-
-    def lookup(self, index: CpIndex, table: Sequence[int]) -> cp_model.LinearExprT:
-        """table[index] as a CP-SAT term, made on first request and memoized by index and
-        table: a number when the table is constant, a linear expression when it is
-        affine, else one element lookup."""
-
-    def linear(self, form: CpLinear) -> cp_model.LinearExprT:
-        """The form as a CP-SAT expression: each list collapsed once onto COST_SCALE and
-        looked up, each lin_min or lin_max over operands behind proxy variables, each
-        switch. Memoized."""
-
-
 class TableLowering:
     """One cost expression, lowered to tables and linear forms, then to CP-SAT."""
 
@@ -739,8 +728,8 @@ class TableLowering:
         """
 
     def build_model(self, model: cp_model.CpModel, root: CpNode) -> cp_model.LinearExprT:
-        """CpBuild(model).linear(root.as_linear()): only the variables that form
-        requests are made."""
+        """root.as_linear().cp_expr(model): only the variables that form requests
+        are made."""
 
 
 def lower_cost_with_tables(
@@ -756,8 +745,9 @@ def lower_cost_with_tables(
 
 The sketch is the public interface only: signatures and docstrings, with the bodies left
 to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for one, so
-a refusal leaves the model untouched. `CpBuild` makes them after the walk, when the
-objective's form requests them, each once. Inside `TableLowering`, the dispatch to one method per node class, the
+a refusal leaves the model untouched. `cp_expr` makes them after the walk, when the
+objective's form requests them, each once. Inside `TableLowering`, the dispatch to one
+method per node class, the
 methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
 `visit_RelayoutCharge`), `tabulate` and the reader that applies rule 3 are private, and
 the sections below describe them. The order of the two passes, `CpNode` and `tabulate`
@@ -842,8 +832,8 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
 
 `tabulate(node, children)` makes the node's candidate `CpTable`, or none. The node's
 value is `values[index]`. The index is a `CpIndex`: an input, a combine, a compact, or
-a min or max of rungs, a recipe until `CpBuild` makes its CP-SAT expression. A node is
-*tabulated* when it has its `CpTable`.
+a min or max of rungs, a recipe until its `cp_expr` makes the CP-SAT expression. A node
+is *tabulated* when it has its `CpTable`.
 
 Every list of the lowering is made here, and a list is never made without its index.
 `tabulate` is the "one operation, in one order" of the guarantees above.
@@ -909,17 +899,17 @@ This is the table of "Which form a node takes", read from the leaves up.
 The walk ends with the root's `CpNode`. `build_model` is the only code that calls
 CP-SAT, and it makes a variable only when a form requests it:
 
-1. **Request.** `CpBuild(model).linear(root.as_linear())`. Each read pulls in what it
-   reads, and nothing else reaches the model: a table used only to compute a parent's
-   table in numpy, or a candidate no parent read, adds no variable.
-2. **Positions, on request.** `CpBuild.index` makes each `CpIndex` once and memoizes
+1. **Request.** `root.as_linear().cp_expr(model)`. Each form pulls in what it reads,
+   and nothing else reaches the model: a table used only to compute a parent's table in
+   numpy, or a candidate no parent read, adds no variable.
+2. **Positions, on request.** `CpIndex.cp_expr` makes each position once and memoizes
    it: an input is its variable, a combine is a linear expression, a compact is one
-   `add_element`, and a min or max of rungs is one constraint. Its parts are requested
-   first. This method is the one helper of Stage 3, so the table constraint replaces it
-   without a change to the walk.
-3. **Collapse, on request.** `CpBuild.lookup` rounds each list once and reads it with one
-   `add_element`, memoized by index and table. An affine list is a linear expression
-   with no table, and a constant list is a number.
+   `add_element`, and a min or max of rungs is one constraint. Its parts are made first,
+   and interning makes a shared position one object. This method is the one helper of
+   Stage 3, so the table constraint replaces it without a change to the walk.
+3. **Collapse, on request.** `CpLinear.cp_expr` rounds each list once and reads it with
+   one `add_element`. An affine list is a linear expression with no table, and a
+   constant list is a number.
 
 Floats become integers in step 3. The one other place is the `p/q` of a switched
 factor (rule 4).
