@@ -17,22 +17,6 @@ and `lin_min`/`lin_max`, and the printer takes an objective the tables cannot lo
 the flag off, every solve goes through the printer as it does on `main`. Table values are
 computed with numpy functions, and the code arrives in layers, each with its own tests.
 
-## Today
-
-#6315 lowers the objective with tables, and its results are what we want: on 50 captured
-objectives every solve is `OPTIMAL` and the objective is exact to 1.2e-7. How it is built
-is not what we want to land:
-
-1. **It evaluates through `sympy.lambdify`.** Python source is generated and exec'd for
-   each node it tables.
-2. **It is on the default path.** It replaces the printer's import at
-   `ilp_solver_ortools.py:134`, so every CP-SAT solve takes the tables.
-3. **It is one module built top-down.** Helpers, CP-SAT primitives and rules arrived
-   together, and tests reach most of it only through the entry point.
-
-This plan does not port that code. It states what each layer does, and the implementation
-is free to differ.
-
 ## Decisions (2026-11-16)
 
 - **numpy first, lambdify as the backup.** A generic evaluator finds each node's numpy
@@ -100,8 +84,8 @@ that turn out affine and cost nothing, so it runs high.
   least one term whose inputs pass the cap, and the lowering is all or nothing.
 - Entry count is decided in Stages 4 to 7, on 1 to 4 terms per objective.
 - Lowering time matters most where the model is smallest. At the default config a decode
-  block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. How much of that is
-  lambdify is not measured. Stage 1 is where it would be saved, and the last PR reports it.
+  block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. How much of that the
+  numpy evaluator of Stage 1 saves is not measured, and the last PR reports it.
 
 ## How a table is read
 
@@ -975,8 +959,9 @@ its factor's precision is refused.
   both enter the FX graph cache key: plans can differ between lowerings.
 - `cpsat_table_lowering.py`: `cost_expr_to_cpsat`, the tables or else the printer,
   reading `config.cpsat_table_cap` when called. It logs why the tables declined.
-- `ilp_solver_ortools.py`: line 134 stays as on `main`. `_minimize_cost_expr` (`:865`)
-  reads the flag when called and imports the table module only when it is on.
+- `ilp_solver_ortools.py`: the printer's import (`:134`) is unchanged.
+  `_minimize_cost_expr` (`:865`) reads the flag when called and imports the table module
+  only when it is on.
 - Docs: rows in the env var table of `docs/source/api/torch_spyre.rst`; the file table
   and objective paragraph in `docs/source/compiler/scratchpad_planning.md` (`:300`,
   `:636-648`); `docs/source/compiler/co_optimizer.md` (`:296`, `:424-431`).
