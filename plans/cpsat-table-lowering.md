@@ -900,6 +900,62 @@ its input and column ("How a table maps onto CP-SAT"), and `sym_map` and `buffer
 are the printer's two maps. With `Inputs` as an empty class the sketch passes mypy with
 torch-spyre's settings (`pyproject.toml:131`), the bodies being empty.
 
+**Using the interfaces.** A caller needs only the entry point:
+
+```python
+objective = lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=8192)
+model.minimize(objective)
+```
+
+Inside, `lower` builds the objects below. Here they are built by hand for the graph of
+"The process, step by step", with the values of its tables. `div_a`, `div_b` and `div_c`
+are the three buffers' division variables, already in `model`:
+
+```python
+# positions: injected IndexMap steps over the inputs
+division_a = CpIndex(3, Input(div_a))
+division_b = CpIndex(2, Input(div_b))
+division_c = CpIndex(4, Input(div_c))
+pair = CpIndex(6, Combine(right_size=2), (division_a, division_b))  # 2*div_a + div_b
+rung_a = CpIndex(5, Compact((0, 0, 4)), (division_a,))
+rung_b = CpIndex(5, Compact((0, 3)), (division_b,))
+rung_c = CpIndex(5, Compact((0, 1, 1, 2)), (division_c,))
+rank = CpIndex(5, Extreme(is_max=True), (rung_a, rung_b, rung_c))
+
+# tables: a node's float values, made in numpy with their index
+split_a, split_b = np.array([1.0, 2.0, 4.0]), np.array([1.0, 3.0])
+a_half = CpTable(split_a ** 0.5, division_a)
+a_07 = CpTable(split_a ** 0.7, division_a)
+product = CpTable(np.outer(9 * split_a ** -2.0, split_b ** 0.5).ravel(), pair)
+ladder = CpTable(np.array([1.0, 2 ** 0.25, 2 ** 0.5, 3 ** 0.5, 2.0]), rank)  # the Max
+
+# reading tables linearly: CpLinear arithmetic, in float, nothing rounded yet
+def read(t: CpTable) -> CpLinear:
+    return CpLinear(lists={t.index: t.values})
+
+form = 7 * read(a_half) + read(a_07) + read(product) + read(ladder)
+# form.lists[division_a] is about [8.0, 11.524, 16.639]: two terms, one list
+
+# the one rounding, and the only CP-SAT calls
+objective = form.cp_expr(model)
+```
+
+`form.cp_expr(model)` asks each list's index for its expression, making each position
+once: `div_a`, the linear `2 * div_a + div_b`, three `add_element` rung lookups and one
+`add_max_equality`. It then rounds each list and reads it with one `add_element`:
+`[8192, 11801, 17038]` on `div_a`, the product's six entries on the pair, and the
+ladder's five on the rank. The objective is the sum of the three targets, the model of
+the step-by-step table. Built in ortools as written, it gives 17566 at `div_a = 1`,
+`div_b = 1`, `div_c = 3` and is within 1.16 units of the float value at all 24
+assignments, the figures of that section.
+
+Through the nodes, the same objective is `root.as_linear().cp_expr(model)`. The root is
+a `CpLinearNode`, and `as_linear` on each of its four children returns the reads above:
+a plain `CpNode` for each power, read as its table; and `CpLinearNode`s for the product
+and the Max, each read as its table because rule 3 prefers it. The Max's linear form,
+a `lin_max` over three operand lists of 3, 2 and 4 entries, would need 9 entries
+against the table's 14. 9 is not under half of 14, so margin 2 keeps the table.
+
 - **One `CpNode` per sympy node, in the same graph.** Pass 2 makes a node's `CpNode` from
   its children's, which it made earlier: a `CpLinearNode` for Add, Mul, Min, Max and
   `RelayoutCharge`, a plain `CpNode` for every other class, so the `CpNode`s form the sympy graph again
