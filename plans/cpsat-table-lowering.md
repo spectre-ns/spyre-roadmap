@@ -32,6 +32,15 @@ computed with numpy functions, and the code arrives in layers, each with its own
   every parent before its children and marks the nodes a linear reader can reach. The
   visitor then visits each node after its arguments, and one function, `tabulate`,
   realizes a node. See Architecture.
+- **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
+  `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
+  #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
+  each rule's solve time against margin 2's: always `lin_max` 1.35 to 1.52 times
+  (slower on 39 to 43 of them); margin 1, linear whenever it has fewer entries, 0.99 on
+  average but 1.22 in total, with the GQA test at 137 s against 82 s; a table whenever
+  one fits 2.07 on the 14 objectives it changes, `main.caps/compile_0` 24 times. An
+  exact-domain `lin_max` target and `linearization_level` 2 were within run-to-run
+  noise. All reach the same optimal cost.
 
 ## Estimates
 
@@ -1011,7 +1020,9 @@ the table.
   collapsed. A negative one turns Min into Max.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
   `lin_max`, CP-SAT's presolve ran out of memory (`bad_alloc` past 40 GB on a Qwen3 0.6B
-  prefill objective).
+  prefill objective). The proxies also carry the speed: without them, margin 2 solves
+  1.5 times slower on average and up to 29 times, and 7 of the 46 objectives above do
+  not solve in 60 s or crash.
 
 Tests: a Min of two sums of residency literals stays linear and is exact, with no table
 over its inputs; a near tie keeps the table; a negative coefficient gives a `lin_max`;
