@@ -404,18 +404,24 @@ whose variables fit the cap together.
 
 ### Which form a node takes
 
-```mermaid
-flowchart TD
-    S["a node of the objective"] --> Q1{"a sum?"}
-    Q1 -- yes --> A1["stays linear<br/>each term lowered on its own,<br/>lists on one index added"]
-    Q1 -- no --> Q2{"can it be one list?"}
-    Q2 -- yes --> A2["its inputs fit one table,<br/>or its parts give a shorter list<br/>(rules 1, 2, 3)<br/>collapse it: one element lookup"]
-    Q2 -- no --> Q3{"Min or Max?"}
-    Q3 -- yes --> A3["kept linear, when every node above it is linear<br/>lin_min or lin_max over its operands"]
-    Q3 -- no --> Q4{"a product?"}
-    Q4 -- yes --> A4["rule 4: switched on a factor<br/>a 0/1 literal is a gate"]
-    Q4 -- no --> A5["not lowered<br/>the printer takes the whole objective"]
-```
+Every node is tabulated, linear, or both. There is no third form and no partial
+lowering: when the objective cannot be read from tables and linear forms alone, the
+printer takes the whole expression.
+
+| A table of it fits the cap | It is linear, under linear nodes only | The node |
+|---|---|---|
+| yes | no | tabulated: a float list on an index |
+| no | yes | linear |
+| yes | yes | both forms; its reader picks one (rule 3) |
+| no | no | no form, so neither has its parent. At the root, the printer takes the whole expression |
+
+- *A table* is one table over the node's inputs, or the form from its parts: a rank, a
+  pair, a Min/Max by rung, a fold (rules 1 to 3).
+- *Linear* nodes are a sum, a constant times one child, a Min/Max kept as a
+  `lin_min`/`lin_max`, and a product switched on one factor's values (rule 4). Pass 1
+  of Architecture marks the nodes that only linear nodes sit above.
+- The objective reads the root's linear form. A root with only a table is one linear
+  term, a single lookup.
 
 ## How a table maps onto CP-SAT
 
@@ -709,7 +715,7 @@ tables are.
   None and the printer takes the whole objective. The model is untouched, because the
   walk never wrote to it.
 
-This is the chart of "Which form a node takes", read from the leaves up.
+This is the table of "Which form a node takes", read from the leaves up.
 
 ### From the walk to the model
 
