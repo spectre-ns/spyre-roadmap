@@ -115,8 +115,9 @@ The four rules that keep lists short:
 
 ## The process, step by step
 
-numpy computes every value before the solve, in float. CP-SAT computes only where to
-look. The two meet at one constraint per linear term.
+Before the solve starts, numpy computes every cost value in floating point. CP-SAT never
+evaluates the expression. It works out which entry of each table applies, and one
+`add_element` constraint per linear term reads that entry.
 
 ```mermaid
 flowchart LR
