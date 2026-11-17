@@ -13,8 +13,9 @@ Short paths: `config.py` and `cost_model.py` are under `torch_spyre/_inductor/`.
 When the last PR of this plan merges, torch-spyre has a table lowering of the CP-SAT cost
 objective behind `config.cpsat_table_lowering`, off by default, that reproduces #6315's
 results. With the flag on, the objective is built from exact element tables, linear sums
-and `lin_min`/`lin_max`, and the printer takes an objective the tables cannot lower. With
-the flag off, every solve goes through the printer as it does on `main`. Table values are
+and `lin_min`/`lin_max`. An objective the tables cannot lower raises, and never reaches
+the printer. With the flag off, every solve goes through the printer as it does on
+`main`. Table values are
 computed with numpy functions, and the code arrives in layers, each with its own tests.
 
 ## Decisions (2026-11-16)
@@ -41,6 +42,15 @@ computed with numpy functions, and the code arrives in layers, each with its own
   one fits 2.07 on the 14 objectives it changes, `main.caps/compile_0` 24 times. An
   exact-domain `lin_max` target and `linearization_level` 2 were within run-to-run
   noise. All reach the same optimal cost.
+
+- **Raise when the cap is hit (2026-11-17).** With the flag on there is no fallback. An
+  objective the tables cannot lower raises `TableLoweringError`, naming the node and the
+  reason, with the model untouched. The printer cannot stand in: on the replay it fails
+  every auto-tiling objective (`calling ** on a linear expression`), and when it fails,
+  `main` solves a traffic objective that ignores the cost model with every relayout copy
+  pinned out (`ilp_solver_ortools.py:886`, `:1449`). `TableLoweringError` subclasses none
+  of `RuntimeError`, `TypeError` or `ValueError`, so that `except` cannot turn it into
+  that solve. At #6315's tip all 50 replayed objectives lower without a refusal.
 
 ## Estimates
 
@@ -120,7 +130,7 @@ that turn out affine and cost nothing, so it runs high.
   factor's value is fixed. `Max(...) ** 0.5` is not: CP-SAT has no root of a `lin_max`.
   Neither is a log, a floor, a division by the Min/Max or a condition on it. Under such
   a node the Min/Max must be a table, by rung or over its inputs, and when neither fits
-  the cap the printer takes the whole objective.
+  the cap the lowering raises (Decisions).
 - Lists are float from the leaves up. CP-SAT holds positions only, until a list is
   collapsed into a linear term (next section).
 
@@ -413,16 +423,16 @@ whose variables fit the cap together.
 
 ### Which form a node takes
 
-Every node is tabulated, linear, or both. There is no third form and no partial
-lowering: when the objective cannot be read from tables and linear forms alone, the
-printer takes the whole expression.
+Every node is tabulated, linear, or both. There is no third form, no partial lowering
+and no fallback: when the objective cannot be read from tables and linear forms alone,
+the lowering raises.
 
 | A table of it fits the cap | It is linear, under linear nodes only | The node |
 |---|---|---|
 | yes | no | tabulated: a float list on an index |
 | no | yes | linear |
 | yes | yes | both forms; its reader picks one (rule 3) |
-| no | no | no form, so neither has its parent. At the root, the printer takes the whole expression |
+| no | no | no form, so neither has its parent. At the root, the lowering raises `TableLoweringError` |
 
 - *A table* is one table over the node's inputs, or the form from its parts: a rank, a
   pair, a Min/Max by rung, a fold (rules 1 to 3).
@@ -720,9 +730,11 @@ tables are.
   one into the other.
 - **Refusal.** A node can come back with no form. Its parent then has only the forms
   that do not read it, which is how a relayout charge on a source this solve does not
-  divide becomes 0. When the root has no linear form, `lower_cost_with_tables` returns
-  None and the printer takes the whole objective. The model is untouched, because the
-  walk never wrote to it.
+  divide becomes 0. When the root has no linear form, `lower_cost_with_tables` raises
+  `TableLoweringError` with the node that had no form and why: no table under the cap
+  and a nonlinear parent, a pair or fold past the cap, two factors too wide to pair, an
+  entry past 2^50, or a switched factor too wide for its precision. The model is
+  untouched, because the walk never wrote to it.
 
 This is the table of "Which form a node takes", read from the leaves up.
 
@@ -814,7 +826,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 | 5 | `tabulate` from a node's parts: the fold |
 | 6 | the linear form of `visit_Min` and `visit_Max`, and a constant times one child in `visit_Mul` |
 | 7 | the switch and the gate in `visit_Mul`, and the gate of `visit_RelayoutCharge` |
-| 8 | nothing: the flag chooses between this visitor and the printer |
+| 8 | nothing: the flag chooses between this visitor and the printer, and a refusal raises |
 
 ## Stages
 
@@ -830,7 +842,7 @@ each on the one before.
 | 5 | rule 2: fold of Min/Max factors over shared inputs | yes |
 | 6 | rule 3 in the objective: linear Min/Max where the table is larger | yes |
 | 7 | rule 4: switched products and literal gates | yes |
-| 8 | `config.cpsat_table_lowering`, the solver's choice, printer fallback, docs | yes |
+| 8 | `config.cpsat_table_lowering`, the solver's choice, the raise on a refusal, docs | yes |
 
 In the tests below, *exact* means: at every assignment of the inputs the lowered
 objective is solved by minimizing and by maximizing. Both are feasible, they agree, and
@@ -942,10 +954,10 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
   table, and a constant list is a number.
 - The whole objective is planned before anything is added to the model.
 - `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap)` returns the
-  objective, or None with the model untouched.
+  objective, or raises `TableLoweringError` with the model untouched.
 
 After this stage a sum whose terms each fit one table is lowered exactly. Anything else
-returns None.
+raises. Nothing imports the module until Stage 8, so the raise reaches no compile.
 
 Tests:
 
@@ -1028,8 +1040,8 @@ Tests: a Min of two sums of residency literals stays linear and is exact, with n
 over its inputs; a near tie keeps the table; a negative coefficient gives a `lin_max`;
 a fractional coefficient on a linear Min is within the largest operand's bound; each
 operand is a single variable; a Max too wide to index under a power, a log or a division
-is refused with the model untouched, and the same Max under a sum, a constant and a Min
-stays linear.
+raises with the model untouched, and the same Max under a sum, a constant and a Min stays
+linear.
 
 ### Stage 7: rule 4
 
@@ -1047,8 +1059,8 @@ stays linear.
 Tests: a fractional factor times a sum of lists with fractional entries is within the
 rule 4 bound; a factor times a Min too wide to pair is exact, also inside a Min; a relayout
 charge and a gated term are exact with no table larger than the menu; a constant rest adds
-no table; two wide factors are refused with the model untouched; a product too wide for
-its factor's precision is refused.
+no table; two wide factors raise with the model untouched; a product too wide for its
+factor's precision raises.
 
 ### Stage 8: the flag
 
@@ -1057,8 +1069,9 @@ its factor's precision is refused.
   `cpsat_table_lowering: bool = os.environ.get("CPSAT_TABLE_LOWERING", "0") == "1"` and
   `cpsat_table_cap: int` from `CPSAT_TABLE_CAP`, default 8192. Both names are public, so
   both enter the FX graph cache key: plans can differ between lowerings.
-- `cpsat_table_lowering.py`: `cost_expr_to_cpsat`, the tables or else the printer,
-  reading `config.cpsat_table_cap` when called. It logs why the tables declined.
+- `cpsat_table_lowering.py`: `cost_expr_to_cpsat`, the tables only, reading
+  `config.cpsat_table_cap` when called. A refusal raises `TableLoweringError` with the
+  node and the reason; the printer is never called with the flag on.
 - `ilp_solver_ortools.py`: the printer's import (`:134`) is unchanged.
   `_minimize_cost_expr` (`:865`) reads the flag when called and imports the table module
   only when it is on.
@@ -1068,7 +1081,8 @@ its factor's precision is refused.
 
 Tests, with `config.patch` as the suites do:
 
-- an expression the tables cannot lower goes to the printer;
+- flag on: an expression the tables cannot lower raises `TableLoweringError` out of the
+  solve, and is not caught at `ilp_solver_ortools.py:886` into the traffic objective;
 - flag off: a `CpSatLayoutSolver` solve never calls the table module (patched to raise);
 - flag on: the same solve never calls the printer, ends `OPTIMAL`, and its plan's exact
   cost is no higher than the printer's plan, within one `COST_SCALE` unit per table.
@@ -1103,7 +1117,9 @@ After Stage 8, posted on that PR:
    `test_scratchpad_solver.py`, `test_scratchpad_use.py`, `test_cost_model_replication.py`
    and `test_solver_relayout_decision.py`. #6315's CI ran every shard with the tables on
    the default path and all passed; its one red job was a card fault
-   (`DdrInitRetryLimitExceeded`).
+   (`DdrInitRetryLimitExceeded`). No suite and none of the 50 replayed objectives may
+   raise `TableLoweringError`: a refusal fails the run, since with the flag on it fails a
+   compile.
 4. **Flag off.** The same suites with no flag, unchanged.
 
 ## Next step
