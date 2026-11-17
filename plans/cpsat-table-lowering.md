@@ -236,7 +236,7 @@ How each node is collapsed:
 | `split_c ** 0.25` | 2 | 1, 1.1892, 1.1892, 1.4142 | `division_c` | nothing |
 | the product | 3 | 9, 15.5885, 2.25, 3.8971, 0.5625, 0.9743 | `pair` | `pair == 2*division_a + division_b` |
 | the Max | 4 | the ladder: 1, 1.1892, 1.4142, 1.7321, 2 | `rank` | three rung lookups, 3 + 2 + 4 entries, and `rank == max(rung_a, rung_b, rung_c)` |
-| the sum | 5 | none: it stays linear | | three tables, 3 + 6 + 5 entries, and three lookups |
+| the sum | 5 | none: it stays linear | None (CP-SAT) | three tables, 3 + 6 + 5 entries, and three lookups |
 
 Every node below the sum ends inside one of three lists, and the collapse makes each of
 them one integer table. These are the only tables that hold a cost:
