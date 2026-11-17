@@ -32,7 +32,8 @@ computed with numpy functions, and the code arrives in layers, each with its own
 - **Two passes: parents first, then children first (2026-11-17).** A first pass visits
   every parent before its children and marks the nodes a linear reader can reach. The
   visitor then visits each node after its arguments, and one function, `tabulate`,
-  realizes a node. See Architecture.
+  realizes a node. Both passes iterate over one `sympy.preorder_traversal` list, forward
+  and then reversed; nothing recurses. See Architecture.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
   #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
@@ -591,24 +592,23 @@ assignment of the inputs, so an entry read from the wrong position fails.
 
 ## Architecture
 
-The lowering is two passes over the cost expression. The first goes from the root down,
-every parent before its children, and marks each node that a linear reader can reach.
-The second is a visitor that visits each node depth first, the arguments before the
-node, so everything under a node is realized before the node is. One function,
+The lowering is two passes over one list, `sympy.preorder_traversal` of the cost
+expression, with no recursion. The first walks the list forward, every parent before its
+children, and marks each node that a linear reader can reach. The second walks it
+reversed, so every node's arguments are realized before the node is. One function,
 `tabulate`, realizes a node: it returns the node's float list and the index that reads
 it.
 
 ```python
 class TableLowering:
     def lower(self, root):
-        self.linear_ok = mark_linear(root)                         # pass 1: parents first
-        return self.visit(root)                                     # pass 2: children first
-
-    def visit(self, node):
-        if node not in self.forms:                                  # each node once
-            children = [self.visit(arg) for arg in children_of(node)]  # depth first
-            self.forms[node] = self.method_for(node)(node, children)
-        return self.forms[node]
+        order = list(sympy.preorder_traversal(root))  # parents before children
+        self.linear_ok = mark_linear(root, order)                   # pass 1: forward
+        for node in reversed(order):                                # pass 2: reversed
+            if node not in self.forms:                              # each node once
+                children = [self.forms[arg] for arg in children_of(node)]
+                self.forms[node] = self.method_for(node)(node, children)
+        return self.forms[root]
 
     def generic_visit(self, node, children):
         return Forms(table=self.tabulate(node, children))           # realize the node
@@ -621,9 +621,15 @@ class TableLowering:
 The code is a sketch. The order of the two passes and `tabulate` are the design, and the
 other names may change.
 
-- **Depth first, post-order.** `visit` owns the descent. A method is handed its node and
-  its children's results, and never visits. Stage 1's `numpy_value` is the same walk
-  with arrays for results.
+- **Reversed pre-order, no recursion.** `preorder_traversal` yields a shared node once
+  under each parent. Reversed, a node's first encounter is its last occurrence in
+  pre-order, which comes after every occurrence of its arguments, so their results are
+  ready. `lower` owns the walk. A method is handed its node and its children's results,
+  and never walks. Stage 1's `numpy_value` is the same loop with arrays for results.
+- **The list is small.** On the 50 replayed objectives it holds 589 to 71,914
+  occurrences, 3 to 11 per distinct node, and takes at most 0.1 s to build. Expressions
+  are 6 to 17 deep, so recursion would not overflow; the loop is chosen for clarity and
+  so that no depth can.
 - **Each node once.** Results are kept by node. A subexpression that two terms share is
   visited once, and both terms read one list and one position.
 - **One method per class.** `method_for` looks for `visit_<Class>` along the node's class
@@ -632,8 +638,10 @@ other names may change.
   way through sympy's `Printer` (`cpsat_expr_printer.py:186`), but each of its methods
   prints its own arguments.
 - **Children.** A node's children are its arguments, with two exceptions. A Piecewise's
-  children are the values and conditions of its arms. A `RelayoutCharge`'s children are
-  its literal and its division, and its prices are data.
+  children are the values and conditions of its arms; the list also holds each arm's
+  `ExprCondPair`, which has no form of its own. A `RelayoutCharge`'s children are its
+  literal and its division; its prices are numbers in the list, and its method does not
+  read them.
 - **No model.** The walk reads the expression, the inputs and the cap, and computes in
   numpy. It adds nothing to the CP-SAT model and rounds nothing.
 
@@ -644,19 +652,19 @@ linear nodes only (see "How a table is read"). The first pass finds those nodes 
 any list is computed:
 
 ```python
-def mark_linear(root):
+def mark_linear(root, order):
     ok = {root: True}                                  # the objective reads the root linearly
-    for node in reversed(post_order(root)):            # every parent before its children
+    for node in order:                                 # preorder_traversal: parents first
         if ok.get(node):
             for child in linear_children(node):
                 ok[child] = True
     return ok
 ```
 
-- **Parents first.** Reverse post-order puts every parent of a node before the node,
-  shared nodes included. A pre-order walk that visits each node once does not: a node
-  shared by two terms is reached from the first term, and the mark the second term would
-  pass down comes too late.
+- **Parents first, shared nodes included.** `preorder_traversal` repeats a shared node
+  under each parent, after that parent. When the mark reaches a shared node from its
+  second parent, that occurrence's subtree is walked again, so the mark still reaches
+  its children. A pre-order that skipped nodes it had seen would lose that mark.
 - **Linear children.** A sum's terms, a Min/Max's operands, and a product's factors, any
   of which may be the rest of a switch (rule 4). Every other node passes no mark down:
   the children of a power, a log, a floor, a Piecewise, a relational or a function are
@@ -672,7 +680,9 @@ def mark_linear(root):
   log of a sum, a Piecewise and a shared subexpression, at caps where the Max does and
   does not fit. Each case gives the same model both ways, and the pass leaves out 0 to 4
   linear forms per case that no reader used. The sketch has no switch, so it marks a
-  product's factor only when the other factors are constants.
+  product's factor only when the other factors are constants. Both passes driven by
+  `preorder_traversal`, forward then reversed, give the same 13 models as the recursive
+  walk.
 
 ### `tabulate` realizes a node
 
@@ -758,53 +768,55 @@ factor (rule 4).
 ### The walk on the roll-up example
 
 `Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)`, over the menus of the graph
-example. Each node shows its place in the visit order and the list
-`tabulate` returned for it. sympy orders the arguments, so the sum comes first.
+example. Each node shows its place in the order pass 2 realizes it and the list
+`tabulate` returned for it. sympy puts the sum first among the product's arguments, so
+in the reversed pre-order the Max's subtree is realized first.
 
 ```mermaid
 flowchart TD
     N13["visit 13, Mul<br/>nine values on pair"]
-    N5["visit 5, Add: 1 + 1/split_c<br/>2, 1.5, 1.5, 1.25 on division_c"]
-    N12["visit 12, Max<br/>1, 1.7321, 1, 1.7321, 2, 2<br/>on 2*division_a + division_b"]
-    N1["visit 1, number 1"]
-    N4["visit 4, Pow: 1/split_c<br/>1, 0.5, 0.5, 0.25 on division_c"]
-    N2["visit 2, Symbol: split_c<br/>1, 2, 2, 4 on division_c"]
-    N3["visit 3, number -1"]
-    N8["visit 8, Pow: split_b ** 0.5<br/>1, 1.7321 on division_b"]
-    N11["visit 11, Mul: split_a / 2<br/>0.5, 1, 2 on division_a"]
-    N6["visit 6, Symbol: split_b<br/>1, 3 on division_b"]
-    N7["visit 7, number 0.5"]
-    N9["visit 9, number 1/2"]
-    N10["visit 10, Symbol: split_a<br/>1, 2, 4 on division_a"]
-    N13 --> N5
+    N12["visit 12, Add: 1 + 1/split_c<br/>2, 1.5, 1.5, 1.25 on division_c"]
+    N7["visit 7, Max<br/>1, 1.7321, 1, 1.7321, 2, 2<br/>on 2*division_a + division_b"]
+    N11["visit 11, number 1"]
+    N10["visit 10, Pow: 1/split_c<br/>1, 0.5, 0.5, 0.25 on division_c"]
+    N9["visit 9, Symbol: split_c<br/>1, 2, 2, 4 on division_c"]
+    N8["visit 8, number -1"]
+    N6["visit 6, Pow: split_b ** 0.5<br/>1, 1.7321 on division_b"]
+    N3["visit 3, Mul: split_a / 2<br/>0.5, 1, 2 on division_a"]
+    N5["visit 5, Symbol: split_b<br/>1, 3 on division_b"]
+    N4["visit 4, number 0.5"]
+    N2["visit 2, number 1/2"]
+    N1["visit 1, Symbol: split_a<br/>1, 2, 4 on division_a"]
     N13 --> N12
-    N5 --> N1
-    N5 --> N4
-    N4 --> N2
-    N4 --> N3
-    N12 --> N8
+    N13 --> N7
     N12 --> N11
-    N8 --> N6
-    N8 --> N7
-    N11 --> N9
-    N11 --> N10
+    N12 --> N10
+    N10 --> N9
+    N10 --> N8
+    N7 --> N6
+    N7 --> N3
+    N6 --> N5
+    N6 --> N4
+    N3 --> N2
+    N3 --> N1
 ```
 
 | Visit | Case of `tabulate` | Result |
 |---|---|---|
-| 1 to 11 | a leaf, or children on one index | a list on `division_c`, `division_b` or `division_a`, with nothing added |
-| 12, the Max | several indexes | one table: 6 entries, against 8 by rung (a ladder of 3, rungs of 3 and 2) |
+| 1 to 6, 8 to 12 | a leaf, or children on one index | a list on `division_a`, `division_b` or `division_c`, with nothing added |
+| 7, the Max | several indexes | one table: 6 entries, against 8 by rung (a ladder of 3, rungs of 3 and 2) |
 | 13, the product | several indexes | from its parts: each child ranked to 3 distinct values and paired, 19 entries against 24 for one table |
 
 The collapsed table holds nine entries, in sympy's argument order:
 `[1280, 2217, 2560, 1536, 2660, 3072, 2048, 3547, 4096]`.
 
-**What depth first costs.** Rule 3 is applied at the node, before its parent is visited.
-At visit 12 one table is the cheaper list for the Max. Its parent then ranks that list
-with a 6-entry remap, where rungs would have cost 5 and needed no rank: 19 entries
-against 18 for the Max by rung, paired with the ranked factor. The walk could instead keep both
-candidates on a node for its reader to choose, since nothing is in the model yet. The
-plan starts with the rule at the node, and the last PR reports entries per capture.
+**What deciding at the node costs.** Rule 3 is applied at the node, before its parent is
+realized. At visit 7 one table is the cheaper list for the Max. Its parent then ranks
+that list with a 6-entry remap, where rungs would have cost 5 and needed no rank: 19
+entries against 18 for the Max by rung, paired with the ranked factor. The walk could
+instead keep both candidates on a node for its reader to choose, since nothing is in the
+model yet. The plan starts with the rule at the node, and the last PR reports entries
+per capture.
 
 **Checked.** A sketch of this walk was run on 15 expressions: the graph of "The process,
 step by step" and the roll-up, smaller sums, a product and a Max, a buffer with three
@@ -852,11 +864,12 @@ determined, total and correct.
 
 ### Stage 1: numpy values (`cost_expr_numpy.py`)
 
-One recursive function, `numpy_value(expr, env)`:
+One function, `numpy_value(expr, env)`, a loop over `preorder_traversal(expr)` reversed,
+each node once, with no recursion:
 
 1. a symbol is its array in `env`, a number is a float, `True` and `False` are
    themselves;
-2. the arguments are evaluated first;
+2. the arguments are evaluated first, which the reversed pre-order guarantees;
 3. the numpy function is found by the node's class name: a table of overrides first,
    then numpy's own function of that name;
 4. with no function it raises `NotImplementedError`.
