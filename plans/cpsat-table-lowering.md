@@ -604,12 +604,18 @@ sympy nodes are immutable, and the lowering never changes one. Each node it meet
 `CpNode`, its CP-SAT counterpart, which holds what the lowering knows about the node:
 
 ```python
+from __future__ import annotations
+
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+import numpy.typing as npt
 import sympy
 from ortools.sat.python import cp_model
+
+Floats = npt.NDArray[np.float64]
 
 
 class TableLoweringError(Exception):
@@ -620,14 +626,49 @@ class TableLoweringError(Exception):
     """
 
 
+@dataclass(frozen=True)
+class CpIndex:
+    """A CP-SAT expression for a position into a table, 0 .. size - 1.
+
+    One of four kinds: an input variable; a combine, left * right.size + right, a linear
+    expression; a compact, remap[parent], one element lookup; a min or max of rungs, one
+    lin_min or lin_max. Held as this description during the walk, so the walk writes
+    nothing to the model; build_model makes each CpIndex into its CP-SAT expression once,
+    and every node that reads it shares that expression.
+    """
+
+    size: int
+    inputs: frozenset[str]            # the decision variables that fix the position
+
+
+@dataclass
+class Linear:
+    """A linear form, float until build_model collapses it."""
+
+    constant: float = 0.0
+    lists: dict[CpIndex, Floats] = field(default_factory=dict)   # one list per index
+    extrema: list[tuple[bool, list[Linear]]] = field(default_factory=list)  # is_min, operands
+    switched: list[tuple[CpNode, Linear]] = field(default_factory=list)     # rule 4
+
+
 @dataclass
 class CpNode:
-    """The CP-SAT counterpart of one sympy node, which it never changes."""
+    """The CP-SAT counterpart of one sympy node, which it never changes.
+
+    A parent reads it by table or by variable. By table, the parent takes values and
+    index and builds its own list from them: elementwise on the same index, or across a
+    combine or compact of indexes. By variable, the parent takes the integer
+    rint(COST_SCALE * values)[index] as a term of its linear form, values entering
+    linear.lists under index; build_model makes that variable, one element lookup per
+    index after the lists on it are summed. A node that is not one list is read by
+    variable through linear.
+    """
 
     expr: sympy.Basic                 # the sympy node, read only
     linear_ok: bool = False           # pass 1: a linear reader can reach it
-    table: Table | None = None        # pass 2: tabulated, a float list on an index
-    linear: Linear | None = None      # pass 2: linear, built only when linear_ok
+    values: Floats | None = None      # by table: the node's value at each position
+    index: CpIndex | None = None      # by table: the position, a CP-SAT expression
+    linear: Linear | None = None      # by variable: a sum, lin_min/lin_max, a switch
     done: bool = False                # pass 2 has realized it
 
 
@@ -664,24 +705,24 @@ def lower_cost_with_tables(
 ```
 
 The sketch is the public interface only: signatures and docstrings, with the bodies left
-to the stages. Inside `TableLowering`, the dispatch to one method per node class, the
+to the stages. `CpIndex` is held as a description during the walk rather than as a live
+CP-SAT expression, so that a refusal leaves the model untouched; `build_model` makes the
+expressions. Inside `TableLowering`, the dispatch to one method per node class, the
 methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
 `visit_RelayoutCharge`), `tabulate` and the reader that applies rule 3 are private, and
 the sections below describe them. The order of the two passes, `CpNode` and `tabulate`
-are the design, and the other names may change. `Table` is a float list and the index
-that reads it (`tabulate`, below), `Linear` a linear form ("A node that is not one
-list"), and `Inputs` the map from each symbol to its input and column ("How a table maps
-onto CP-SAT"). `sym_map` and `buffer_map` are the printer's two maps. With `Table`,
-`Linear` and `Inputs` as empty classes the sketch passes `mypy --strict`, sympy being
-untyped and the bodies empty.
+are the design, and the other names may change. `Inputs` is the map from each symbol to
+its input and column ("How a table maps onto CP-SAT"), and `sym_map` and `buffer_map`
+are the printer's two maps. With `Inputs` as an empty class the sketch passes
+`mypy --strict`, sympy being untyped and the bodies empty.
 
 - **One `CpNode` per sympy node.** The map is keyed by the sympy node, which is hashable
   and compares by structure, so a subexpression that two terms share has one `CpNode`:
   both terms read one list and one position. Every result lives on the `CpNode`. The
   expression is the same object, unchanged, after the lowering.
-- **Tabulated, linear or both.** A method sets `table`, `linear` or both on its
-  `CpNode`. One that ends with neither raises `TableLoweringError` at once, naming that
-  node and why (Decisions), so the error points at the innermost node that failed.
+- **Tabulated, linear or both.** A method sets `values` and `index`, `linear`, or both on
+  its `CpNode`. One that ends with neither raises `TableLoweringError` at once, naming
+  that node and why (Decisions), so the error points at the innermost node that failed.
 - **Pre-order, then post-order, no recursion.** Pass 1 keeps the repeats: pre-order
   yields a shared node once under each parent, after that parent, which is what lets a
   mark from its second parent reach its children. Pass 2 skips them: a node's first
@@ -745,10 +786,11 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
 
 ### `tabulate` realizes a node
 
-`tabulate(node, children)` returns a `Table` or None. A `Table` is a float list `values`
-and an `index`, and the node's value is `values[index]`. The index is a description, not
-yet a CP-SAT variable: an input, a combine, a compact, or a min or max of rungs. It
-carries the decision variables behind it. A node is *realized* when it has its table.
+`tabulate(node, children)` sets the node's `values` and `index`, or neither. The
+node's value is `values[index]`. The index is a `CpIndex`: an input, a combine, a
+compact, or a min or max of rungs, held as a description until `build_model` makes it a
+CP-SAT expression. It carries the decision variables behind it. A node is *tabulated*
+when it has its values and index.
 
 Every list of the lowering is made here, and a list is never made without its index.
 `tabulate` is the "one operation, in one order" of the guarantees above.
@@ -769,7 +811,7 @@ Every list of the lowering is made here, and a list is never made without its in
 5. **The cheaper one.** The candidate with fewer entries is the table (rule 3). Its
    entries are its list plus the remaps under its index. A candidate's size is known
    before its list is computed, so one past the cap is never evaluated. With no
-   candidate under the cap the result is None.
+   candidate under the cap it sets neither.
 
 ### A node that is not one list
 
