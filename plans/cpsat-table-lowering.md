@@ -34,8 +34,9 @@ computed with numpy functions, and the code arrives in layers, each with its own
   visitor then visits each node after its arguments, and one function, `tabulate`,
   realizes a node. Pass 1 iterates `sympy.preorder_traversal`, pass 2
   `sympy.postorder_traversal`; nothing recurses. Each sympy node gets a `CpNode`, its
-  CP-SAT counterpart, which holds the node's table and linear form; no sympy node is
-  changed. See Architecture.
+  CP-SAT counterpart, which a parent reads as a table or linearly; no sympy node is
+  changed. Reads and CP-SAT variables are made when first requested and memoized. See
+  Architecture.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
   #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
@@ -601,12 +602,14 @@ every node after its arguments, and realizes it. One function, `tabulate`, makes
 node's table: its float list and the index that reads it.
 
 sympy nodes are immutable, and the lowering never changes one. Each node it meets gets a
-`CpNode`, its CP-SAT counterpart, which holds what the lowering knows about the node:
+`CpNode`, its CP-SAT counterpart. A parent reads it as a `CpTable` or as a `CpLinear`,
+and `CpBuild` turns what the objective reads into CP-SAT variables, each on first
+request:
 
 ```python
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -628,48 +631,90 @@ class TableLoweringError(Exception):
 
 @dataclass(frozen=True)
 class CpIndex:
-    """A CP-SAT expression for a position into a table, 0 .. size - 1.
+    """A position into a table, 0 .. size - 1, and the recipe for its CP-SAT expression.
 
     One of four kinds: an input variable; a combine, left * right.size + right, a linear
     expression; a compact, remap[parent], one element lookup; a min or max of rungs, one
-    lin_min or lin_max. Held as this description during the walk, so the walk writes
-    nothing to the model; build_model makes each CpIndex into its CP-SAT expression once,
-    and every node that reads it shares that expression.
+    lin_min or lin_max. Equal by structure, so two nodes that make the same position
+    share one CpIndex, and CpBuild makes its expression once.
     """
 
     size: int
     inputs: frozenset[str]            # the decision variables that fix the position
 
 
+@dataclass(frozen=True)
+class CpTable:
+    """A node read as a table: values[index], made together and never apart."""
+
+    values: Floats                    # the value at each position, float until collapsed
+    index: CpIndex
+
+    def __post_init__(self) -> None:
+        """Refuses a list whose length is not index.size."""
+
+    @property
+    def entries(self) -> int:
+        """Its list plus the remaps under its index: what rule 3 compares, and what the
+        cap bounds."""
+
+
 @dataclass
-class Linear:
-    """A linear form, float until build_model collapses it."""
+class CpLinear:
+    """A node read linearly, float until CpBuild collapses it."""
 
     constant: float = 0.0
     lists: dict[CpIndex, Floats] = field(default_factory=dict)   # one list per index
-    extrema: list[tuple[bool, list[Linear]]] = field(default_factory=list)  # is_min, operands
-    switched: list[tuple[CpNode, Linear]] = field(default_factory=list)     # rule 4
+    extrema: list[tuple[bool, list[CpLinear]]] = field(default_factory=list)  # is_min, operands
+    switched: list[tuple[CpTable, CpLinear]] = field(default_factory=list)    # rule 4
+
+    @property
+    def entries(self) -> int:
+        """The entries its lists, operands and switches put in the model."""
 
 
 @dataclass
 class CpNode:
     """The CP-SAT counterpart of one sympy node, which it never changes.
 
-    A parent reads it by table or by variable. By table, the parent takes values and
-    index and builds its own list from them: elementwise on the same index, or across a
-    combine or compact of indexes. By variable, the parent takes the integer
-    rint(COST_SCALE * values)[index] as a term of its linear form, values entering
-    linear.lists under index; build_model makes that variable, one element lookup per
-    index after the lists on it are summed. A node that is not one list is read by
-    variable through linear.
+    A parent reads it as a table or linearly. Each read is made on first request and
+    memoized, so a node shared by two parents that read it differently makes both, and
+    a read nobody requests is never made.
     """
 
     expr: sympy.Basic                 # the sympy node, read only
     linear_ok: bool = False           # pass 1: a linear reader can reach it
-    values: Floats | None = None      # by table: the node's value at each position
-    index: CpIndex | None = None      # by table: the position, a CP-SAT expression
-    linear: Linear | None = None      # by variable: a sum, lin_min/lin_max, a switch
-    done: bool = False                # pass 2 has realized it
+
+    def as_table(self) -> CpTable:
+        """The node read as a table, from pass 2's candidate. Raises TableLoweringError
+        when no table of it fits the cap."""
+
+    def as_linear(self) -> CpLinear:
+        """The node read linearly: its own linear form, or its table as one list,
+        whichever rule 3 prefers (margin 2 for a Min/Max). Raises TableLoweringError
+        when it has neither."""
+
+
+class CpBuild:
+    """Makes CP-SAT variables in one model when a form requests them, each once."""
+
+    def __init__(self, model: cp_model.CpModel) -> None:
+        """Holds the model and a memo per position, per lookup and per linear form."""
+
+    def index(self, index: CpIndex) -> cp_model.LinearExprT:
+        """The position as a CP-SAT expression, made on first request and memoized: an
+        input's variable, a combine's linear expression, a compact's element lookup, or
+        a min or max of rungs. Its parts are requested first."""
+
+    def lookup(self, index: CpIndex, table: Sequence[int]) -> cp_model.LinearExprT:
+        """table[index] as a CP-SAT term, made on first request and memoized by index and
+        table: a number when the table is constant, a linear expression when it is
+        affine, else one element lookup."""
+
+    def linear(self, form: CpLinear) -> cp_model.LinearExprT:
+        """The form as a CP-SAT expression: each list collapsed once onto COST_SCALE and
+        looked up, each lin_min or lin_max over operands behind proxy variables, each
+        switch. Memoized."""
 
 
 class TableLowering:
@@ -682,15 +727,15 @@ class TableLowering:
         """Run both passes and return the root's CpNode.
 
         Pass 1 iterates preorder_traversal and sets linear_ok, repeats kept. Pass 2
-        iterates postorder_traversal and realizes each node once, after its arguments.
-        Writes nothing to a model. Raises TableLoweringError at the first node left with
-        neither a table nor a linear form.
+        iterates postorder_traversal and gives each node, once, its candidate table and
+        linear form, reading its children with as_table and as_linear. Writes nothing
+        to a model. Raises TableLoweringError at the first node left with neither.
         """
 
-    def build_model(self, model: cp_model.CpModel, root: CpNode) -> cp_model.LinearExpr:
-        """The objective read linearly from root: check each list's decision variables,
-        make each position once, collapse each list and add its lookup. The only method
-        that writes to the model."""
+    def build_model(self, model: cp_model.CpModel, root: CpNode) -> cp_model.LinearExprT:
+        """Check each list's decision variables against the variables its terms read,
+        then return CpBuild(model).linear(root.as_linear()). Only the variables that
+        form requests are made."""
 
 
 def lower_cost_with_tables(
@@ -705,9 +750,9 @@ def lower_cost_with_tables(
 ```
 
 The sketch is the public interface only: signatures and docstrings, with the bodies left
-to the stages. `CpIndex` is held as a description during the walk rather than as a live
-CP-SAT expression, so that a refusal leaves the model untouched; `build_model` makes the
-expressions. Inside `TableLowering`, the dispatch to one method per node class, the
+to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for one, so
+a refusal leaves the model untouched. `CpBuild` makes them after the walk, when the
+objective's form requests them, each once. Inside `TableLowering`, the dispatch to one method per node class, the
 methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
 `visit_RelayoutCharge`), `tabulate` and the reader that applies rule 3 are private, and
 the sections below describe them. The order of the two passes, `CpNode` and `tabulate`
@@ -720,9 +765,13 @@ are the printer's two maps. With `Inputs` as an empty class the sketch passes
   and compares by structure, so a subexpression that two terms share has one `CpNode`:
   both terms read one list and one position. Every result lives on the `CpNode`. The
   expression is the same object, unchanged, after the lowering.
-- **Tabulated, linear or both.** A method sets `values` and `index`, `linear`, or both on
-  its `CpNode`. One that ends with neither raises `TableLoweringError` at once, naming
-  that node and why (Decisions), so the error points at the innermost node that failed.
+- **Read as a table or linearly.** Pass 2 leaves each `CpNode` with a candidate table, a
+  candidate linear form, or both. A parent reads a child with `as_table` or `as_linear`,
+  and each read is made on first request and memoized: a node read both ways, such as a
+  Max under a power and a sum, makes both, and a candidate no parent reads goes no
+  further. A node left with neither candidate raises `TableLoweringError` at once,
+  naming that node and why (Decisions), so the error points at the innermost node that
+  failed.
 - **Pre-order, then post-order, no recursion.** Pass 1 keeps the repeats: pre-order
   yields a shared node once under each parent, after that parent, which is what lets a
   mark from its second parent reach its children. Pass 2 skips them: a node's first
@@ -786,11 +835,10 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
 
 ### `tabulate` realizes a node
 
-`tabulate(node, children)` sets the node's `values` and `index`, or neither. The
-node's value is `values[index]`. The index is a `CpIndex`: an input, a combine, a
-compact, or a min or max of rungs, held as a description until `build_model` makes it a
-CP-SAT expression. It carries the decision variables behind it. A node is *tabulated*
-when it has its values and index.
+`tabulate(node, children)` makes the node's candidate `CpTable`, or none. The node's
+value is `values[index]`. The index is a `CpIndex`: an input, a combine, a compact, or
+a min or max of rungs, a recipe until `CpBuild` makes its CP-SAT expression. It carries
+the decision variables behind it. A node is *tabulated* when it has its `CpTable`.
 
 Every list of the lowering is made here, and a list is never made without its index.
 `tabulate` is the "one operation, in one order" of the guarantees above.
@@ -816,9 +864,9 @@ Every list of the lowering is made here, and a list is never made without its in
 ### A node that is not one list
 
 A sum, a product and a Min/Max can be read without being one list, so their methods
-set a second form on the `CpNode` beside the table. A *linear form* is a constant, one float list per
-index, and the `lin_min`, `lin_max` and switched terms inside it. It is float, as the
-tables are.
+give the `CpNode` a second candidate beside the table. A *linear form*, a `CpLinear`, is
+a constant, one float list per index, and the `lin_min`, `lin_max` and switched terms
+inside it. It is float, as the tables are.
 
 | Method | Table | Linear form |
 |---|---|---|
@@ -828,14 +876,16 @@ tables are.
 | `visit_Min`, `visit_Max` | `tabulate` | `lin_min` or `lin_max` over the children's linear forms |
 | `visit_RelayoutCharge` | `tabulate`, or the number 0 when this solve does not divide the source | its literal as a gate on the price list |
 
-- **The reader picks the form.** Pass 1 tells a node whether a linear reader can reach
-  it, but not which form that reader will take, so the `CpNode` keeps the forms it has.
-  `tabulate` reads tables. A linear form reads each child's cheaper form in entries, and
-  a Min/Max child stays linear only under half the entries of its table (rule 3). The
-  objective reads the root's linear form. Only `visit_Add`, `visit_Mul`, `visit_Min` and
-  `visit_Max` read a linear form. They and `visit_RelayoutCharge` build one, on a marked
-  node only. `generic_visit` reads tables only: under `Max(...) ** 0.5` the Max is read
-  as its table, and a Max with no table leaves the power with no form.
+- **The reader picks the read.** Pass 1 tells a node whether a linear reader can reach
+  it, but not which read that reader will make, so the `CpNode` keeps its candidates.
+  `tabulate` calls `as_table` on its children. A linear form calls `as_linear`, which
+  returns the child's own linear form or its table as one list, whichever has fewer
+  entries; a Min/Max keeps its linear form only under half the entries of its table
+  (rule 3). The objective reads the root with `as_linear`. Only `visit_Add`,
+  `visit_Mul`, `visit_Min` and `visit_Max` call `as_linear`. They and
+  `visit_RelayoutCharge` build a linear candidate, on a marked node only.
+  `generic_visit` calls `as_table` only: under `Max(...) ** 0.5` the Max is read as its
+  table, and a Max with no table raises there.
 - **Multipliers go down in float.** Scaling a linear form multiplies its lists in numpy.
   Through a `lin_min` or `lin_max` it scales the operands, and a negative factor turns
   one into the other.
@@ -851,19 +901,24 @@ This is the table of "Which form a node takes", read from the leaves up.
 
 ### From the walk to the model
 
-The walk ends with the objective as one linear form. A second pass, over that form and
-not over the expression, is the only code that calls CP-SAT:
+The walk ends with the root's `CpNode`. `build_model` is the only code that calls
+CP-SAT, and it makes a variable only when a form requests it:
 
 1. **Check.** Each list's decision variables are compared with the variables its terms
-   read (guarantee 3). A miss is refused here, before the model changes.
-2. **Positions.** Each index is made once and shared: an input is its variable, a
-   combine is a linear equality, a compact is one `add_element`, and a min or max of
-   rungs is one constraint. This step is the one helper of Stage 3, so the table
-   constraint replaces it without a change to the walk.
-3. **Collapse.** Each list is rounded once and read by one `add_element`. An affine list
-   is a linear term with no table, and a constant list is a number.
+   read (guarantee 3). A miss raises here, before the model changes.
+2. **Request.** `CpBuild(model).linear(root.as_linear())`. Each read pulls in what it
+   reads, and nothing else reaches the model: a table used only to compute a parent's
+   table in numpy, or a candidate no parent read, adds no variable.
+3. **Positions, on request.** `CpBuild.index` makes each `CpIndex` once and memoizes
+   it: an input is its variable, a combine is a linear expression, a compact is one
+   `add_element`, and a min or max of rungs is one constraint. Its parts are requested
+   first. This method is the one helper of Stage 3, so the table constraint replaces it
+   without a change to the walk.
+4. **Collapse, on request.** `CpBuild.lookup` rounds each list once and reads it with one
+   `add_element`, memoized by index and table. An affine list is a linear expression
+   with no table, and a constant list is a number.
 
-Floats become integers in step 3. The one other place is the `p/q` of a switched
+Floats become integers in step 4. The one other place is the `p/q` of a switched
 factor (rule 4).
 
 ### The walk on the roll-up example
