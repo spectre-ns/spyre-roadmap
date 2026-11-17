@@ -44,6 +44,8 @@ is free to differ.
   its results only.
 - **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
   moves, combine and compact, and the table constraint is measured against them.
+- **One visitor, depth first (2026-11-17).** The lowering visits each node after its
+  arguments, and one function, `tabulate`, realizes a node. See Architecture.
 
 ## Estimates
 
@@ -548,6 +550,196 @@ measured over the 50 objectives is 1.2e-7 of the cost.
 The *exact* tests of every stage are the check on this mapping: they solve at every
 assignment of the inputs, so an entry read from the wrong position fails.
 
+## Architecture
+
+The lowering is one visitor over the cost expression. It visits each node depth first,
+the arguments before the node, so everything under a node is realized before the node
+is. One function, `tabulate`, realizes a node: it returns the node's float list and the
+index that reads it.
+
+```python
+class TableLowering:
+    def visit(self, node):
+        if node not in self.forms:                                  # each node once
+            children = [self.visit(arg) for arg in children_of(node)]  # depth first
+            self.forms[node] = self.method_for(node)(node, children)
+        return self.forms[node]
+
+    def generic_visit(self, node, children):
+        return Forms(table=self.tabulate(node, children))           # realize the node
+
+    def visit_Add(self, node, children):
+        return Forms(table=self.tabulate(node, children),
+                     linear=add_linear(children))
+```
+
+The code is a sketch. The order of the walk and `tabulate` are the design, and the other
+names may change.
+
+- **Depth first, post-order.** `visit` owns the descent. A method is handed its node and
+  its children's results, and never visits. Stage 1's `numpy_value` is the same walk
+  with arrays for results.
+- **Each node once.** Results are kept by node. A subexpression that two terms share is
+  visited once, and both terms read one list and one position.
+- **One method per class.** `method_for` looks for `visit_<Class>` along the node's class
+  and its bases, and falls back to `generic_visit`. The bases matter: `Integer(1)` is
+  class `One` and `Rational(1, 2)` is `Half`. The printer on `main` dispatches the same
+  way through sympy's `Printer` (`cpsat_expr_printer.py:186`), but each of its methods
+  prints its own arguments.
+- **Children.** A node's children are its arguments, with two exceptions. A Piecewise's
+  children are the values and conditions of its arms. A `RelayoutCharge`'s children are
+  its literal and its division, and its prices are data.
+- **No model.** The walk reads the expression, the inputs and the cap, and computes in
+  numpy. It adds nothing to the CP-SAT model and rounds nothing.
+
+### `tabulate` realizes a node
+
+`tabulate(node, children)` returns a `Table` or None. A `Table` is a float list `values`
+and an `index`, and the node's value is `values[index]`. The index is a description, not
+yet a CP-SAT variable: an input, a combine, a compact, or a min or max of rungs. It
+carries the decision variables behind it. A node is *realized* when it has its table.
+
+Every list of the lowering is made here, and a list is never made without its index.
+`tabulate` is the "one operation, in one order" of the guarantees above.
+
+1. **A leaf.** A symbol's table is its input's column, on that input: a buffer's symbol
+   over the menu, `[0, 1]` for a literal, the domain's values for an integer. A number
+   is one value on no input.
+2. **A child with no table.** The node has none either.
+3. **Children on one index.** The node's numpy function, the one-node step of Stage 1,
+   is applied to the children's lists elementwise. The index is the children's, and no
+   entry is added. A term over one buffer's symbols never leaves this case.
+4. **Children on several indexes.** There are two candidates:
+   - *one table*: the node on the grid of its inputs, from `values_on_grid`, on the
+     inputs combined;
+   - *from its parts*: a Min/Max by rung (rule 1), a product of Min/Max factors by fold
+     (rule 2), and any other node by compacting each child's list to its distinct
+     values, combining the positions and applying the node's numpy function across them.
+5. **The cheaper one.** The candidate with fewer entries is the table (rule 3). Its
+   entries are its list plus the remaps under its index. A candidate's size is known
+   before its list is computed, so one past the cap is never evaluated. With no
+   candidate under the cap the result is None.
+
+### A node that is not one list
+
+A sum, a product and a Min/Max can be read without being one list, so their methods
+return a second form beside the table. A *linear form* is a constant, one float list per
+index, and the `lin_min`, `lin_max` and switched terms inside it. It is float, as the
+tables are.
+
+| Method | Table | Linear form |
+|---|---|---|
+| `generic_visit`: symbols, numbers, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | `tabulate` | none |
+| `visit_Add` | `tabulate` | the children's linear forms added, where lists on one index become one list |
+| `visit_Mul` | `tabulate` | constants times one child: that child's linear form, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
+| `visit_Min`, `visit_Max` | `tabulate` | `lin_min` or `lin_max` over the children's linear forms |
+| `visit_RelayoutCharge` | `tabulate`, or the number 0 when this solve does not divide the source | its literal as a gate on the price list |
+
+- **The reader picks the form.** A node is visited before its parent, so it cannot know
+  how it will be read. It returns the forms it has. `tabulate` reads tables. A linear
+  form reads each child's cheaper form in entries, and a Min/Max child stays linear only
+  under half the entries of its table (rule 3). The objective reads the root's linear
+  form.
+- **Multipliers go down in float.** Scaling a linear form multiplies its lists in numpy.
+  Through a `lin_min` or `lin_max` it scales the operands, and a negative factor turns
+  one into the other.
+- **Refusal.** A node can come back with no form. Its parent then has only the forms
+  that do not read it, which is how a relayout charge on a source this solve does not
+  divide becomes 0. When the root has no linear form, `lower_cost_with_tables` returns
+  None and the printer takes the whole objective. The model is untouched, because the
+  walk never wrote to it.
+
+This is the chart of "Which form a node takes", read from the leaves up.
+
+### From the walk to the model
+
+The walk ends with the objective as one linear form. A second pass, over that form and
+not over the expression, is the only code that calls CP-SAT:
+
+1. **Check.** Each list's decision variables are compared with the variables its terms
+   read (guarantee 3). A miss is refused here, before the model changes.
+2. **Positions.** Each index is made once and shared: an input is its variable, a
+   combine is a linear equality, a compact is one `add_element`, and a min or max of
+   rungs is one constraint. This step is the one helper of Stage 3, so the table
+   constraint replaces it without a change to the walk.
+3. **Collapse.** Each list is rounded once and read by one `add_element`. An affine list
+   is a linear term with no table, and a constant list is a number.
+
+Floats become integers in step 3. The one other place is the `p/q` of a switched
+factor (rule 4).
+
+### The walk on the roll-up example
+
+`Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)`, from "When the final table no
+longer names its inputs". Each node shows its place in the visit order and the list
+`tabulate` returned for it. sympy orders the arguments, so the sum comes first.
+
+```mermaid
+flowchart TD
+    N13["visit 13, Mul<br/>nine values on pair"]
+    N5["visit 5, Add: 1 + 1/split_c<br/>2, 1.5, 1.5, 1.25 on division_c"]
+    N12["visit 12, Max<br/>1, 1.7321, 1, 1.7321, 2, 2<br/>on 2*division_a + division_b"]
+    N1["visit 1, number 1"]
+    N4["visit 4, Pow: 1/split_c<br/>1, 0.5, 0.5, 0.25 on division_c"]
+    N2["visit 2, Symbol: split_c<br/>1, 2, 2, 4 on division_c"]
+    N3["visit 3, number -1"]
+    N8["visit 8, Pow: split_b ** 0.5<br/>1, 1.7321 on division_b"]
+    N11["visit 11, Mul: split_a / 2<br/>0.5, 1, 2 on division_a"]
+    N6["visit 6, Symbol: split_b<br/>1, 3 on division_b"]
+    N7["visit 7, number 0.5"]
+    N9["visit 9, number 1/2"]
+    N10["visit 10, Symbol: split_a<br/>1, 2, 4 on division_a"]
+    N13 --> N5
+    N13 --> N12
+    N5 --> N1
+    N5 --> N4
+    N4 --> N2
+    N4 --> N3
+    N12 --> N8
+    N12 --> N11
+    N8 --> N6
+    N8 --> N7
+    N11 --> N9
+    N11 --> N10
+```
+
+| Visit | Case of `tabulate` | Result |
+|---|---|---|
+| 1 to 11 | a leaf, or children on one index | a list on `division_c`, `division_b` or `division_a`, with nothing added |
+| 12, the Max | several indexes | one table: 6 entries, against 8 by rung (a ladder of 3, rungs of 3 and 2) |
+| 13, the product | several indexes | from its parts: each child ranked to 3 distinct values and paired, 19 entries against 24 for one table |
+
+The collapsed table holds the nine entries of that section, in sympy's argument order:
+`[1280, 2217, 2560, 1536, 2660, 3072, 2048, 3547, 4096]`.
+
+**What depth first costs.** Rule 3 is applied at the node, before its parent is visited.
+At visit 12 one table is the cheaper list for the Max. Its parent then ranks that list
+with a 6-entry remap, where rungs would have cost 5 and needed no rank: 19 entries
+against the 18 of the chain drawn in that section. The walk could instead keep both
+candidates on a node for its reader to choose, since nothing is in the model yet. The
+plan starts with the rule at the node, and the last PR reports entries per capture.
+
+**Checked.** A sketch of this walk was run on 14 expressions: the sums, the product, the
+Max and the roll-up of the sections above, a buffer with three symbols, a Piecewise over
+two buffers, a shared subexpression, and a sum and a Max too wide for one table. It has
+no fold and no switch. Each is exact as Stages defines it, each model has one solution
+per assignment of its inputs, and the tables printed above come back, the roll-up's in
+sympy's order. On the roll-up the worst error is 0.43 units. A node shared by two terms
+was visited once: 10 visits for an expression of 15 nodes.
+
+### Where each stage lands
+
+| Stage | Adds to the architecture |
+|---|---|
+| 1 | `numpy_value`, and its one-node step that `tabulate` applies to lists |
+| 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
+| 3 | `visit`, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the pass that builds the model, and `tabulate` for a leaf, for one index and for one table over the inputs |
+| 4 | `tabulate` from a node's parts: by rung, rank and pair, and the choice by entries |
+| 5 | `tabulate` from a node's parts: the fold |
+| 6 | the linear form of `visit_Min` and `visit_Max`, and a constant times one child in `visit_Mul` |
+| 7 | the switch and the gate in `visit_Mul`, and the gate of `visit_RelayoutCharge` |
+| 8 | nothing: the flag chooses between this visitor and the printer |
+
 ## Stages
 
 Every stage is one PR with its tests. Branches: `table-lowering-N-<slug>-experimental`,
@@ -583,6 +775,9 @@ One recursive function, `numpy_value(expr, env)`:
 
 A caller that gets `NotImplementedError` evaluates that node through `sympy.lambdify`
 instead. This is the only use of lambdify. It is cached per node and counted.
+
+Steps 3 and 4 can be called for one node on arrays already computed. `tabulate` applies
+them to its children's lists.
 
 Overrides, for names numpy does not share: Add, Mul, Pow, Abs; Min and Max
 (`np.minimum`, `np.maximum`); ceiling; the six relationals; And, Or, Not; ITE
@@ -654,6 +849,9 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 
 ### Stage 3: inputs, indexes, tables, linear sums
 
+- The visitor of Architecture arrives: the walk, `generic_visit`, `visit_Add`,
+  `visit_RelayoutCharge` and the pass that builds the model. `tabulate` realizes a leaf,
+  a node whose children share an index, and a node whose inputs fit one table.
 - Positions are made by two moves only, combine and compact, behind one helper. Each list
   carries the decision variables behind its index.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
@@ -674,6 +872,8 @@ returns None.
 
 Tests:
 
+- the walk visits a node after its arguments, and a subexpression two terms share once;
+- every list `tabulate` returns has the length of its index;
 - a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
 - a term whose chain misses a variable it depends on is refused when the objective is
@@ -694,6 +894,9 @@ Tests:
 - an expression it cannot lower leaves the model's variables and constraints unchanged.
 
 ### Stage 4: rule 1 and parts
+
+All of this stage is inside `tabulate`: its second candidate, the form from a node's
+parts, and the choice between the two.
 
 - A Min/Max of indexed operands is indexed by rung (rule 1).
 - Equal values share one rank, and a product of two short lists is one table over the
@@ -720,12 +923,16 @@ Tests:
 ### Stage 5: rule 2
 
 Min/Max factors of one product, over shared inputs, become one indexed value over the
-reachable tuples of their rungs, when crossing their lists would pass the cap.
+reachable tuples of their rungs, when crossing their lists would pass the cap. It is one
+more form from a node's parts inside `tabulate`.
 
 Tests: a product of four Max factors over three shared buffers is exact under a cap their
 crossed ladders pass; no fold when the crossed lists fit.
 
 ### Stage 6: rule 3 in the objective
+
+`visit_Min` and `visit_Max` gain their linear form, and a reader picks between it and
+the table.
 
 - A Min/Max too wide to index, or whose table is over twice its linear form, stays a
   `lin_min`/`lin_max` over linear operands.
@@ -741,6 +948,8 @@ a fractional coefficient on a linear Min is within the largest operand's bound; 
 operand is a single variable.
 
 ### Stage 7: rule 4
+
+`visit_Mul` and `visit_RelayoutCharge` gain their linear forms.
 
 - A product whose factor cannot pair with the rest is switched on the factor's value.
   Whole values take one equality per value. Fractional values take the floor pair of
