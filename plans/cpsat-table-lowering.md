@@ -632,6 +632,13 @@ class TableLowering:
     def cp(self, expr):
         return self.nodes.setdefault(expr, CpNode(expr))
 
+    def method_for(self, expr):                          # sympy.Add -> visit_Add
+        for cls in type(expr).__mro__:                   # the class, then its bases
+            method = getattr(self, f"visit_{cls.__name__}", None)
+            if method is not None:
+                return method
+        return self.generic_visit                        # Pow, log, floor, ...
+
     def generic_visit(self, node, children):
         node.table = self.tabulate(node.expr, children)
 
