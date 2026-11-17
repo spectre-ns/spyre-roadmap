@@ -417,115 +417,9 @@ flowchart TD
     Q4 -- no --> A5["not lowered<br/>the printer takes the whole objective"]
 ```
 
-## When the final table no longer names its inputs
-
-After a roll-up, the constraint that produces a cost is `cost == table[index]`, and
-`index` is a derived position. No decision variable appears in it. What ties the cost to
-the plan is the chain of constraints behind that position. This section says how the
-chain is built and what it must guarantee.
-
-**Example.** `Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)` reads three buffers:
-`split_a = [1, 2, 4]`, `split_b = [1, 3]` and `split_c = [1, 2, 2, 4]`.
-
-```mermaid
-flowchart LR
-    subgraph IN["decision variables: the only ones chosen"]
-        DA["division_a"]
-        DB["division_b"]
-        DC["division_c"]
-    end
-    subgraph POS["derived positions: fixed by the inputs, never chosen"]
-        RA["rung_a == rungs_a[division_a]"]
-        RB["rung_b == rungs_b[division_b]"]
-        RM["rank_m == max(rung_a, rung_b)"]
-        RC["rank_c == rank_of_c[division_c]"]
-        P["pair == 3*rank_m + rank_c"]
-    end
-    subgraph LT["linear term"]
-        C["cost == table[pair]"]
-    end
-    DA --> RA
-    DB --> RB
-    DC --> RC
-    RA --> RM
-    RB --> RM
-    RM -- combine --> P
-    RC -- combine --> P
-    P --> C
-```
-
-- The Max is read by rung, as in step 4 of the process: 0.5 is clamped to 1, the ladder
-  is `[1, 1.7321, 2]`, `rungs_a` is `[0, 0, 2]` and `rungs_b` is `[0, 1]`.
-- The factor `1 + 1 / split_c` is `[2, 1.5, 1.5, 1.25]`. Its distinct values are
-  `[1.25, 1.5, 2]` and `rank_of_c` is `[2, 1, 1, 0]`.
-- The final table is the outer product of the ladder and the distinct values, collapsed:
-  `[1280, 1536, 2048, 2217, 2660, 3547, 2560, 3072, 4096]`.
-
-At `division_a = 1`, `division_b = 1`, `division_c = 3` the rungs are 0 and 1, `rank_m`
-is 1, `rank_c` is 0, `pair` is 3 and the cost is 2217. The float value is 2217.03. The
-last constraint, `cost == table[pair]`, names none of the three divisions.
-
-**Two moves make every position.**
-
-- *Combine*: `parent == left * size(right) + right`. A linear equality that turns two
-  positions into one position in the larger table.
-- *Compact*: `short == remap[parent]`, one `add_element`. It renumbers a position onto
-  the rows that are distinct or that can occur.
-
-| Form | Moves |
-|---|---|
-| one table over several inputs | combine all the inputs |
-| rank | compact one list |
-| product of two lists | compact each, then combine |
-| Min/Max by rung | compact each operand to its rung, then take the min or max |
-| fold | combine the state with the next group, compact, repeat |
-
-The min or max over rungs is a compact that needs no table, because a ladder keeps order.
-
-**One constraint for both moves.** `add_allowed_assignments([left, right, out], rows)`
-lists the rows directly, and `out` is the next position up or the cost. It needs no
-strides, a domain with gaps needs no position lookup, and a row that cannot occur is left
-out. On the example it replaces the six constraints of the diagram with two:
-`[division_a, division_b, rank_m]` with 6 rows and `[rank_m, division_c, cost]` with 12.
-
-Both forms were run on the example and agree at all 24 assignments. Which solves faster on
-real objectives is not measured. Both sit behind one helper. The default is combine and
-compact, and the last PR reports both on the replay.
-
-**What the chain must guarantee.** Let D be the decision variables a term reads.
-
-1. *Determined.* Once D has values, every position and the cost have one feasible value.
-   A position is never a choice, so the lowering adds no decisions to the search.
-2. *Total.* Every assignment of D the model allowed before still has a feasible chain.
-   The lowering never forbids a plan. A table constraint missing a row that can occur
-   would break this without any error.
-3. *Complete.* Walking the chain back from the cost reaches every variable of D that the
-   term's value depends on.
-4. *Correct.* The cost is the term's float value at that assignment, within the collapse
-   bound.
-
-On the example, in both forms: the model has 24 solutions, one per assignment of the
-three divisions; minimizing and maximizing the cost at a fixed assignment give the same
-value; and the worst error is 0.43 units.
-
-**How the plan keeps them.**
-
-- A position is made only by a combine or a compact of positions that are determined, so
-  it is determined.
-- A remap has an entry for every value of its parent, and a table constraint has a row
-  for every combination its parents can take.
-- Every list carries its index and the set of decision variables behind that index.
-  Combine takes the union of the two sets, and compact keeps the set. At a linear term
-  the set is checked against the variables the term reads: one may be missing only when
-  the term's value does not change with it.
-- A list and its index are made by one operation, in one order.
-- A position is made once and shared. Two terms that roll up the same sub-table read the
-  same variable.
-- The plan is read from the decision variables only. Positions are never read back.
-
 ## How a table maps onto CP-SAT
 
-This is the reference for the section above: every way a list is made, and what it
+Every way a list is made, how CP-SAT computes the index that reads it, and what that
 guarantees. A list is computed in numpy before the solve. CP-SAT returns the right entry
 because a list and its index are made together, by one rule in one order. Every operation
 that makes a new list also makes the constraint that computes the new index.
@@ -567,6 +461,69 @@ node's list is made from its arguments' lists.
 - A ladder is ascending, so position keeps order: the Min of the rungs is the rung of the
   Min. A value clamped to the bound can never be the result, so sharing the bound's rung
   changes nothing.
+
+**Two moves make every position.** A position above an input is never chosen. The
+inputs fix it through a chain of constraints, and only the last link, `cost ==
+table[index]`, reads a cost. That link names no decision variable when the index is
+derived. Every other link is one of two moves:
+
+- *Combine*: `parent == left * size(right) + right`. A linear equality that turns two
+  positions into one position in the larger table.
+- *Compact*: `short == remap[parent]`, one `add_element`. It renumbers a position onto
+  the rows that are distinct or that can occur.
+
+| Form | Moves |
+|---|---|
+| one table over several inputs | combine all the inputs |
+| rank | compact one list |
+| product of two lists | compact each, then combine |
+| Min/Max by rung | compact each operand to its rung, then take the min or max |
+| fold | combine the state with the next group, compact, repeat |
+
+The min or max over rungs is a compact that needs no table, because a ladder keeps order.
+
+**One constraint for both moves.** `add_allowed_assignments([left, right, out], rows)`
+lists the rows directly, and `out` is the next position up or the cost. It needs no
+strides, a domain with gaps needs no position lookup, and a row that cannot occur is left
+out. On the roll-up `Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)`, over the
+menus of the graph example, it replaces the six constraints of rungs, ranks and pair with
+two: `[division_a, division_b, rank_m]` with 6 rows and `[rank_m, division_c, cost]` with
+12.
+
+Both forms were run on the roll-up and agree at all 24 assignments. Which solves faster on
+real objectives is not measured. Both sit behind one helper. The default is combine and
+compact, and the last PR reports both on the replay.
+
+**What the chain must guarantee.** Let D be the decision variables a term reads.
+
+1. *Determined.* Once D has values, every position and the cost have one feasible value.
+   A position is never a choice, so the lowering adds no decisions to the search.
+2. *Total.* Every assignment of D the model allowed before still has a feasible chain.
+   The lowering never forbids a plan. A table constraint missing a row that can occur
+   would break this without any error.
+3. *Complete.* Walking the chain back from the cost reaches every variable of D that the
+   term's value depends on.
+4. *Correct.* The cost is the term's float value at that assignment, within the collapse
+   bound.
+
+On the roll-up, in both forms: the model has 24 solutions, one per assignment of the
+three divisions; minimizing and maximizing the cost at a fixed assignment give the same
+value; and the worst error is 0.43 units.
+
+**How the plan keeps them.**
+
+- A position is made only by a combine or a compact of positions that are determined, so
+  it is determined.
+- A remap has an entry for every value of its parent, and a table constraint has a row
+  for every combination its parents can take.
+- Every list carries its index and the set of decision variables behind that index.
+  Combine takes the union of the two sets, and compact keeps the set. At a linear term
+  the set is checked against the variables the term reads: one may be missing only when
+  the term's value does not change with it.
+- A list and its index are made by one operation, in one order.
+- A position is made once and shared. Two terms that roll up the same sub-table read the
+  same variable.
+- The plan is read from the decision variables only. Positions are never read back.
 
 **Collapsing float lists into linear terms.** Every list is float: the leaf lists over
 the menus, and each list made from them. CP-SAT cannot hold a float, so below a linear
@@ -773,8 +730,8 @@ factor (rule 4).
 
 ### The walk on the roll-up example
 
-`Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)`, from "When the final table no
-longer names its inputs". Each node shows its place in the visit order and the list
+`Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c)`, over the menus of the graph
+example. Each node shows its place in the visit order and the list
 `tabulate` returned for it. sympy orders the arguments, so the sum comes first.
 
 ```mermaid
@@ -812,13 +769,13 @@ flowchart TD
 | 12, the Max | several indexes | one table: 6 entries, against 8 by rung (a ladder of 3, rungs of 3 and 2) |
 | 13, the product | several indexes | from its parts: each child ranked to 3 distinct values and paired, 19 entries against 24 for one table |
 
-The collapsed table holds the nine entries of that section, in sympy's argument order:
+The collapsed table holds nine entries, in sympy's argument order:
 `[1280, 2217, 2560, 1536, 2660, 3072, 2048, 3547, 4096]`.
 
 **What depth first costs.** Rule 3 is applied at the node, before its parent is visited.
 At visit 12 one table is the cheaper list for the Max. Its parent then ranks that list
 with a 6-entry remap, where rungs would have cost 5 and needed no rank: 19 entries
-against the 18 of the chain drawn in that section. The walk could instead keep both
+against 18 for the Max by rung, paired with the ranked factor. The walk could instead keep both
 candidates on a node for its reader to choose, since nothing is in the model yet. The
 plan starts with the rule at the node, and the last PR reports entries per capture.
 
