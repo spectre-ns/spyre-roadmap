@@ -28,8 +28,10 @@ computed with numpy functions, and the code arrives in layers, each with its own
   its results only.
 - **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
   moves, combine and compact, and the table constraint is measured against them.
-- **One visitor, depth first (2026-11-17).** The lowering visits each node after its
-  arguments, and one function, `tabulate`, realizes a node. See Architecture.
+- **Two passes: parents first, then children first (2026-11-17).** A first pass visits
+  every parent before its children and marks the nodes a linear reader can reach. The
+  visitor then visits each node after its arguments, and one function, `tabulate`,
+  realizes a node. See Architecture.
 
 ## Estimates
 
@@ -607,13 +609,19 @@ assignment of the inputs, so an entry read from the wrong position fails.
 
 ## Architecture
 
-The lowering is one visitor over the cost expression. It visits each node depth first,
-the arguments before the node, so everything under a node is realized before the node
-is. One function, `tabulate`, realizes a node: it returns the node's float list and the
-index that reads it.
+The lowering is two passes over the cost expression. The first goes from the root down,
+every parent before its children, and marks each node that a linear reader can reach.
+The second is a visitor that visits each node depth first, the arguments before the
+node, so everything under a node is realized before the node is. One function,
+`tabulate`, realizes a node: it returns the node's float list and the index that reads
+it.
 
 ```python
 class TableLowering:
+    def lower(self, root):
+        self.linear_ok = mark_linear(root)                         # pass 1: parents first
+        return self.visit(root)                                     # pass 2: children first
+
     def visit(self, node):
         if node not in self.forms:                                  # each node once
             children = [self.visit(arg) for arg in children_of(node)]  # depth first
@@ -624,12 +632,12 @@ class TableLowering:
         return Forms(table=self.tabulate(node, children))           # realize the node
 
     def visit_Add(self, node, children):
-        return Forms(table=self.tabulate(node, children),
-                     linear=add_linear(children))
+        linear = add_linear(children) if self.linear_ok.get(node) else None
+        return Forms(table=self.tabulate(node, children), linear=linear)
 ```
 
-The code is a sketch. The order of the walk and `tabulate` are the design, and the other
-names may change.
+The code is a sketch. The order of the two passes and `tabulate` are the design, and the
+other names may change.
 
 - **Depth first, post-order.** `visit` owns the descent. A method is handed its node and
   its children's results, and never visits. Stage 1's `numpy_value` is the same walk
@@ -646,6 +654,43 @@ names may change.
   its literal and its division, and its prices are data.
 - **No model.** The walk reads the expression, the inputs and the cap, and computes in
   numpy. It adds nothing to the CP-SAT model and rounds nothing.
+
+### Pass 1: the nodes a linear reader can reach
+
+A node's linear form is of use only when some path from it to the objective runs through
+linear nodes only (see "How a table is read"). The first pass finds those nodes before
+any list is computed:
+
+```python
+def mark_linear(root):
+    ok = {root: True}                                  # the objective reads the root linearly
+    for node in reversed(post_order(root)):            # every parent before its children
+        if ok.get(node):
+            for child in linear_children(node):
+                ok[child] = True
+    return ok
+```
+
+- **Parents first.** Reverse post-order puts every parent of a node before the node,
+  shared nodes included. A pre-order walk that visits each node once does not: a node
+  shared by two terms is reached from the first term, and the mark the second term would
+  pass down comes too late.
+- **Linear children.** A sum's terms, a Min/Max's operands, and a product's factors, any
+  of which may be the rest of a switch (rule 4). Every other node passes no mark down:
+  the children of a power, a log, a floor, a Piecewise, a relational or a function are
+  read as tables.
+- **A shared node can need both forms.** In `Max(...) ** 0.5 + 3 * Max(...)` the Max is
+  marked through the sum and is still read as a table by the power. It builds its linear
+  form for the sum and its table for the power.
+- **What the mark changes.** A node not marked builds no linear form, and a Min/Max not
+  marked is never kept linear. Tables do not change, because a nonlinear reader needs
+  them and rule 3 compares against them.
+- **Checked.** The sketch was run with this pass and without it on 13 cases: the graph,
+  the roll-up, a Max under a power and under a sum, a Max shared by a power and a sum, a
+  log of a sum, a Piecewise and a shared subexpression, at caps where the Max does and
+  does not fit. Each case gives the same model both ways, and the pass leaves out 0 to 4
+  linear forms per case that no reader used. The sketch has no switch, so it marks a
+  product's factor only when the other factors are constants.
 
 ### `tabulate` realizes a node
 
@@ -690,13 +735,14 @@ tables are.
 | `visit_Min`, `visit_Max` | `tabulate` | `lin_min` or `lin_max` over the children's linear forms |
 | `visit_RelayoutCharge` | `tabulate`, or the number 0 when this solve does not divide the source | its literal as a gate on the price list |
 
-- **The reader picks the form.** A node is visited before its parent, so it cannot know
-  how it will be read. It returns the forms it has. `tabulate` reads tables. A linear
-  form reads each child's cheaper form in entries, and a Min/Max child stays linear only
-  under half the entries of its table (rule 3). The objective reads the root's linear
-  form. Only `visit_Add`, `visit_Mul`, `visit_Min` and `visit_Max` build a linear form,
-  so only they read one. `generic_visit` reads tables only: under `Max(...) ** 0.5` the
-  Max is read as its table, and a Max with no table leaves the power with no form.
+- **The reader picks the form.** Pass 1 tells a node whether a linear reader can reach
+  it, but not which form that reader will take, so the node returns the forms it has.
+  `tabulate` reads tables. A linear form reads each child's cheaper form in entries, and
+  a Min/Max child stays linear only under half the entries of its table (rule 3). The
+  objective reads the root's linear form. Only `visit_Add`, `visit_Mul`, `visit_Min` and
+  `visit_Max` read a linear form. They and `visit_RelayoutCharge` build one, on a marked
+  node only. `generic_visit` reads tables only: under `Max(...) ** 0.5` the Max is read
+  as its table, and a Max with no table leaves the power with no form.
 - **Multipliers go down in float.** Scaling a linear form multiplies its lists in numpy.
   Through a `lin_min` or `lin_max` it scales the operands, and a negative factor turns
   one into the other.
@@ -791,7 +837,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 |---|---|
 | 1 | `numpy_value`, and its one-node step that `tabulate` applies to lists |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `visit`, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the pass that builds the model, and `tabulate` for a leaf, for one index and for one table over the inputs |
+| 3 | `mark_linear` (pass 1), `visit`, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the pass that builds the model, and `tabulate` for a leaf, for one index and for one table over the inputs |
 | 4 | `tabulate` from a node's parts: by rung, rank and pair, and the choice by entries |
 | 5 | `tabulate` from a node's parts: the fold |
 | 6 | the linear form of `visit_Min` and `visit_Max`, and a constant times one child in `visit_Mul` |
@@ -907,9 +953,10 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 
 ### Stage 3: inputs, indexes, tables, linear sums
 
-- The visitor of Architecture arrives: the walk, `generic_visit`, `visit_Add`,
-  `visit_RelayoutCharge` and the pass that builds the model. `tabulate` realizes a leaf,
-  a node whose children share an index, and a node whose inputs fit one table.
+- The two passes of Architecture arrive: `mark_linear`, the walk, `generic_visit`,
+  `visit_Add`, `visit_RelayoutCharge` and the pass that builds the model. `tabulate`
+  realizes a leaf, a node whose children share an index, and a node whose inputs fit one
+  table.
 - Positions are made by two moves only, combine and compact, behind one helper. Each list
   carries the decision variables behind its index.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
@@ -931,6 +978,8 @@ returns None.
 Tests:
 
 - the walk visits a node after its arguments, and a subexpression two terms share once;
+- pass 1 marks every parent before its children: a node under a power is not marked, a
+  node shared by a power and a sum is, and a node not marked builds no linear form;
 - every list `tabulate` returns has the length of its index;
 - a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
