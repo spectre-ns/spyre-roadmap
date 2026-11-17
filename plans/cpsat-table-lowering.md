@@ -548,10 +548,19 @@ on real objectives is not measured. The table constraint is a second emitter,
 plan `TableLowering` returns (Architecture). The plan it builds is the same one. Where
 `CpEmitter` builds a position from two others by compacts and a combine,
 `AllowedEmitter` lists the rows, read off `CpIndex.positions`, and where a cost is read
-on such a position it puts the rounded cost in the rows as `out`. So the walk, rule 3
-and the cap count entries the same way under both, and the two models differ only in
-their constraints. Which steps one table constraint takes in is settled in Stage 8. The
-default is combine and compact, and Stage 9's replay reports both.
+on such a position it puts the rounded cost in the rows as `out`.
+
+Its rows are not the entries of the links they replace. A table constraint lists every
+combination of its columns that can occur, and independent columns occur in every
+combination: the product of their sizes, which is what rungs and ranks avoid. On the
+roll-up `[division_a, division_b, rank_m]` has 6 rows where the two rung remaps have
+5 entries, and `[rank_m, division_c, cost]` 12 where the rank remap and the cost table
+have 13. For the graph's Max over three divisions it is 24 rows against 9, and at the
+real menus of "On real menus" 4620 against 52. So the table constraint pays only on a
+link whose columns' product is small, and it would give back rule 1 if it took in a
+Min/Max's operands. Which links it takes in, and how its rows count against the cap,
+are settled in Stage 8. The default is combine and compact, and Stage 9's replay
+reports both.
 
 **What the chain must guarantee.** Let D be the decision variables a term reads.
 
@@ -1888,9 +1897,11 @@ factors raise; a product too wide for its factor's precision raises.
 
 `AllowedEmitter`, a second emitter, builds the same plan with
 `add_allowed_assignments` ("One constraint for both moves"): its rows are read off
-`CpIndex.positions`, and a cost read on a rolled-up position goes into the rows. Which
-steps one table constraint takes in is settled here. `CpEmitter` stays the default, and
-Stage 9's replay measures both.
+`CpIndex.positions`, and a cost read on a rolled-up position goes into the rows. A
+table constraint over independent columns has their product as rows, so it takes in a
+link only where its rows are no more than the entries of the `add_element`s it
+replaces, and its rows count against the cap as a table's entries do. `CpEmitter` stays
+the default, and Stage 9's replay measures both.
 
 Tests: a three-buffer roll-up, a Max by rung times a ranked factor, is exact under both
 emitters, with the same cost at every assignment, and its last lookup names no division;
