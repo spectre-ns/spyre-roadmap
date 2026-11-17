@@ -545,10 +545,12 @@ value; and the worst error is 0.43 units.
   it is determined.
 - A remap has an entry for every value of its parent, and a table constraint has a row
   for every combination its parents can take.
-- Every list carries its index and the set of decision variables behind that index.
-  Combine takes the union of the two sets, and compact keeps the set. At a linear term
-  the set is checked against the variables the term reads: one may be missing only when
-  the term's value does not change with it.
+- An index is a map between table positions, made from the inputs by combine and
+  compact only. A combine keeps both of its parts, and a compact merges positions only
+  where the values are equal. So a term's final index is a function of every input its
+  value depends on, by construction, and needs no check at run time. The exact tests
+  of every stage would catch a missing input: the value would be wrong at some
+  assignment, or one assignment would have several solutions.
 - A list and its index are made by one operation, in one order.
 - A position is made once and shared. Two terms that roll up the same sub-table read the
   same variable.
@@ -611,7 +613,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import sympy
@@ -628,16 +630,23 @@ class TableLoweringError(Exception):
 
 @dataclass(frozen=True)
 class CpIndex:
-    """A position into a table, 0 .. size - 1, and the recipe for its CP-SAT expression.
+    """A map from the inputs' positions to a position in one table, 0 .. size - 1, and
+    the recipe for its CP-SAT expression.
 
-    One of four kinds: an input variable; a combine, left * right.size + right, a linear
-    expression; a compact, remap[parent], one element lookup; a min or max of rungs, one
-    lin_min or lin_max. Equal by structure, so two nodes that make the same position
-    share one CpIndex, and CpBuild makes its expression once.
+    One of five kinds: an input, the position of its variable; a combine,
+    left * right.size + right, a linear expression; a compact, remap[parent], one
+    element lookup; a min or max of rungs, one lin_min or lin_max. Made from the inputs
+    by these alone, so the final index of a term is a function of every input it was
+    made from. Equal by structure, so two nodes that make the same position share one
+    CpIndex, and CpBuild makes its expression once.
     """
 
     size: int
-    inputs: frozenset[str]            # the decision variables that fix the position
+    kind: Literal["input", "combine", "compact", "min", "max"]
+    parts: tuple[CpIndex, ...] = ()           # combine: left, right; compact: parent;
+                                              # min or max: the rungs
+    remap: tuple[int, ...] = ()               # compact: parent position -> position
+    var: cp_model.IntVar | None = None        # input: its variable, already in the model
 
 
 @dataclass(frozen=True)
@@ -730,9 +739,8 @@ class TableLowering:
         """
 
     def build_model(self, model: cp_model.CpModel, root: CpNode) -> cp_model.LinearExprT:
-        """Check each list's decision variables against the variables its terms read,
-        then return CpBuild(model).linear(root.as_linear()). Only the variables that
-        form requests are made."""
+        """CpBuild(model).linear(root.as_linear()): only the variables that form
+        requests are made."""
 
 
 def lower_cost_with_tables(
@@ -834,8 +842,8 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
 
 `tabulate(node, children)` makes the node's candidate `CpTable`, or none. The node's
 value is `values[index]`. The index is a `CpIndex`: an input, a combine, a compact, or
-a min or max of rungs, a recipe until `CpBuild` makes its CP-SAT expression. It carries
-the decision variables behind it. A node is *tabulated* when it has its `CpTable`.
+a min or max of rungs, a recipe until `CpBuild` makes its CP-SAT expression. A node is
+*tabulated* when it has its `CpTable`.
 
 Every list of the lowering is made here, and a list is never made without its index.
 `tabulate` is the "one operation, in one order" of the guarantees above.
@@ -901,21 +909,19 @@ This is the table of "Which form a node takes", read from the leaves up.
 The walk ends with the root's `CpNode`. `build_model` is the only code that calls
 CP-SAT, and it makes a variable only when a form requests it:
 
-1. **Check.** Each list's decision variables are compared with the variables its terms
-   read (guarantee 3). A miss raises here, before the model changes.
-2. **Request.** `CpBuild(model).linear(root.as_linear())`. Each read pulls in what it
+1. **Request.** `CpBuild(model).linear(root.as_linear())`. Each read pulls in what it
    reads, and nothing else reaches the model: a table used only to compute a parent's
    table in numpy, or a candidate no parent read, adds no variable.
-3. **Positions, on request.** `CpBuild.index` makes each `CpIndex` once and memoizes
+2. **Positions, on request.** `CpBuild.index` makes each `CpIndex` once and memoizes
    it: an input is its variable, a combine is a linear expression, a compact is one
    `add_element`, and a min or max of rungs is one constraint. Its parts are requested
    first. This method is the one helper of Stage 3, so the table constraint replaces it
    without a change to the walk.
-4. **Collapse, on request.** `CpBuild.lookup` rounds each list once and reads it with one
+3. **Collapse, on request.** `CpBuild.lookup` rounds each list once and reads it with one
    `add_element`, memoized by index and table. An affine list is a linear expression
    with no table, and a constant list is a number.
 
-Floats become integers in step 4. The one other place is the `p/q` of a switched
+Floats become integers in step 3. The one other place is the `p/q` of a switched
 factor (rule 4).
 
 ### The walk on the roll-up example
@@ -1106,8 +1112,7 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
   `visit_Add`, `visit_RelayoutCharge` and the pass that builds the model. `tabulate`
   realizes a leaf, a node whose children share an index, and a node whose inputs fit one
   table.
-- Positions are made by two moves only, combine and compact, behind one helper. Each list
-  carries the decision variables behind its index.
+- Positions are made by two moves only, combine and compact, behind one helper.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
   their index. Any other variable is indexed by its domain, through a position lookup
   when the domain has gaps. A domain past the cap is not an input.
@@ -1133,8 +1138,6 @@ Tests:
 - every list `tabulate` returns has the length of its index;
 - a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
-- a term whose chain misses a variable it depends on is refused when the objective is
-  planned;
 - a coefficient is applied before the rounding: `7 * split ** 0.5` at split 2 is 10137,
   not 7 * 1448;
 - terms on one index are added before the rounding: `split ** 0.5 + split ** 0.7` at
