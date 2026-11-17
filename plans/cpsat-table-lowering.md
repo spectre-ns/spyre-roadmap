@@ -838,6 +838,8 @@ class CpNode:
 
     expr: sympy.Basic                 # injected, read only; never changed
     children: tuple[CpNode, ...]      # the CpNodes of children_of(expr)
+    linear_ok: bool = False           # pass 1: a linear reader can reach it; only a
+                                      # CpLinearNode builds a linear form from it
 
     def visit_op(self, lowering: TableLowering) -> None:
         """Pass 2 on this node, once, after its children: its candidate table. A
@@ -860,8 +862,6 @@ class CpNode:
 class CpLinearNode(CpNode):
     """A node that can be linear in its children: expr is an Add, Mul, Max, Min or
     RelayoutCharge."""
-
-    linear_ok: bool                   # pass 1: a linear reader can reach it
 
     def visit_op(self, lowering: TableLowering) -> None:
         """CpNode.visit_op, with one more candidate table from expr's own parts: by rung
@@ -1072,9 +1072,9 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
   marked through the sum and is still read as a table by the power. It builds its linear
   form for the sum and its table for the power.
 - **What the mark changes.** A `CpLinearNode` not marked builds no linear form, and a
-  Min/Max not marked is never kept linear. Any other `CpNode` has no mark: it never
-  builds one. Tables do not change, because a nonlinear reader needs them and rule 3
-  compares against them.
+  Min/Max not marked is never kept linear. Any other `CpNode` carries the mark too,
+  `linear_ok` defaulting to false, but builds no linear form from it. Tables do not
+  change, because a nonlinear reader needs them and rule 3 compares against them.
 - **Checked.** The sketch was run with this pass and without it on 13 cases: the graph,
   the roll-up, a Max under a power and under a sum, a Max shared by a power and a sum, a
   log of a sum, a Piecewise and a shared subexpression, at caps where the Max does and
