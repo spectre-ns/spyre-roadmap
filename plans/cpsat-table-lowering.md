@@ -813,26 +813,43 @@ class CpLinear:
 
 @dataclass(eq=False)
 class CpNode:
-    """The CP-SAT counterpart of one sympy node, which it never changes.
+    """The CP-SAT counterpart of one sympy node, which it never changes: a node with no
+    linear form of its own, such as a symbol, a number, Pow, log, floor, Piecewise, a
+    relational or a function.
 
     The CpNodes form the same graph as the sympy nodes: children holds the CpNodes of
     the sympy node's children, made before it, and a subexpression shared by two
     parents is one CpNode that both hold. A parent reads a child as a table or
-    linearly. Each read is made on first request and memoized, so a node that two
-    parents read differently makes both, and a read nobody requests is never made.
+    linearly, whatever the child's class. Each read is made on first request and
+    memoized, so a node that two parents read differently makes both, and a read nobody
+    requests is never made. Neither read touches the model.
     """
 
     expr: sympy.Basic                 # the sympy node, read only
     children: tuple[CpNode, ...]      # its children's CpNodes, in children_of order
-    linear_ok: bool                   # pass 1: a linear reader can reach it
 
     def as_table(self) -> CpTable:
         """The node read as a table, from pass 2's candidate. Raises TableLoweringError
         when no table of it fits the cap."""
 
     def as_linear(self) -> CpLinear:
-        """The node read linearly: its own linear form, or its table as one list,
-        whichever rule 3 prefers (margin 2 for a Min/Max). Raises TableLoweringError
+        """The node read linearly: as_table() as one list,
+        CpLinear(lists={table.index: table.values})."""
+
+
+@dataclass(eq=False)
+class CpLinearNode(CpNode):
+    """A node that can be linear in its children: Add, Mul, Min, Max or RelayoutCharge.
+    Pass 2 makes one for these classes, a CpNode for every other."""
+
+    linear_ok: bool                   # pass 1: a linear reader can reach it
+
+    def as_linear(self) -> CpLinear:
+        """The node read linearly, by rule 3: its own linear form when it has no table
+        under the cap; its table as one list when it is not linear_ok; otherwise the
+        one with fewer entries, the linear form needing under half the table's for a
+        Min/Max (margin 2). Looks at the table candidate rather than calling as_table,
+        which would raise where the linear form must win. Raises TableLoweringError
         when it has neither."""
 
 
@@ -884,14 +901,17 @@ are the printer's two maps. With `Inputs` as an empty class the sketch passes my
 torch-spyre's settings (`pyproject.toml:131`), the bodies being empty.
 
 - **One `CpNode` per sympy node, in the same graph.** Pass 2 makes a node's `CpNode` from
-  its children's, which it made earlier, so the `CpNode`s form the sympy graph again
+  its children's, which it made earlier: a `CpLinearNode` for Add, Mul, Min, Max and
+  `RelayoutCharge`, a plain `CpNode` for every other class, so the `CpNode`s form the sympy graph again
   with their own edges. It finds a node's `CpNode` through a map keyed by the sympy
   node, which is hashable and compares by structure, so a subexpression that two terms
   share is one `CpNode` that both parents hold: both read one list and one position.
   Every result lives on the `CpNode`. The expression is the same object, unchanged,
   after the lowering.
-- **Read as a table or linearly.** Pass 2 leaves each `CpNode` with a candidate table, a
-  candidate linear form, or both. A parent reads a child with `as_table` or `as_linear`,
+- **Read as a table or linearly.** Pass 2 leaves each `CpNode` with a candidate table,
+  and a `CpLinearNode` also with a candidate linear form when it is marked. A parent
+  reads any child with `as_table` or `as_linear`; on a plain `CpNode`, `as_linear` is
+  its table as one list,
   and each read is made on first request and memoized: a node read both ways, such as a
   Max under a power and a sum, makes both, and a candidate no parent reads goes no
   further. A node left with neither candidate raises `TableLoweringError` at once,
@@ -945,8 +965,9 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
 - **A shared node can need both forms.** In `Max(...) ** 0.5 + 3 * Max(...)` the Max is
   marked through the sum and is still read as a table by the power. It builds its linear
   form for the sum and its table for the power.
-- **What the mark changes.** A `CpNode` not marked builds no linear form, and a Min/Max not
-  marked is never kept linear. Tables do not change, because a nonlinear reader needs
+- **What the mark changes.** A `CpLinearNode` not marked builds no linear form, and a
+  Min/Max not marked is never kept linear. A plain `CpNode` has no mark: it never builds
+  one. Tables do not change, because a nonlinear reader needs
   them and rule 3 compares against them.
 - **Checked.** The sketch was run with this pass and without it on 13 cases: the graph,
   the roll-up, a Max under a power and under a sum, a Max shared by a power and a sum, a
@@ -992,20 +1013,20 @@ give the `CpNode` a second candidate beside the table. A *linear form*, a `CpLin
 a constant, one float list per index, and the `lin_min`, `lin_max` and switched terms
 inside it. It is float, as the tables are.
 
-| Method | Table | Linear form |
-|---|---|---|
-| `generic_visit`: symbols, numbers, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | `tabulate` | none |
-| `visit_Add` | `tabulate` | the children's linear forms added, where lists on one index become one list |
-| `visit_Mul` | `tabulate` | constants times one child: that child's linear form, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
-| `visit_Min`, `visit_Max` | `tabulate` | `lin_min` or `lin_max` over the children's linear forms |
-| `visit_RelayoutCharge` | `tabulate`, or the number 0 when this solve does not divide the source | its literal as a gate on the price list |
+| Method | Makes | Table | Linear form |
+|---|---|---|---|
+| `generic_visit`: symbols, numbers, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | `CpNode` | `tabulate` | none: `as_linear` is the table as one list |
+| `visit_Add` | `CpLinearNode` | `tabulate` | the children's `as_linear` added, where lists on one index become one list |
+| `visit_Mul` | `CpLinearNode` | `tabulate` | constants times one child: that child's `as_linear`, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
+| `visit_Min`, `visit_Max` | `CpLinearNode` | `tabulate` | `lin_min` or `lin_max` over the children's `as_linear` |
+| `visit_RelayoutCharge` | `CpLinearNode` | `tabulate`, or the number 0 when this solve does not divide the source | its literal as a gate on the price list |
 
 - **The reader picks the read.** Pass 1 tells a node whether a linear reader can reach
   it, but not which read that reader will make, so the `CpNode` keeps its candidates.
-  `tabulate` calls `as_table` on its children. A linear form calls `as_linear`, which
-  returns the child's own linear form or its table as one list, whichever has fewer
-  entries; a Min/Max keeps its linear form only under half the entries of its table
-  (rule 3). The objective reads the root with `as_linear`. Only `visit_Add`,
+  `tabulate` calls `as_table` on its children. A linear form calls `as_linear` on every
+  child: a plain `CpNode` returns its table as one list, and a `CpLinearNode` its own
+  linear form or its table, whichever has fewer entries; a Min/Max keeps its linear
+  form only under half the entries of its table (rule 3). The objective reads the root with `as_linear`. Only `visit_Add`,
   `visit_Mul`, `visit_Min` and `visit_Max` call `as_linear`. They and
   `visit_RelayoutCharge` build a linear candidate, on a marked node only.
   `generic_visit` calls `as_table` only: under `Max(...) ** 0.5` the Max is read as its
@@ -1111,7 +1132,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 |---|---|
 | 1 | `numpy_value`, and its one-node step that `tabulate` applies to lists |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, pass 1, pass 2, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the `cp_expr` methods that make the model's variables, and `tabulate` for a leaf, for one index and for one table over the inputs |
+| 3 | `CpNode`, `CpLinearNode`, pass 1, pass 2, `generic_visit`, `visit_Add`, `visit_RelayoutCharge`, the `cp_expr` methods that make the model's variables, and `tabulate` for a leaf, for one index and for one table over the inputs |
 | 4 | `tabulate` from a node's parts: by rung, rank and pair, and the choice by entries |
 | 5 | `tabulate` from a node's parts: the fold |
 | 6 | the linear form of `visit_Min` and `visit_Max`, and a constant times one child in `visit_Mul` |
@@ -1228,10 +1249,10 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 
 ### Stage 3: inputs, indexes, tables, linear sums
 
-- The two passes of Architecture arrive: `CpNode`, pass 1, pass 2, `generic_visit`,
-  `visit_Add`, `visit_RelayoutCharge` and the `cp_expr` methods. `tabulate`
-  realizes a leaf, a node whose children share an index, and a node whose inputs fit one
-  table.
+- The two passes of Architecture arrive: `CpNode`, `CpLinearNode`, pass 1, pass 2,
+  `generic_visit`, `visit_Add`, `visit_RelayoutCharge` and the `cp_expr` methods.
+  `tabulate` realizes a leaf, a node whose children share an index, and a node whose
+  inputs fit one table.
 - Positions are made by injected `IndexMap` steps: `Input`, `Combine` and `Compact` here,
   `Extreme` in Stage 4.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
@@ -1256,6 +1277,8 @@ Tests:
   with one `CpNode`; the expression is the same object, equal to a copy taken before;
 - pass 1 marks every parent before its children: a node under a power is not marked, a
   node shared by a power and a sum is, and a node not marked builds no linear form;
+- Add, Mul, Min, Max and `RelayoutCharge` get a `CpLinearNode` and every other class a
+  `CpNode`; a plain `CpNode` read with `as_linear` is its table as one list;
 - every list `tabulate` returns has the length of its index;
 - a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
