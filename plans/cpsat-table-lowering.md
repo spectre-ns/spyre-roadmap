@@ -614,11 +614,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import numpy.typing as npt
 import sympy
 from ortools.sat.python import cp_model
-
-Floats = npt.NDArray[np.float64]
 
 
 class TableLoweringError(Exception):
@@ -647,7 +644,7 @@ class CpIndex:
 class CpTable:
     """A node read as a table: values[index], made together and never apart."""
 
-    values: Floats                    # the value at each position, float until collapsed
+    values: np.ndarray                # the value at each position, float until collapsed
     index: CpIndex
 
     def __post_init__(self) -> None:
@@ -664,7 +661,7 @@ class CpLinear:
     """A node read linearly, float until CpBuild collapses it."""
 
     constant: float = 0.0
-    lists: dict[CpIndex, Floats] = field(default_factory=dict)   # one list per index
+    lists: dict[CpIndex, np.ndarray] = field(default_factory=dict)   # one list per index
     extrema: list[tuple[bool, list[CpLinear]]] = field(default_factory=list)  # is_min, operands
     switched: list[tuple[CpTable, CpLinear]] = field(default_factory=list)    # rule 4
 
@@ -758,8 +755,8 @@ methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
 the sections below describe them. The order of the two passes, `CpNode` and `tabulate`
 are the design, and the other names may change. `Inputs` is the map from each symbol to
 its input and column ("How a table maps onto CP-SAT"), and `sym_map` and `buffer_map`
-are the printer's two maps. With `Inputs` as an empty class the sketch passes
-`mypy --strict`, sympy being untyped and the bodies empty.
+are the printer's two maps. With `Inputs` as an empty class the sketch passes mypy with
+torch-spyre's settings (`pyproject.toml:131`), the bodies being empty.
 
 - **One `CpNode` per sympy node.** The map is keyed by the sympy node, which is hashable
   and compares by structure, so a subexpression that two terms share has one `CpNode`:
