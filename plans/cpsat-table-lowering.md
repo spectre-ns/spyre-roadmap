@@ -852,20 +852,12 @@ class CpNode:
     def visit_op(self, lowering: TableLowering) -> None:
         """Pass 2 on this node, once, after its children: its candidate table. A
         symbol's is its input's column; a number's, its value on the Unit position. An
-        operation's is grid_table or parts_table, whichever has fewer entries (rule 3),
-        or none when neither fits the cap; its numpy step is found by type(expr)'s name
-        (Stage 1's lookup), or is lambdify of expr where numpy has none. Raises
-        TableLoweringError when the node ends with no candidate."""
-
-    def grid_table(self, lowering: TableLowering) -> CpTable | None:
-        """One table over the inputs of expr.free_symbols: expr evaluated on their
-        grid, on the inputs combined. None when the grid passes the cap, which is known
-        before any value is made."""
-
-    def parts_table(self, lowering: TableLowering) -> CpTable | None:
-        """The table from its children's tables. On one shared index, expr's step
-        elementwise, with no new position. Otherwise each child's table ranked to its
-        distinct values, the ranks combined, and the step applied across them."""
+        operation's is the cheaper, in entries, of two (rule 3), or none when neither
+        fits the cap: one table over the inputs of expr.free_symbols, expr evaluated on
+        their grid; or the table from its children's tables, its numpy step applied
+        across them. The step is found by type(expr)'s name (Stage 1's lookup), or is
+        lambdify of expr where numpy has none. Raises TableLoweringError when the node
+        ends with no candidate."""
 
     def as_table(self) -> CpTable:
         """The node read as a table. Raises TableLoweringError when it has none."""
@@ -1112,11 +1104,11 @@ Every list of the lowering is made here, and a list is never made without its in
    children's, and no entry is added. A term over one buffer's symbols never leaves this
    case.
 4. **Children on several indexes.** There are two candidates:
-   - *one table*, the node's `grid_table`: `expr` evaluated on the grid of the inputs of
-     its free symbols, on the inputs combined;
-   - *from its parts*, the node's `parts_table`, and on a `CpLinearNode` also its rule's:
-     by rung for a Max or Min (rule 1), by fold of Min/Max factors for a Mul (rule 2),
-     and for any node each child's list compacted to its distinct values, the positions
+   - *one table*: `expr` evaluated on the grid of the inputs of its free symbols, on the
+     inputs combined;
+   - *from its parts*, and on a `CpLinearNode` also from the parts its `expr` allows: by
+     rung for a Max or Min (rule 1), by fold of Min/Max factors for a Mul (rule 2), and
+     for any node each child's list compacted to its distinct values, the positions
      combined and the node's step applied across them.
 5. **The cheaper one.** The candidate with fewer entries is the table (rule 3). Its
    entries are its list plus the remaps under its index. A candidate's size is known
@@ -1134,7 +1126,7 @@ switched terms inside it. It is float, as the tables are.
 |---|---|---|
 | `CpNode`, a symbol | its input's column | none: its column as one list |
 | `CpNode`, a number | one value on `Unit` | its constant |
-| `CpNode`, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | `grid_table` or `parts_table` | none: `as_linear` is the table as one list |
+| `CpNode`, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | one table over its inputs, or from its parts | none: `as_linear` is the table as one list |
 | `CpLinearNode`, an Add | the same | the children's `as_linear` added, where lists on one index become one list |
 | `CpLinearNode`, a Mul | the same, or the fold of Min/Max factors (rule 2) | constants times one child, through `expr.as_coeff_Mul()`: that child's `as_linear`, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
 | `CpLinearNode`, a Max or Min | the same, or by rung (rule 1) | `lin_max` or `lin_min` over the children's `as_linear`, kept only under half the table's entries |
@@ -1253,7 +1245,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 | 1 | `numpy_value`, and its one-node step, which `visit_op` finds for each operation |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
 | 3 | `CpNode`, `CpLinearNode`, `normalize`, pass 1, `rewrite`, the `cp_expr` methods that make the model's variables, `visit_op` for a leaf, for one index and for one table over the inputs, and the linear forms of an Add and a `RelayoutCharge` |
-| 4 | `parts_table`'s rank and pair, a Max's or Min's table by rung, and the choice by entries |
+| 4 | the table from a node's parts: rank and pair, a Max's or Min's table by rung, and the choice by entries |
 | 5 | a Mul's table by fold |
 | 6 | the linear form of a Max or Min, and of a constant times one child in a Mul |
 | 7 | the switch and the gate in a Mul's linear form, and a `RelayoutCharge`'s gate |
@@ -1422,8 +1414,8 @@ Tests:
 
 ### Stage 4: rule 1 and parts
 
-All of this stage is in `parts_table` and `tabulate`: the second candidate, the form
-from a node's parts, and the choice between the two.
+All of this stage is in `tabulate`: the second candidate, the form from a node's parts,
+and the choice between the two.
 
 - A Min/Max of indexed operands is indexed by rung (rule 1).
 - Equal values share one rank, and a product of two short lists is one table over the
