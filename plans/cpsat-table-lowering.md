@@ -604,77 +604,76 @@ sympy nodes are immutable, and the lowering never changes one. Each node it meet
 `CpNode`, its CP-SAT counterpart, which holds what the lowering knows about the node:
 
 ```python
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import sympy
+from ortools.sat.python import cp_model
+
+
+class TableLoweringError(Exception):
+    """An objective the tables cannot lower, naming the node left with no form and why.
+
+    Subclasses none of RuntimeError, TypeError and ValueError, so the except around the
+    objective in _minimize_cost_expr cannot turn it into the traffic-objective solve.
+    """
 
 
 @dataclass
 class CpNode:
     """The CP-SAT counterpart of one sympy node, which it never changes."""
+
     expr: sympy.Basic                 # the sympy node, read only
     linear_ok: bool = False           # pass 1: a linear reader can reach it
     table: Table | None = None        # pass 2: tabulated, a float list on an index
     linear: Linear | None = None      # pass 2: linear, built only when linear_ok
-    done: bool = False
-
-
-Visit = Callable[[CpNode, list[CpNode]], None]      # sets the node's table and/or linear
-
-
-def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]: ...
-def linear_children(expr: sympy.Basic) -> tuple[sympy.Basic, ...]: ...
-def add_linear(children: list[CpNode]) -> Linear: ...
+    done: bool = False                # pass 2 has realized it
 
 
 class TableLowering:
+    """One cost expression, lowered to tables and linear forms, then to CP-SAT."""
+
     def __init__(self, inputs: Inputs, cap: int) -> None:
-        self.inputs = inputs
-        self.cap = cap
-        self.nodes: dict[sympy.Basic, CpNode] = {}   # sympy node -> CpNode
+        """inputs maps each symbol to its input and column; cap bounds one table."""
 
     def lower(self, root: sympy.Basic) -> CpNode:
-        self.cp(root).linear_ok = True                   # the objective reads it linearly
-        for expr in sympy.preorder_traversal(root):      # pass 1: parents first
-            if self.cp(expr).linear_ok:
-                for child in linear_children(expr):
-                    self.cp(child).linear_ok = True
-        for expr in sympy.postorder_traversal(root):     # pass 2: children first
-            node = self.cp(expr)
-            if not node.done:                            # each node once
-                children = [self.cp(arg) for arg in children_of(expr)]
-                self.method_for(expr)(node, children)    # sets node.table, node.linear
-                node.done = True
-        return self.cp(root)
+        """Run both passes and return the root's CpNode.
 
-    def cp(self, expr: sympy.Basic) -> CpNode:
-        return self.nodes.setdefault(expr, CpNode(expr))
+        Pass 1 iterates preorder_traversal and sets linear_ok, repeats kept. Pass 2
+        iterates postorder_traversal and realizes each node once, after its arguments.
+        Writes nothing to a model. Raises TableLoweringError at the first node left with
+        neither a table nor a linear form.
+        """
 
-    def method_for(self, expr: sympy.Basic) -> Visit:    # sympy.Add -> visit_Add
-        for cls in type(expr).__mro__:                   # the class, then its bases
-            method: Visit | None = getattr(self, f"visit_{cls.__name__}", None)
-            if method is not None:
-                return method
-        return self.generic_visit                        # Pow, log, floor, ...
+    def build_model(self, model: cp_model.CpModel, root: CpNode) -> cp_model.LinearExpr:
+        """The objective read linearly from root: check each list's decision variables,
+        make each position once, collapse each list and add its lookup. The only method
+        that writes to the model."""
 
-    def tabulate(self, expr: sympy.Basic, children: list[CpNode]) -> Table | None: ...
 
-    def generic_visit(self, node: CpNode, children: list[CpNode]) -> None:
-        node.table = self.tabulate(node.expr, children)
-
-    def visit_Add(self, node: CpNode, children: list[CpNode]) -> None:
-        node.table = self.tabulate(node.expr, children)
-        if node.linear_ok:
-            node.linear = add_linear(children)
+def lower_cost_with_tables(
+    model: cp_model.CpModel,
+    sym_map: Mapping[str, Any],
+    buffer_map: Mapping[str, Any],
+    cost_expr: sympy.Basic,
+    cap: int,
+) -> cp_model.LinearExpr:
+    """cost_expr as a CP-SAT objective in COST_SCALE units, from tables and linear forms.
+    Raises TableLoweringError, with the model untouched, when it cannot."""
 ```
 
-The code is a sketch. The order of the two passes, `CpNode` and `tabulate` are the
-design, and the other names may change. `Table` is a float list and the index that reads
-it (`tabulate`, below), `Linear` a linear form ("A node that is not one list"), and
-`Inputs` the map from each symbol to its input and column ("How a table maps onto
-CP-SAT"). With those three as empty classes, the sketch passes `mypy --strict`, sympy
-being untyped and the helpers stubs.
+The sketch is the public interface only: signatures and docstrings, with the bodies left
+to the stages. Inside `TableLowering`, the dispatch to one method per node class, the
+methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
+`visit_RelayoutCharge`), `tabulate` and the reader that applies rule 3 are private, and
+the sections below describe them. The order of the two passes, `CpNode` and `tabulate`
+are the design, and the other names may change. `Table` is a float list and the index
+that reads it (`tabulate`, below), `Linear` a linear form ("A node that is not one
+list"), and `Inputs` the map from each symbol to its input and column ("How a table maps
+onto CP-SAT"). `sym_map` and `buffer_map` are the printer's two maps. With `Table`,
+`Linear` and `Inputs` as empty classes the sketch passes `mypy --strict`, sympy being
+untyped and the bodies empty.
 
 - **One `CpNode` per sympy node.** The map is keyed by the sympy node, which is hashable
   and compares by structure, so a subexpression that two terms share has one `CpNode`:
@@ -694,9 +693,9 @@ being untyped and the helpers stubs.
   nodes, 3 to 11 per distinct node, in at most 0.1 s. Expressions are 6 to 17 deep, so
   recursion would not overflow; the loops are chosen for clarity and so that no depth
   can.
-- **One method per class.** `method_for` looks for `visit_<Class>` along the node's class
-  and its bases, and falls back to `generic_visit`. The bases matter: `Integer(1)` is
-  class `One` and `Rational(1, 2)` is `Half`. The printer on `main` dispatches the same
+- **One method per class.** A private dispatch looks for `visit_<Class>` along the
+  node's class and its bases, and falls back to `generic_visit`. The bases matter:
+  `Integer(1)` is class `One` and `Rational(1, 2)` is `Half`. The printer on `main` dispatches the same
   way through sympy's `Printer` (`cpsat_expr_printer.py:186`), but each of its methods
   prints its own arguments.
 - **Children.** A node's children are its arguments, with two exceptions. A Piecewise's
@@ -714,10 +713,11 @@ linear nodes only (see "How a table is read"). The first pass finds those nodes 
 any list is computed:
 
 ```python
+nodes: dict[sympy.Basic, CpNode] = {root: CpNode(root, linear_ok=True)}
 for expr in sympy.preorder_traversal(root):           # parents first, repeats kept
-    if cp(expr).linear_ok:                            # the root starts marked
-        for child in linear_children(expr):
-            cp(child).linear_ok = True
+    if nodes.setdefault(expr, CpNode(expr)).linear_ok:
+        for child in linear_children(expr):           # see "Linear children" below
+            nodes.setdefault(child, CpNode(child)).linear_ok = True
 ```
 
 - **Parents first, shared nodes included.** `preorder_traversal` repeats a shared node
