@@ -26,8 +26,10 @@ computed with numpy functions, and the code arrives in layers, each with its own
   a class the dict does not hold stays on lambdify. There is no generic lookup of numpy
   functions by name. This replaces the 2026-11-16 decision, numpy first by name with
   lambdify as the backup.
-- **A stack of PRs**, one per stage, off torch-spyre `main`. #6315 stays open as the
-  reference result and closes when the flag reproduces it.
+- **A stack of PRs in the fork**, one per stage, each on the one before. Stage 1 is
+  spectre-ns/torch-spyre#32, on the fork's `main` (92582da3, torch-spyre `main` of
+  2026-11-17). #6315 stays open as the reference result and closes when the flag
+  reproduces it.
 - **Off by default.** Stages 1 to 10 add files nothing imports. Stage 11 adds the flag.
 - **Base mechanics first, then one optimization per stage, integration last
   (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
@@ -1662,9 +1664,11 @@ by `sympy.lambdify`; numpy steps come in Stage 2.
 
 **Values by lambdify.** `values_on_grid(expr, columns, shape)` lambdifies `expr` over its
 free symbols with the `numpy` module, once per node and cached, and evaluates it at every
-joint assignment of the node's inputs, row-major, the last input fastest. It refuses a
-value that is not finite, which is how a Piecewise with no arm true is refused: lambdify
-writes it as `select(..., default=nan)`. A node whose lambdified function takes scalars
+joint assignment of the node's inputs, row-major, the last input fastest. A value need
+not be finite inside the walk: an arm of a Piecewise is infinite where it is not taken,
+and every node has its own table. A list read into the objective must be finite, which
+is how a Piecewise with no arm true is refused: lambdify writes it as
+`select(..., default=nan)`. A node whose lambdified function takes scalars
 only is evaluated point by point: `RelayoutCharge`'s `_imp_` rounds its division with
 `round`, which an array does not take (checked on sympy 1.14). lambdify maps each sympy
 function to sympy's own meaning: `sinc(1)` is 0.84, as in sympy.
@@ -1707,8 +1711,8 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 - a variable with gaps in its domain reads the entry of its value, through `Locate`, and
   so does one whose domain starts above 0;
 - `values_on_grid`: row-major order over axes of three sizes, two symbols on one axis, a
-  constant broadcast; a value that is not finite is refused; each node is lambdified
-  once;
+  constant broadcast; a value that is not finite is refused when read into the
+  objective; each node is lambdified once;
 - a Piecewise cost, with an infinite value in an arm not taken, is exact, and one with
   no arm true is refused; `sympy.sec` and `sympy.sinc` give sympy's values; a relayout
   charge, one table over its literal and its division, is exact; an undefined function
@@ -2056,5 +2060,5 @@ After Stage 11, posted on that PR:
 
 ## Next step
 
-Stage 1 starts in a new torch-spyre worktree off `upstream/main`. PRs to torch-spyre open
-on the owner's go.
+Stage 1 is built: spectre-ns/torch-spyre#32, branch `table-lowering-1-base-experimental`,
+24 device-free tests. Stage 2 stacks on it in the fork.
