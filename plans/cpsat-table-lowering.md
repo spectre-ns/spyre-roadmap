@@ -103,6 +103,13 @@ that turn out affine and cost nothing, so it runs high.
   ways. *By rung*, `lin_max` takes the max of small integer positions, and one lookup
   then reads the cost (rule 1). *Kept linear*, each operand is collapsed to an integer
   cost, and `lin_max` takes the max of the costs, with no table for the Min/Max itself.
+- *Kept linear* is open to a Min/Max only when every node between it and the objective
+  is linear in it: a sum, a constant factor (a negative one turns Max into Min), another
+  Min/Max, or a product switched on a factor's values (rule 4), which is linear once the
+  factor's value is fixed. `Max(...) ** 0.5` is not: CP-SAT has no root of a `lin_max`.
+  Neither is a log, a floor, a division by the Min/Max or a condition on it. Under such
+  a node the Min/Max must be a table, by rung or over its inputs, and when neither fits
+  the cap the printer takes the whole objective.
 - Lists are float from the leaves up. CP-SAT holds positions only, until a list is
   collapsed into a linear term (next section).
 
@@ -114,8 +121,8 @@ The four rules that keep lists short:
 2. A product of Min/Max factors over shared inputs is indexed by the tuples of rungs that
    can occur together, found by a chain of small tables, one per group of shared inputs.
 3. A node takes the cheaper, in entries, of one table over its inputs and the form built
-   from its parts. In the objective a Min/Max stays linear when that needs under half the
-   entries of its table.
+   from its parts. A Min/Max with only linear nodes above it stays linear when that needs
+   under half the entries of its table.
 4. A product whose factor cannot share a table with the rest is switched on the factor's
    value: one literal per value holds the product at that value times the rest. A 0/1
    literal times a term is the two-value case.
@@ -278,8 +285,8 @@ its inputs and the form from its parts, and `tabulate` keeps the one with fewer 
 (rule 3). Both sizes are known before any list is computed: one table is the product of
 its inputs' sizes, and the form from its parts is its list (the product of the parts'
 distinct values, or the ladder) plus the remaps under its index. A candidate past the cap
-is never evaluated. In the objective a Min/Max stays a `lin_min`/`lin_max` only when that
-needs under half the entries of its table.
+is never evaluated. A Min/Max with only linear nodes above it stays a
+`lin_min`/`lin_max` when that needs under half the entries of its table.
 
 **On the graph above.** Its menus are 3, 2 and 4 long, and one table over all three is 24
 entries. The reductions bring that to 23, so on menus this short they barely matter.
@@ -402,7 +409,7 @@ flowchart TD
     Q1 -- no --> Q2{"can it be one list?"}
     Q2 -- yes --> A2["its inputs fit one table,<br/>or its parts give a shorter list<br/>(rules 1, 2, 3)<br/>collapse it: one element lookup"]
     Q2 -- no --> Q3{"Min or Max?"}
-    Q3 -- yes --> A3["kept linear<br/>lin_min or lin_max over its operands"]
+    Q3 -- yes --> A3["kept linear, when every node above it is linear<br/>lin_min or lin_max over its operands"]
     Q3 -- no --> Q4{"a product?"}
     Q4 -- yes --> A4["rule 4: switched on a factor<br/>a 0/1 literal is a gate"]
     Q4 -- no --> A5["not lowered<br/>the printer takes the whole objective"]
@@ -687,7 +694,9 @@ tables are.
   how it will be read. It returns the forms it has. `tabulate` reads tables. A linear
   form reads each child's cheaper form in entries, and a Min/Max child stays linear only
   under half the entries of its table (rule 3). The objective reads the root's linear
-  form.
+  form. Only `visit_Add`, `visit_Mul`, `visit_Min` and `visit_Max` build a linear form,
+  so only they read one. `generic_visit` reads tables only: under `Max(...) ** 0.5` the
+  Max is read as its table, and a Max with no table leaves the power with no form.
 - **Multipliers go down in float.** Scaling a linear form multiplies its lists in numpy.
   Through a `lin_min` or `lin_max` it scales the operands, and a negative factor turns
   one into the other.
@@ -984,7 +993,8 @@ crossed ladders pass; no fold when the crossed lists fit.
 the table.
 
 - A Min/Max too wide to index, or whose table is over twice its linear form, stays a
-  `lin_min`/`lin_max` over linear operands.
+  `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
+  sums, constant factors and other Min/Max nodes here, and the switch of Stage 7.
 - A coefficient on the Min/Max is applied to its operands' lists before they are
   collapsed. A negative one turns Min into Max.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
@@ -994,7 +1004,9 @@ the table.
 Tests: a Min of two sums of residency literals stays linear and is exact, with no table
 over its inputs; a near tie keeps the table; a negative coefficient gives a `lin_max`;
 a fractional coefficient on a linear Min is within the largest operand's bound; each
-operand is a single variable.
+operand is a single variable; a Max too wide to index under a power, a log or a division
+is refused with the model untouched, and the same Max under a sum, a constant and a Min
+stays linear.
 
 ### Stage 7: rule 4
 
