@@ -1,7 +1,8 @@
 # CP-SAT table lowering, rebuilt bottom-up behind a config flag
 
-Reference result: torch-spyre#6315 (`table-lowering-experimental`, tip `c26f6171`, draft).
-Code base: torch-spyre `cab4721d`, the PR's base. Line numbers are at that commit.
+Reference result: torch-spyre#6315 (`table-lowering-experimental`, tip `c26f6171`,
+draft). Code base: torch-spyre `cab4721d`, the PR's base. Line numbers are at that
+commit.
 
 Short paths: `config.py` and `cost_model.py` are under `torch_spyre/_inductor/`.
 `cpsat_table_lowering.py`, `cost_expr_numpy.py`, `cpsat_expr_printer.py`,
@@ -31,13 +32,14 @@ computed with numpy functions, and the code arrives in layers, each with its own
   moves, combine and compact, and the table constraint is measured against them.
 - **Two passes: parents first, then children first (2026-11-17).** A first pass visits
   every parent before its children and marks the nodes a linear reader can reach. The
-  second makes each node's `CpNode` after its children's and realizes it. Pass 1
-  iterates `sympy.preorder_traversal`, pass 2 `sympy.postorder_traversal`; nothing
-  recurses. Each sympy node gets a `CpNode`, its CP-SAT counterpart, of the subclass
-  that holds its sympy class's lowering (`CpAdd`, `CpMul`, `CpMax`, `CpMin`,
-  `CpRelayoutCharge`, or `CpNode` itself), which a parent reads as a table or linearly;
-  no sympy node is changed. Reads and CP-SAT variables are made when first requested
-  and memoized. See Architecture.
+  second replaces each sympy node by a `CpNode` after its children's and realizes it.
+  Pass 1 iterates `sympy.preorder_traversal`, pass 2 `sympy.postorder_traversal`;
+  nothing recurses. The `CpNode`s hold no sympy: `TableLowering` gives each operation
+  its numpy step, or a lambdified one where numpy has none, so below the replacement
+  everything is numpy and CP-SAT. The class carries the lowering (`CpAdd`, `CpMul`,
+  `CpMax`, `CpMin`, `CpRelayoutCharge`, `CpOp`, `CpLeaf`, `CpConst`), and a parent reads
+  any node as a table or linearly. No sympy node is changed. Reads and CP-SAT variables
+  are made when first requested and memoized. See Architecture.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
   #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
@@ -60,9 +62,9 @@ computed with numpy functions, and the code arrives in layers, each with its own
 ## Estimates
 
 Measured on the 50 replayed objectives: 45 captured compiles (model blocks at the default
-config and with auto tiling, plus tests) and 5 synthetic products. Two sources: a count of
-what each top-level term of the objective reads (2026-11-16), and #6315's lowering at a
-cap of 8192 (replay of 2026-11-15).
+config and with auto tiling, plus tests) and 5 synthetic products. Two sources: a count
+of what each top-level term of the objective reads (2026-11-16), and #6315's lowering at
+a cap of 8192 (replay of 2026-11-15).
 
 **Cost between buffers is rare.** Of 6663 terms:
 
@@ -100,8 +102,8 @@ is never one table.
 | flash attention test | 41 | 338 | 232 | 4 | 28986 | 49227 | 2.01 | 8.89 |
 | prefill batch GQA test | 91 | 662 | 401 | 3 | 58399 | 115667 | 5.94 | 13.49 |
 
-The narrow estimate is one list per division and gate, sized by the menu. It ignores lists
-that turn out affine and cost nothing, so it runs high.
+The narrow estimate is one list per division and gate, sized by the menu. It ignores
+lists that turn out affine and cost nothing, so it runs high.
 
 **What it says about the stages.**
 
@@ -320,8 +322,8 @@ entries. The reductions bring that to 23, so on menus this short they barely mat
 **On real menus.** The same graph, with each symbol replaced by a split of the default
 Granite 3.3 8B decode capture: `split_a` is `buf6`'s d1 split (21 divisions, 6 values),
 `split_b` is `buf13`'s d0 split (11 divisions, 6 values) and `split_c` is `buf7`'s d1
-split (20 divisions, 6 values). One table over the three divisions is 21 * 11 * 20 =
-4620 entries. The reductions, turned on one at a time in the order of the first table, and
+split (20 divisions, 6 values). One table over the three divisions is 21 * 11 * 20 = 4620
+entries. The reductions, turned on one at a time in the order of the first table, and
 each turned off alone with the others on:
 
 | Reduction | Entries, built up | Largest table | Entries without it |
@@ -362,8 +364,8 @@ capture with each reduction.
 
 Two subsections below add what the graph does not show: a buffer with several symbols on
 one division, and one table over several integer variables. Every table in this section
-was run through CP-SAT at every assignment of its inputs, and each came back within half a
-unit of the float value.
+was run through CP-SAT at every assignment of its inputs, and each came back within half
+a unit of the float value.
 
 ### What a position is: a buffer's menu
 
@@ -520,8 +522,8 @@ menus of the graph example, it replaces the six constraints of rungs, ranks and 
 two: `[division_a, division_b, rank_m]` with 6 rows and `[rank_m, division_c, cost]` with
 12.
 
-Both forms were run on the roll-up and agree at all 24 assignments. Which solves faster on
-real objectives is not measured. The table constraint is one more `IndexMap`,
+Both forms were run on the roll-up and agree at all 24 assignments. Which solves faster
+on real objectives is not measured. The table constraint is one more `IndexMap`,
 `Allowed(rows)`, injected in place of `Combine` and `Compact`. The default is combine and
 compact, and the last PR reports both on the replay.
 
@@ -590,8 +592,8 @@ collapsed:
 
 Collapsing this form too means pairing every list of the sum with the factor's values. It
 is exact to half a unit per list and costs the factor's number of values times the
-entries. #6315 measured that form at 26 to 27 s against 5 to 6 s for the switch on the 14B
-and 24B auto-tiling prefill objectives. The plan keeps the switch. The largest error
+entries. #6315 measured that form at 26 to 27 s against 5 to 6 s for the switch on the
+14B and 24B auto-tiling prefill objectives. The plan keeps the switch. The largest error
 measured over the 50 objectives is 1.2e-7 of the cost.
 
 The *exact* tests of every stage are the check on this mapping: they solve at every
@@ -613,7 +615,7 @@ and each of those makes its CP-SAT variables itself, on first request:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -732,6 +734,23 @@ class Extreme(IndexMap):
 
 
 @dataclass(frozen=True)
+class Unit(IndexMap):
+    """The one position of a constant, size 1, on no input."""
+
+    @property
+    def entries(self) -> int:
+        """0."""
+
+    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+        """Position 0."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
+    ) -> cp_model.LinearExprT:
+        """0, with no parts."""
+
+
+@dataclass(frozen=True)
 class CpIndex:
     """A map from the inputs' positions to a position in one table, 0 .. size - 1: its
     mapping applied to its parts.
@@ -813,52 +832,94 @@ class CpLinear:
         per factor value."""
 
 
-@dataclass(eq=False)
-class CpNode:
-    """The CP-SAT counterpart of one sympy node, which it never changes. This base class
-    is a node with no linear form of its own: a symbol, a number, Pow, log, floor,
-    Piecewise, a relational or a function. Each sympy class with a lowering of its own
-    has a subclass below, chosen by node_class.
+@dataclass(eq=False, kw_only=True)
+class CpNode(ABC):
+    """One node of the cost expression in numpy and CP-SAT terms, with no sympy:
+    TableLowering replaces each sympy node by one.
 
     The CpNodes form the same graph as the sympy nodes: children holds the CpNodes of
-    the sympy node's children, made before it, and a subexpression shared by two
-    parents is one CpNode that both hold. A parent reads a child as a table or
-    linearly, whatever the child's class. Each read is made on first request and
-    memoized, so a node that two parents read differently makes both, and a read nobody
-    requests is never made. Neither read touches the model.
+    the node's children, made before it, and a subexpression shared by two parents is
+    one CpNode that both hold. A parent reads a child as a table or linearly, whatever
+    the child's class. Each read is made on first request and memoized, so a node that
+    two parents read differently makes both, and a read nobody requests is never made.
+    Neither read touches the model.
     """
 
-    expr: sympy.Basic                 # the sympy node, read only
-    children: tuple[CpNode, ...]      # its children's CpNodes, in children_of order
+    children: tuple[CpNode, ...] = ()
 
     def realize(self, lowering: TableLowering) -> None:
-        """Pass 2 on this node, once, after its children: make its candidates. Here the
-        candidate table: one table over its inputs or parts_table, whichever has fewer
-        entries (rule 3), or none when neither fits the cap. Raises TableLoweringError
-        when the node ends with no candidate."""
+        """Pass 2 on this node, once, after its children: make its candidates. Nothing
+        to make here; CpOp overrides it."""
 
-    def parts_table(self, lowering: TableLowering) -> CpTable | None:
-        """The table from its children's tables. On one shared index, the node's numpy
-        step elementwise, with no new position. Otherwise each child's table ranked to
-        its distinct values, the ranks combined, and the step applied across them."""
-
+    @abstractmethod
     def as_table(self) -> CpTable:
-        """The node read as a table: the candidate. Raises TableLoweringError when no
-        table of it fits the cap."""
+        """The node read as a table. Raises TableLoweringError when it has none."""
 
     def as_linear(self) -> CpLinear:
         """The node read linearly: as_table() as one list,
         CpLinear(lists={table.index: table.values})."""
 
 
-@dataclass(eq=False)
-class CpLinearNode(CpNode, ABC):
-    """A node that can be linear in its children."""
+@dataclass(eq=False, kw_only=True)
+class CpLeaf(CpNode):
+    """A symbol: its input's column on the input's position. A buffer's split or tile
+    over the menu, [0, 1] for a residency literal, an integer's domain."""
+
+    table: CpTable
+
+    def as_table(self) -> CpTable:
+        """table."""
+
+
+@dataclass(eq=False, kw_only=True)
+class CpConst(CpNode):
+    """A number."""
+
+    value: float
+
+    def as_table(self) -> CpTable:
+        """CpTable(np.array([value]), CpIndex(1, Unit()))."""
+
+    def as_linear(self) -> CpLinear:
+        """CpLinear(constant=value)."""
+
+
+@dataclass(eq=False, kw_only=True)
+class CpOp(CpNode):
+    """An operation with no linear form of its own: Pow, log, floor, Piecewise, a
+    relational, And, Or, Not, ITE or a function. Its step is its numpy function, which
+    TableLowering takes from Stage 1's lookup, or from lambdify for a node numpy has no
+    function for."""
+
+    step: Callable[..., np.ndarray]   # applied to its children's values, elementwise
+
+    def realize(self, lowering: TableLowering) -> None:
+        """Its candidate table: grid_table or parts_table, whichever has fewer entries
+        (rule 3), or none when neither fits the cap. Raises TableLoweringError when the
+        node ends with no candidate."""
+
+    def grid_table(self, lowering: TableLowering) -> CpTable | None:
+        """One table over its inputs: its step applied through its subtree, children
+        first, to its leaves' columns broadcast on their grid, on the inputs combined.
+        None when the grid passes the cap, which is known before any value is made."""
+
+    def parts_table(self, lowering: TableLowering) -> CpTable | None:
+        """The table from its children's tables. On one shared index, its step
+        elementwise, with no new position. Otherwise each child's table ranked to its
+        distinct values, the ranks combined, and its step applied across them."""
+
+    def as_table(self) -> CpTable:
+        """The candidate. Raises TableLoweringError when no table of it fits the cap."""
+
+
+@dataclass(eq=False, kw_only=True)
+class CpLinearNode(CpOp, ABC):
+    """An operation that can be linear in its children."""
 
     linear_ok: bool                   # pass 1: a linear reader can reach it
 
     def realize(self, lowering: TableLowering) -> None:
-        """CpNode.realize, then, when linear_ok, the candidate linear form from
+        """CpOp.realize, then, when linear_ok, the candidate linear form from
         linear_form."""
 
     @abstractmethod
@@ -876,7 +937,7 @@ class CpLinearNode(CpNode, ABC):
 
 
 class CpAdd(CpLinearNode):
-    """sympy.Add."""
+    """A sum. Its step is np.add."""
 
     def linear_form(self) -> CpLinear | None:
         """sum(child.as_linear() for child in children): lists on one index added in
@@ -884,20 +945,20 @@ class CpAdd(CpLinearNode):
 
 
 class CpMul(CpLinearNode):
-    """sympy.Mul."""
+    """A product. Its step is np.multiply."""
 
     def parts_table(self, lowering: TableLowering) -> CpTable | None:
-        """CpNode.parts_table, or, for Min/Max factors over shared inputs, the fold of
+        """CpOp.parts_table, or, for Min/Max factors over shared inputs, the fold of
         the tuples of rungs that occur together (rule 2), whichever has fewer entries."""
 
     def linear_form(self) -> CpLinear | None:
-        """k * child.as_linear() when every other factor is a constant k. Otherwise the
-        product switched on one factor's table (rule 4), a 0/1 literal being a gate.
-        None when two factors are too wide to pair."""
+        """k * child.as_linear() when every other child is a CpConst, k their product.
+        Otherwise the product switched on one factor's table (rule 4), a 0/1 literal
+        being a gate. None when two factors are too wide to pair."""
 
 
 class CpMax(CpLinearNode):
-    """sympy.Max."""
+    """A Max. Its step is np.maximum."""
 
     def parts_table(self, lowering: TableLowering) -> CpTable | None:
         """By rung (rule 1): the ladder of the values it can return, each child's table
@@ -908,7 +969,7 @@ class CpMax(CpLinearNode):
 
 
 class CpMin(CpLinearNode):
-    """sympy.Min: CpMax with min for max, and lin_min for lin_max."""
+    """A Min. Its step is np.minimum: CpMax with min for max, and lin_min for lin_max."""
 
     def parts_table(self, lowering: TableLowering) -> CpTable | None:
         """By rung, as CpMax.parts_table."""
@@ -917,9 +978,12 @@ class CpMin(CpLinearNode):
         """CpLinear(extrema=[(True, [child.as_linear() for child in children])])."""
 
 
+@dataclass(eq=False, kw_only=True)
 class CpRelayoutCharge(CpLinearNode):
-    """RelayoutCharge(is_lx, division, *prices). Its children are its literal and its
-    division; its prices are data."""
+    """A relayout charge: its children are its literal and its division, and its price
+    by division is data."""
+
+    prices: np.ndarray
 
     def realize(self, lowering: TableLowering) -> None:
         """The number 0 as its table when this solve does not divide the source,
@@ -930,18 +994,13 @@ class CpRelayoutCharge(CpLinearNode):
         literal."""
 
 
-NODE_CLASSES: dict[type, type[CpNode]] = {
+NODE_CLASSES: dict[type, type[CpOp]] = {    # read by TableLowering, the only sympy side
     sympy.Add: CpAdd,
     sympy.Mul: CpMul,
     sympy.Max: CpMax,
     sympy.Min: CpMin,
     RelayoutCharge: CpRelayoutCharge,
 }
-
-
-def node_class(expr: sympy.Basic) -> type[CpNode]:
-    """The CpNode class for expr: NODE_CLASSES of the first class along
-    type(expr).__mro__ that has one, else CpNode."""
 
 
 class TableLowering:
@@ -955,10 +1014,14 @@ class TableLowering:
         """root as a CP-SAT objective in COST_SCALE units.
 
         Pass 1 iterates preorder_traversal and marks the sympy nodes a linear reader can
-        reach, repeats kept. Pass 2 iterates postorder_traversal and, once per node,
-        makes its CpNode of node_class(expr) from its children's CpNodes and calls its
-        realize. Only then does
-        it return the root's as_linear().cp_expr(model), which makes just the variables
+        reach, repeats kept. Pass 2 iterates postorder_traversal and replaces each sympy
+        node, once, by a CpNode made from its children's: a CpLeaf for a symbol, with
+        its input's column; a CpConst for a number; otherwise the NODE_CLASSES entry of
+        the first class along its bases, or CpOp, with its numpy step. It then calls the
+        CpNode's realize, and re-raises a TableLoweringError with the sympy node named:
+        the CpNodes do not know it. Past this replacement nothing reads sympy, and the
+        step of an operation numpy has no function for is lambdified. Only then does it
+        return the root's as_linear().cp_expr(model), which makes just the variables
         that form requests. Every refusal raises TableLoweringError during the passes,
         before any variable is made, so the model is untouched when it raises.
         """
@@ -976,18 +1039,20 @@ def lower_cost_with_tables(
 ```
 
 The sketch is the public interface only: signatures and docstrings, with the bodies left
-to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for one, so
-a refusal leaves the model untouched. `cp_expr` makes them after the walk, when the
+to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for one, so a
+refusal leaves the model untouched. `cp_expr` makes them after the walk, when the
 objective's form requests them, each once. `Input`, `Combine`, `Compact` and `Extreme`
 subclass the abstract `IndexMap` and override its three members, so a step missing one
-cannot be made.
-Each sympy class's lowering lives on its `CpNode` subclass: `realize`, `parts_table`
-and `linear_form`, chosen by `node_class`. The sections below describe them. The order
-of the two passes, the `CpNode` classes and `tabulate`, the private helper `realize`
-calls, are the design, and the other names may change. `Inputs` is the map from each symbol to
-its input and column ("How a table maps onto CP-SAT"), and `sym_map` and `buffer_map`
-are the printer's two maps. With `Inputs` as an empty class the sketch passes mypy with
-torch-spyre's settings (`pyproject.toml:131`), the bodies being empty.
+cannot be made. The `CpNode` classes hold no sympy. `TableLowering` is the one place that
+reads it: it replaces each sympy node by a `CpNode`, choosing the class through
+`NODE_CLASSES` and giving an operation its numpy `step`. Each class carries its lowering
+in `realize`, `grid_table`, `parts_table` and `linear_form`, and the sections below
+describe them. The order of the two passes, the `CpNode` classes and `tabulate`, the
+private helper `realize` calls, are the design, and the other names may change. `Inputs`
+is the map from each symbol to its input and column ("How a table maps onto CP-SAT"), and
+`sym_map` and `buffer_map` are the printer's two maps. With `Inputs` as an empty class
+the sketch passes mypy with torch-spyre's settings (`pyproject.toml:131`), the bodies
+being empty.
 
 **Using the interfaces.** A caller needs only the entry point:
 
@@ -1039,24 +1104,25 @@ the step-by-step table. Built in ortools as written, it gives 17566 at `div_a = 
 assignments, the figures of that section.
 
 Through the nodes, the same objective is `root.as_linear().cp_expr(model)`. The root is
-a `CpLinearNode`, and `as_linear` on each of its four children returns the reads above:
-a plain `CpNode` for each power, read as its table; and `CpLinearNode`s for the product
-and the Max, each read as its table because rule 3 prefers it. The Max's linear form,
+a `CpAdd`, and `as_linear` on each of its four children returns the reads above: a
+`CpOp` for each power, with step `np.power`, read as its table; and a `CpMul` and a
+`CpMax`, each read as its table because rule 3 prefers it. The Max's linear form,
 a `lin_max` over three operand lists of 3, 2 and 4 entries, would need 9 entries
 against the table's 14. 9 is not under half of 14, so margin 2 keeps the table.
 
 - **One `CpNode` per sympy node, in the same graph.** Pass 2 makes a node's `CpNode` from
-  its children's, which it made earlier: a `CpLinearNode` for Add, Mul, Min, Max and
-  `RelayoutCharge`, a plain `CpNode` for every other class, so the `CpNode`s form the sympy graph again
-  with their own edges. It finds a node's `CpNode` through a map keyed by the sympy
-  node, which is hashable and compares by structure, so a subexpression that two terms
-  share is one `CpNode` that both parents hold: both read one list and one position.
-  Every result lives on the `CpNode`. The expression is the same object, unchanged,
-  after the lowering.
+  its children's, which it made earlier: a `CpLeaf` for a symbol, a `CpConst` for a
+  number, the `NODE_CLASSES` subclass for Add, Mul, Max, Min and `RelayoutCharge`, and a
+  `CpOp` for every other class. So the `CpNode`s form the sympy graph again with their
+  own edges, and no sympy. `TableLowering` finds a node's `CpNode` through a map keyed by
+  the sympy node, which is hashable and compares by structure, so a subexpression that
+  two terms share is one `CpNode` that both parents hold: both read one list and one
+  position. Every result lives on the `CpNode`. The expression is the same object,
+  unchanged, after the lowering.
 - **Read as a table or linearly.** Pass 2 leaves each `CpNode` with a candidate table,
   and a `CpLinearNode` also with a candidate linear form when it is marked. A parent
-  reads any child with `as_table` or `as_linear`; on a plain `CpNode`, `as_linear` is
-  its table as one list,
+  reads any child with `as_table` or `as_linear`; on any node but a `CpLinearNode`,
+  `as_linear` is its table as one list, or its constant,
   and each read is made on first request and memoized: a node read both ways, such as a
   Max under a power and a sum, makes both, and a candidate no parent reads goes no
   further. A node left with neither candidate raises `TableLoweringError` at once,
@@ -1067,23 +1133,26 @@ against the table's 14. 9 is not under half of 14, so margin 2 keeps the table.
   mark from its second parent reach its children. Pass 2 skips them: a node's first
   post-order occurrence comes after its whole subtree, so its children's `CpNode`s exist
   and are done. `lower` owns both walks. A method is handed a new `CpNode`, whose
-  `children` are done, and never walks. Stage 1's `numpy_value` is the pass 2 loop with arrays for
-  results.
+  `children` are done, and never walks. Stage 1's `numpy_value` is the pass 2 loop with
+  arrays for results.
 - **The walks are short.** On the 50 replayed objectives each yields 589 to 71,914
   nodes, 3 to 11 per distinct node, in at most 0.1 s. Expressions are 6 to 17 deep, so
   recursion would not overflow; the loops are chosen for clarity and so that no depth
   can.
-- **One class per sympy class.** `node_class` looks along the sympy node's class and its
-  bases for an entry of `NODE_CLASSES`, and falls back to `CpNode`. The bases matter:
-  `Integer(1)` is class `One` and `Rational(1, 2)` is `Half`, and both reach `CpNode`.
-  The printer on `main` dispatches by class too, through sympy's `Printer`
+- **One class per sympy class, chosen once.** `TableLowering` looks along the sympy
+  node's class and its bases for an entry of `NODE_CLASSES`, and falls back to `CpOp`; a
+  symbol becomes a `CpLeaf` and a number a `CpConst`. The bases matter: `Integer(1)` is
+  class `One` and `Rational(1, 2)` is `Half`, and both are numbers. An operation's
+  `step` is its numpy function from Stage 1's lookup, or `sympy.lambdify` of that one
+  node where numpy has none, so every `CpOp` holds a `Callable` over arrays. The
+  printer on `main` dispatches by class too, through sympy's `Printer`
   (`cpsat_expr_printer.py:186`), but each of its methods prints its own arguments; a
   `CpNode` only reads its children, which are already realized.
 - **Children.** A node's children are its arguments, with two exceptions. A Piecewise's
-  children are the values and conditions of its arms; the walks also yield each arm's
-  `ExprCondPair`, whose `CpNode` has no form of its own and is read by its Piecewise. A `RelayoutCharge`'s children are its
-  literal and its division; its prices are numbers the walks yield, and
-  `CpRelayoutCharge` does not read them.
+  children are the values and conditions of its arms, and its step is `np.select`;
+  `TableLowering` skips each arm's `ExprCondPair`, which gets no `CpNode`. A
+  `RelayoutCharge`'s children are its literal and its division, and `TableLowering`
+  gives its prices to `CpRelayoutCharge` as data.
 - **No model.** The walk reads the expression, the inputs and the cap, and computes in
   numpy. It adds nothing to the CP-SAT model and rounds nothing.
 
@@ -1112,9 +1181,9 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
   marked through the sum and is still read as a table by the power. It builds its linear
   form for the sum and its table for the power.
 - **What the mark changes.** A `CpLinearNode` not marked builds no linear form, and a
-  Min/Max not marked is never kept linear. A plain `CpNode` has no mark: it never builds
-  one. Tables do not change, because a nonlinear reader needs
-  them and rule 3 compares against them.
+  Min/Max not marked is never kept linear. Any other `CpNode` has no mark: it never
+  builds one. Tables do not change, because a nonlinear reader needs them and rule 3
+  compares against them.
 - **Checked.** The sketch was run with this pass and without it on 13 cases: the graph,
   the roll-up, a Max under a power and under a sum, a Max shared by a power and a sum, a
   log of a sum, a Piecewise and a shared subexpression, at caps where the Max does and
@@ -1126,28 +1195,29 @@ for expr in sympy.preorder_traversal(root):           # parents first, repeats k
 
 ### `tabulate` realizes a node
 
-`CpNode.realize` makes the node's candidate `CpTable`, or none, through `tabulate`. The node's
-value is `values[index]`. The index is a `CpIndex`: an input, a combine, a compact, or
-a min or max of rungs, a recipe until its `cp_expr` makes the CP-SAT expression. A node
-is *tabulated* when it has its `CpTable`.
+`CpOp.realize` makes the node's candidate `CpTable`, or none, through `tabulate`. The
+node's value is `values[index]`. The index is a `CpIndex`: an input, a combine, a
+compact, or a min or max of rungs, a recipe until its `cp_expr` makes the CP-SAT
+expression. A node is *tabulated* when it has its `CpTable`.
 
 Every list of the lowering is made here, and a list is never made without its index.
 `tabulate` is the "one operation, in one order" of the guarantees above.
 
-1. **A leaf.** A symbol's table is its input's column, on that input: a buffer's symbol
-   over the menu, `[0, 1]` for a literal, the domain's values for an integer. A number
-   is one value on no input.
+1. **A leaf.** A `CpLeaf`'s table is its input's column, on that input: a buffer's symbol
+   over the menu, `[0, 1]` for a literal, the domain's values for an integer.
+   `TableLowering` makes it. A `CpConst` is one value on the `Unit` position.
 2. **A child with no table.** The node has none either.
-3. **Children on one index.** The node's numpy function, the one-node step of Stage 1,
-   is applied to the children's lists elementwise. The index is the children's, and no
-   entry is added. A term over one buffer's symbols never leaves this case.
+3. **Children on one index.** The node's `step`, the one-node step of Stage 1 or a
+   lambdified one, is applied to the children's lists elementwise. The index is the
+   children's, and no entry is added. A term over one buffer's symbols never leaves this
+   case.
 4. **Children on several indexes.** There are two candidates:
-   - *one table*: the node on the grid of its inputs, from `values_on_grid`, on the
-     inputs combined;
+   - *one table*, the node's `grid_table`: its step applied through its subtree to its
+     leaves' columns on the grid of its inputs, on the inputs combined;
    - *from its parts*, the node's `parts_table`: by rung for `CpMax` and `CpMin`
      (rule 1), by fold of Min/Max factors for `CpMul` (rule 2), and for any other node
      each child's list compacted to its distinct values, the positions combined and the
-     node's numpy function applied across them.
+     node's step applied across them.
 5. **The cheaper one.** The candidate with fewer entries is the table (rule 3). Its
    entries are its list plus the remaps under its index. A candidate's size is known
    before its list is computed, so one past the cap is never evaluated. With no
@@ -1155,14 +1225,16 @@ Every list of the lowering is made here, and a list is never made without its in
 
 ### A node that is not one list
 
-A sum, a product and a Min/Max can be read without being one list, so their classes
-give the node a second candidate beside the table, from `linear_form`. A *linear form*, a `CpLinear`, is
-a constant, one float list per index, and the `lin_min`, `lin_max` and switched terms
-inside it. It is float, as the tables are.
+A sum, a product and a Min/Max can be read without being one list, so their classes give
+the node a second candidate beside the table, from `linear_form`. A *linear form*, a
+`CpLinear`, is a constant, one float list per index, and the `lin_min`, `lin_max` and
+switched terms inside it. It is float, as the tables are.
 
 | Class | Table | Linear form |
 |---|---|---|
-| `CpNode`: symbols, numbers, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | one table or `parts_table` | none: `as_linear` is the table as one list |
+| `CpLeaf`: a symbol | its input's column | none: its column as one list |
+| `CpConst`: a number | one value on `Unit` | its constant |
+| `CpOp`: Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | `grid_table` or `parts_table` | none: `as_linear` is the table as one list |
 | `CpAdd` | the same | the children's `as_linear` added, where lists on one index become one list |
 | `CpMul` | the same, or the fold of Min/Max factors (rule 2) | constants times one child: that child's `as_linear`, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
 | `CpMax`, `CpMin` | the same, or by rung (rule 1) | `lin_max` or `lin_min` over the children's `as_linear` |
@@ -1171,12 +1243,13 @@ inside it. It is float, as the tables are.
 - **The reader picks the read.** Pass 1 tells a node whether a linear reader can reach
   it, but not which read that reader will make, so the `CpNode` keeps its candidates.
   `tabulate` calls `as_table` on its children. A linear form calls `as_linear` on every
-  child: a plain `CpNode` returns its table as one list, and a `CpLinearNode` its own
+  child: a `CpLeaf` or `CpOp` returns its table as one list, a `CpConst` its constant,
+  and a `CpLinearNode` its own
   linear form or its table, whichever has fewer entries; a Min/Max keeps its linear
   form only under half the entries of its table (rule 3). The objective reads the root
   with `as_linear`. Only `CpAdd`, `CpMul`, `CpMax` and `CpMin` call `as_linear` on their
   children; they and `CpRelayoutCharge` build a linear candidate, on a marked node
-  only. A plain `CpNode` calls `as_table` only: under `Max(...) ** 0.5` the Max is read
+  only. A plain `CpOp` calls `as_table` only: under `Max(...) ** 0.5` the Max is read
   as its table, and a Max with no table raises there.
 - **Multipliers go down in float.** Scaling a linear form multiplies its lists in numpy.
   Through a `lin_min` or `lin_max` it scales the operands, and a negative factor turns
@@ -1277,10 +1350,10 @@ was visited once: 10 visits for an expression of 15 nodes.
 
 | Stage | Adds to the architecture |
 |---|---|
-| 1 | `numpy_value`, and its one-node step that `tabulate` applies to lists |
+| 1 | `numpy_value`, and its one-node step, which `TableLowering` gives each `CpOp` as its `step` |
 | 2 | the pure helpers `tabulate` calls: ladder, rungs, fold, scaling |
-| 3 | `CpNode`, `CpLinearNode`, `CpAdd`, `CpRelayoutCharge`, `node_class`, pass 1, pass 2, the `cp_expr` methods that make the model's variables, and `tabulate` for a leaf, for one index and for one table over the inputs |
-| 4 | `parts_table`: `CpNode`'s rank and pair, `CpMax` and `CpMin` by rung, and the choice by entries |
+| 3 | `CpNode`, `CpLeaf`, `CpConst`, `CpOp`, `CpLinearNode`, `CpAdd`, `CpRelayoutCharge`, the replacement of sympy nodes in `TableLowering`, pass 1, pass 2, the `cp_expr` methods that make the model's variables, and `tabulate` for a leaf, for one index and for one table over the inputs |
+| 4 | `parts_table`: `CpOp`'s rank and pair, `CpMax` and `CpMin` by rung, and the choice by entries |
 | 5 | `CpMul.parts_table`: the fold |
 | 6 | `CpMax.linear_form` and `CpMin.linear_form`, and a constant times one child in `CpMul.linear_form` |
 | 7 | the switch and the gate in `CpMul.linear_form`, and the gate of `CpRelayoutCharge` |
@@ -1323,8 +1396,8 @@ node once, with no recursion. Values are kept in a dict by node; no node is chan
 A caller that gets `NotImplementedError` evaluates that node through `sympy.lambdify`
 instead. This is the only use of lambdify. It is cached per node and counted.
 
-Steps 3 and 4 can be called for one node on arrays already computed. `tabulate` applies
-them to its children's lists.
+Steps 3 and 4 can be called for one node on arrays already computed. `TableLowering`
+takes them as each `CpOp`'s `step`, and `tabulate` applies it to the children's lists.
 
 Overrides, for names numpy does not share: Add, Mul, Pow, Abs; Min and Max
 (`np.minimum`, `np.maximum`); ceiling; the six relationals; And, Or, Not; ITE
@@ -1341,10 +1414,11 @@ Two rules for the lookup, both checked on numpy 2.5.1 and sympy 1.14:
   constant with arrays raises.
 
 `values_on_grid(expr, columns, shape)` is `numpy_value` at every joint assignment of the
-node's inputs, row-major, with the lambdify backup. It refuses a value that is not finite.
+node's inputs, row-major, with the lambdify backup. It refuses a value that is not
+finite.
 
-The overrides cover everything the cost model builds today: Add, Mul, Pow (exponent -1 and
-floats), Min, Max, floor, log, Piecewise ending in `True`, Eq/Le/Ge/Lt/Gt, And, Or,
+The overrides cover everything the cost model builds today: Add, Mul, Pow (exponent -1
+and floats), Min, Max, floor, log, Piecewise ending in `True`, Eq/Le/Ge/Lt/Gt, And, Or,
 numbers, `decode_delivery_price_*` (`cost_model.py:1426-1449`) and `RelayoutCharge`
 (`plan_solver.py:487`). ITE and `False` are latent: they need auto tiling or cost
 parameters other than production's.
@@ -1396,8 +1470,9 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 
 ### Stage 3: inputs, indexes, tables, linear sums
 
-- The two passes of Architecture arrive: `CpNode`, `CpLinearNode`, `CpAdd`,
-  `CpRelayoutCharge`, `node_class`, pass 1, pass 2 and the `cp_expr` methods.
+- The two passes of Architecture arrive: the `CpNode` classes `CpLeaf`, `CpConst`,
+  `CpOp`, `CpLinearNode`, `CpAdd` and `CpRelayoutCharge`, the replacement of each sympy
+  node in `TableLowering`, pass 1, pass 2 and the `cp_expr` methods.
   `tabulate` realizes a leaf, a node whose children share an index, and a node whose
   inputs fit one table.
 - Positions are made by injected `IndexMap` steps: `Input`, `Combine` and `Compact` here,
@@ -1424,8 +1499,10 @@ Tests:
   with one `CpNode`; the expression is the same object, equal to a copy taken before;
 - pass 1 marks every parent before its children: a node under a power is not marked, a
   node shared by a power and a sum is, and a node not marked builds no linear form;
-- Add, Mul, Min, Max and `RelayoutCharge` get a `CpLinearNode` and every other class a
-  `CpNode`; a plain `CpNode` read with `as_linear` is its table as one list;
+- a symbol becomes a `CpLeaf`, a number a `CpConst`, Add, Mul, Max, Min and
+  `RelayoutCharge` their `NODE_CLASSES` subclass and every other class a `CpOp`; no
+  `CpNode` holds a sympy object; an operation with no numpy function gets a lambdified
+  step; a `CpOp` read with `as_linear` is its table as one list;
 - every list `tabulate` returns has the length of its index;
 - a sum of single-buffer terms is exact, with no table across two buffers;
 - the lowered model has as many solutions as its inputs have assignments;
@@ -1516,10 +1593,10 @@ linear.
 - A gate whose rest is constant is a coefficient on the literal.
 
 Tests: a fractional factor times a sum of lists with fractional entries is within the
-rule 4 bound; a factor times a Min too wide to pair is exact, also inside a Min; a relayout
-charge and a gated term are exact with no table larger than the menu; a constant rest adds
-no table; two wide factors raise with the model untouched; a product too wide for its
-factor's precision raises.
+rule 4 bound; a factor times a Min too wide to pair is exact, also inside a Min; a
+relayout charge and a gated term are exact with no table larger than the menu; a constant
+rest adds no table; two wide factors raise with the model untouched; a product too wide
+for its factor's precision raises.
 
 ### Stage 8: the flag
 
@@ -1556,29 +1633,30 @@ Each PR:
 
 - `python3 -m pytest tests/inductor/test_cost_expr_numpy.py
   tests/inductor/test_cpsat_table_lowering.py`
-- `make precommit`, `mypy torch_spyre tests` and `make check-all-configs`. Both test files
-  are listed in `tests/configs/torch_spyre_tests/inductor/test_cpsat_table_lowering_config.yaml`.
+- `make precommit`, `mypy torch_spyre tests` and `make check-all-configs`. Both test
+  files are listed in
+  `tests/configs/torch_spyre_tests/inductor/test_cpsat_table_lowering_config.yaml`.
 - `git commit -s`, the Apache header on new files, `feat(scratchpad): ...` subjects.
 - Stages 1 to 7: `git diff main --stat` shows new files only.
 
 After Stage 8, posted on that PR:
 
-1. **Same results as #6315.** Replay the 50 captured objectives (`~/pr6301-review/replay.py`,
-   #6315's results in `~/pr6301-review/tableonly/`). Every capture is `OPTIMAL` at the
-   exact cost #6315 reaches, and no objective is further from exact than 1.2e-7. A
-   different plan at that cost is a tie.
+1. **Same results as #6315.** Replay the 50 captured objectives
+   (`~/pr6301-review/replay.py`, #6315's results in `~/pr6301-review/tableonly/`). Every
+   capture is `OPTIMAL` at the exact cost #6315 reaches, and no objective is further from
+   exact than 1.2e-7. A different plan at that cost is a tie.
 2. **Size and time, reported.** Entries, largest table, lowering time and solve time per
    capture, beside the table in Estimates, for combine and compact and for the table
    constraint. Entries also with each reduction of "How the tables are kept small" turned
    off alone. A capture with more entries or a slower solve than #6315 is explained in
    the PR.
 3. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`:
-   `test_scratchpad_solver.py`, `test_scratchpad_use.py`, `test_cost_model_replication.py`
-   and `test_solver_relayout_decision.py`. #6315's CI ran every shard with the tables on
-   the default path and all passed; its one red job was a card fault
-   (`DdrInitRetryLimitExceeded`). No suite and none of the 50 replayed objectives may
-   raise `TableLoweringError`: a refusal fails the run, since with the flag on it fails a
-   compile.
+   `test_scratchpad_solver.py`, `test_scratchpad_use.py`,
+   `test_cost_model_replication.py` and `test_solver_relayout_decision.py`. #6315's CI
+   ran every shard with the tables on the default path and all passed; its one red job
+   was a card fault (`DdrInitRetryLimitExceeded`). No suite and none of the 50 replayed
+   objectives may raise `TableLoweringError`: a refusal fails the run, since with the
+   flag on it fails a compile.
 4. **Flag off.** The same suites with no flag, unchanged.
 
 ## Next step
