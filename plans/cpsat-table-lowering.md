@@ -34,6 +34,13 @@ computed with numpy functions, and the code arrives in layers, each with its own
   node, and cannot lower a real objective: its one table would hold 10^13.4 to 10^401
   entries. Stages 2 to 9 each add one optimization. Stages 10 and 11 integrate with the
   printer's maps and then with the solver.
+- **Rule 4 as switched tables, a multiplication as the fallback (2026-11-17).** A Mul is
+  linear in its children only when its other factors are constants. Any other product
+  pushes one factor into every list of the rest as numpy tables, the factor's position
+  switching the row. #6315 left this form for a switch on a collapsed sum, measured 5
+  times faster on the auto-tiling prefill objectives and 3 times over the whole replay
+  ("Collapsing float lists into linear terms"). Stage 10's replay measures it again, and
+  if it cannot be made to work, `add_multiplication_equality` is the fallback.
 - **Behaviour, not code.** The stages below say what each layer does. #6315 is cited for
   its results only.
 - **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
@@ -104,8 +111,8 @@ is never one table.
 
 - *Narrow terms, 98%.* Each is a list over one buffer's menu, or a coefficient on
   literals. 81% read exactly one literal, 18% none, and 57 terms read four or more. Terms
-  on one division under one gate add into one list in numpy, before anything reaches the
-  model. Their entries are about the sum over divisions of menu size times gated groups,
+  on one division with one literal add into one list in numpy, before anything reaches
+  the model. Their entries are about the sum over divisions of menu size times literals,
   which is linear in the number of buffers. No table spans two buffers, and on every
   model block the largest table is the largest menu.
 - *Wide terms, 2%.* Rules 1, 2 and 4 exist for these 1 to 4 terms. By the estimate below
@@ -121,8 +128,9 @@ is never one table.
 | flash attention test | 41 | 338 | 232 | 4 | 28986 | 49227 | 2.01 | 8.89 |
 | prefill batch GQA test | 91 | 662 | 401 | 3 | 58399 | 115667 | 5.94 | 13.49 |
 
-The narrow estimate is one list per division and gate, sized by the menu. It ignores
-lists that turn out affine and cost nothing, so it runs high.
+The narrow estimate is one list per division and literal, sized by the menu, as #6315's
+gate holds it. Rule 4's switched table for a literal holds twice that, its off half
+zeros. The estimate ignores lists that turn out affine and cost nothing.
 
 **What it says about the stages.**
 
@@ -156,8 +164,8 @@ lists that turn out affine and cost nothing, so it runs high.
   cost, and `lin_max` takes the max of the costs, with no table for the Min/Max itself.
 - *Kept linear* is open to a Min/Max only when every node between it and the objective
   is linear in it: a sum, a constant factor (a negative one turns Max into Min), another
-  Min/Max, or a product switched on a factor's values (rule 4), which is linear once the
-  factor's value is fixed. `Max(...) ** 0.5` is not: CP-SAT has no root of a `lin_max`.
+  Min/Max, or a product whose factor has values of one sign, which rule 4 pushes into
+  the Min/Max's operands. `Max(...) ** 0.5` is not: CP-SAT has no root of a `lin_max`.
   Neither is a log, a floor, a division by the Min/Max or a condition on it. Under such
   a node the Min/Max must be a table, by rung or over its inputs, and when neither fits
   the cap the lowering raises (Decisions).
@@ -174,9 +182,12 @@ The four rules that keep lists short:
 3. A node takes the cheaper, in entries, of one table over its inputs and the form built
    from its parts. A Min/Max with only linear nodes above it stays linear when that needs
    under half the entries of its table.
-4. A product whose factor cannot share a table with the rest is switched on the factor's
-   value: one literal per value holds the product at that value times the rest. A 0/1
-   literal times a term is the two-value case.
+4. A product is linear in its children only when its other factors are constants. Any
+   other product is switched tables: one factor's distinct values are pushed into every
+   list of the rest, each list and the factor one numpy table on the pair of their
+   positions, so the factor's position switches the row. A 0/1 literal times a term is
+   the two-value case. If switched tables cannot be made to work, the fallback is one
+   multiplication in the solver (Decisions).
 
 ## The process, step by step
 
@@ -379,11 +390,11 @@ minimizing and maximizing agree at each, and the worst error stays within the co
 bound.
 
 Two more reductions are not in this graph. A fold (rule 2) reads a product of Min/Max
-factors over shared inputs by the tuples of rungs that can occur together. A switch
-(rule 4) leaves a factor too wide to pair out of every table. On the model blocks one
-table over the widest term alone would hold 3.6e4 to 7.5e18 entries, and #6315's lowering
-of the whole objective holds 396 to 21998 (Estimates). Stage 10's replay reports
-entries per capture with each reduction.
+factors over shared inputs by the tuples of rungs that can occur together. Switched
+tables (rule 4) push a factor into each list of a rest too wide to pair with it as one
+table. On the model blocks one table over the widest term alone would hold 3.6e4 to
+7.5e18 entries, and #6315's lowering of the whole objective holds 396 to 21998
+(Estimates). Stage 10's replay reports entries per capture with each reduction.
 
 Two subsections below add what the graph does not show: a buffer with several symbols on
 one division, and one table over several integer variables. Every table in this section
@@ -467,9 +478,10 @@ the lowering raises.
 
 - *A table* is one table over the node's inputs, or the form from its parts: a rank, a
   pair, a Min/Max by rung, a fold (rules 1 to 3).
-- *Linear* nodes are a sum, a constant times one child, a Min/Max kept as a
-  `lin_min`/`lin_max`, and a product switched on one factor's values (rule 4). Pass 1
-  of Architecture marks the nodes that only linear nodes sit above.
+- *Linear* nodes are a sum, a constant times one child and a Min/Max kept as a
+  `lin_min`/`lin_max`. A product with another factor is switched tables (rule 4): its
+  form is a sum of tables, which only a linear reader reads. Pass 1 of Architecture
+  marks the nodes that only linear nodes sit above.
 - The objective reads the root's linear form. A root with only a table is one linear
   term, a single lookup.
 
@@ -603,12 +615,13 @@ value; and the worst error is 0.43 units.
 the menus, and each list made from them. CP-SAT cannot hold a float, so below a linear
 term it holds positions only (divisions, ranks, rungs, pair and fold positions), and no
 cost value. A *linear term* is where a list must become a CP-SAT integer: a term of the
-objective's sum, a term of an operand of a Min/Max kept linear, or a term of the sum
-inside a switched product. There the list is collapsed, in this order:
+objective's sum, or a term of an operand of a Min/Max kept linear. There the list is
+collapsed, in this order:
 
 1. Every float multiplier above the list is applied to it in numpy: the term's
-   coefficient, the constant factors of a product, and a coefficient pushed through a
-   linear Min/Max, where a negative one turns Min into Max.
+   coefficient, the constant factors of a product, a coefficient pushed through a linear
+   Min/Max, where a negative one turns Min into Max, and a switched factor's values,
+   which pair the list with the factor (rule 4).
 2. Lists on one index in the same sum are added.
 3. The list is rounded once, `table[i] = rint(COST_SCALE * values[i])`. An entry past
    2^50 is refused, so a sum of thousands of entries stays inside int64. This refusal
@@ -618,23 +631,25 @@ inside a switched product. There the list is collapsed, in this order:
    A list is affine when its rounded entries are, so `table[0] + step * index` equals
    the table entry for entry.
 
-No integer made by a collapse is multiplied by a float afterwards, with the one exception
-below. A unit is 1/`COST_SCALE` of the cost. Each collapsed list is within half a unit of
-its float value, a sum of T lists and a constant is within (T + 1) / 2 units, and a
-linear Min/Max is within the largest bound among its operands.
+No integer made by a collapse is multiplied by a float afterwards. A unit is
+1/`COST_SCALE` of the cost. Each collapsed list is within half a unit of its float
+value, a sum of T lists and a constant is within (T + 1) / 2 units, and a linear Min/Max
+is within the largest bound among its operands.
 
-The exception is rule 4, where a factor too wide to pair multiplies a sum that is already
-collapsed:
-
-- a 0/1 literal: the product is the sum or 0, and nothing is added;
-- whole values `v`: the product is `v * w` exactly, so the sum's bound times `|v|`;
-- fractional values: `floor(p * w / q)`, which adds `|w| / (2q) + 1` units, with `q`
-  from 2^16 to 2^24.
-
-Collapsing this form too means pairing every list of the sum with the factor's values. It
-is exact to half a unit per list and costs the factor's number of values times the
-entries. #6315 measured that form at 26 to 27 s against 5 to 6 s for the switch on the
-14B and 24B auto-tiling prefill objectives. The plan keeps the switch. The largest error
+Rule 4 keeps this: a factor that multiplies a sum is paired with each of the sum's lists
+in numpy, before the rounding, so each switched table is one list rounded once. #6315
+began with this form and left it. On the 14B and 24B auto-tiling prefill objectives the
+derate factor has 80 values; the paired tables held 45k of their 80k entries, CP-SAT's
+presolve expanded them into 74k enforced constraints, and lowering and solving took 26
+to 27 s. #6315 replaced them with a switch on the sum already collapsed to one integer
+`w`: one literal per factor value, and the product `floor(p * w / q)` held by two
+enforced inequalities per value. That took 5 to 6 s, and the whole replay 144.6 s
+against 443.8 s. Tabling a residency literal's term, the two-value case, had made small
+default-config kernels solve 2 to 2.5 times slower than the printer. Stage 10's replay
+measures switched tables against those numbers. If they cannot be made to work, rule 4
+falls back to one multiplication in the solver: the factor's values scaled to integers
+over one power of two `q` and read by one `add_element`, times the rest collapsed to one
+integer by `add_multiplication_equality`, divided by `q`. The largest error #6315
 measured over the 50 objectives is 1.2e-7 of the cost.
 
 The *exact* tests of every stage are the check on this mapping: they solve at every
@@ -909,14 +924,6 @@ class LinearExtreme:
     operands: tuple[CpLinear, ...]
 
 
-@dataclass(frozen=True, eq=False)
-class Switch:
-    """A product switched on one factor's values (rule 4): factor times rest."""
-
-    factor: CpTable
-    rest: CpLinear
-
-
 @dataclass(frozen=True, eq=False, kw_only=True)
 class CpLinear:
     """A node read linearly: the float form an emitter collapses into a CP-SAT
@@ -927,7 +934,6 @@ class CpLinear:
     constant: float = 0.0
     lists: Mapping[CpIndex, np.ndarray] = field(default_factory=dict)  # one per index
     extrema: tuple[LinearExtreme, ...] = ()
-    switched: tuple[Switch, ...] = ()
 
     def __post_init__(self) -> None:
         """Refuses a list whose length is not its index's size, and marks each list
@@ -936,7 +942,7 @@ class CpLinear:
     @property
     def entries(self) -> int:
         """The entries the form puts in the model: its lists, the remaps under their
-        indexes, each once, and its operands' and switches' entries. What rule 3
+        indexes, each once, and its operands' entries. What rule 3
         compares. Counted before any rounding, so a list that turns out affine or
         constant still counts in full."""
 
@@ -1000,8 +1006,7 @@ class CpNode:
 
 @dataclass(eq=False)
 class CpLinearNode(CpNode):
-    """A node that can be linear in its children: expr is an Add, Mul, Max, Min or
-    RelayoutCharge."""
+    """A node that can be linear in its children: expr is an Add, Mul, Max or Min."""
 
     linear: CpLinear | None = field(default=None, init=False)   # set by visit_op
 
@@ -1017,11 +1022,13 @@ class CpLinearNode(CpNode):
         - a Mul: through expr.as_coeff_Mul(), k times the one other child's as_linear,
           a new form with its lists, constant and operands scaled by k, so
           7 * split ** 0.5 at split 2 is 10137, not 7 * 1448, and a negative k turns
-          each lin_min into a lin_max; with no single other child, the product switched
-          on one factor's table (rule 4), a 0/1 literal being a gate. Two linear forms
-          are never multiplied;
-        - a Max or Min: lin_max or lin_min over its children's as_linear;
-        - a RelayoutCharge: its literal gating the price list in expr's arguments.
+          each lin_min into a lin_max; with more than one other child, switched
+          tables (rule 4): one factor's table, ranked, pushed into every list of the
+          rest's as_linear, each list and the factor one numpy table on the pair of
+          their positions, the rest's constant times the factor's list, and the
+          factor pushed into each Min/Max operand when its values have one sign. A
+          0/1 literal is the two-value case. Two linear forms are never multiplied;
+        - a Max or Min: lin_max or lin_min over its children's as_linear.
 
         Raises TableLoweringError(expr, reason) when it ends with neither.
         """
@@ -1060,9 +1067,9 @@ class TableLowering:
            node comes once, after its arguments.
         3. Pass 1, over the list reversed: mark the nodes a linear reader can reach.
         4. Pass 2, the rewrite, over the list: each sympy node but an ExprCondPair
-           becomes a CpLinearNode for an Add, Mul, Max, Min or RelayoutCharge and a
-           CpNode otherwise, holding its children's CpNodes, and its visit_op is
-           called. Shared subexpressions stay shared.
+           becomes a CpLinearNode for an Add, Mul, Max or Min and a CpNode
+           otherwise, holding its children's CpNodes, and its visit_op is called.
+           Shared subexpressions stay shared.
 
         Returns the root's as_linear(). The list, the marks and the CpNodes are local
         to the call, so one TableLowering lowers any number of roots.
@@ -1092,8 +1099,7 @@ class CpEmitter:
         """form as a CP-SAT expression in COST_SCALE units, built once per form: its
         constant, plus self.table of each list, already summed per index, so a sum of
         T lists and a constant is within (T + 1) / 2 units of its float value. Each
-        lin_min or lin_max is over operands behind proxy variables, and each switch
-        is one literal per factor value."""
+        lin_min or lin_max is over operands behind proxy variables."""
 
 
 def inputs_from_maps(
@@ -1319,8 +1325,8 @@ and `pair.positions` and `rank.positions` equal the CP-SAT positions at every
 assignment.
 
 - **One `CpNode` per sympy node, in the same graph.** Pass 2 makes a node's `CpNode` from
-  its children's, which it made earlier: a `CpLinearNode` for an Add, Mul, Max, Min or
-  `RelayoutCharge`, and a `CpNode` for every other class. So the `CpNode`s form the sympy
+  its children's, which it made earlier: a `CpLinearNode` for an Add, Mul, Max or Min,
+  and a `CpNode` for every other class. So the `CpNode`s form the sympy
   graph again with their own edges, each holding its sympy node. `lower` finds a node's
   `CpNode` through a map keyed by the sympy node, which is hashable and compares by
   structure, so a subexpression that two terms share is one `CpNode` that both parents
@@ -1349,7 +1355,7 @@ assignment.
   to 71,914 nodes, 3 to 11 per distinct node. Expressions are 6 to 17 deep, so recursion
   would not overflow; the loops are chosen for clarity and so that no depth can.
 - **Two classes, one dispatch.** The rewrite makes a `CpLinearNode` for an Add, Mul,
-  Max, Min or `RelayoutCharge`, looking along the sympy node's class and its bases, and
+  Max or Min, looking along the sympy node's class and its bases, and
   a `CpNode` for every other; `visit_op` then dispatches on `expr`'s class. The bases
   matter: `Integer(1)` is class `One` and `Rational(1, 2)` is `Half`, and both are
   numbers. An operation's step is `sympy.lambdify` of `expr` in Stage 1; from Stage 2 it
@@ -1390,9 +1396,9 @@ for expr in reversed(order):                          # every parent before its 
   its first parent, before the second is seen, and has to walk the shared subtree again
   to carry a later mark down. Pass 2 iterates the same `order` forward.
 - **Linear children.** A sum's terms, a Min/Max's operands, and a product's factors, any
-  of which may be the rest of a switch (rule 4). Every other node passes no mark down:
-  the children of a power, a log, a floor, a Piecewise, a relational or a function are
-  read as tables.
+  of which may be the rest of switched tables (rule 4). Every other node passes no mark
+  down: the children of a power, a log, a floor, a Piecewise, a relational or a function
+  are read as tables.
 - **A shared node can need both forms.** In `Max(...) ** 0.5 + 3 * Max(...)` the Max is
   marked through the sum and is still read as a table by the power. It builds its linear
   form for the sum and its table for the power.
@@ -1448,19 +1454,18 @@ may still have its linear form. `visit_op` raises when the node ends with neithe
 
 A sum, a product and a Min/Max can be read without being one list, so a `CpLinearNode`
 has a second field beside `table`, its `linear`. A *linear form*, a `CpLinear`, is a
-constant, one float list per index, and the `lin_min`, `lin_max` and switched terms
-inside it. It is float, as the tables are, and frozen: merging two forms or scaling one
-makes a new form and leaves the children's lists as they were.
+constant, one float list per index, and the `lin_min` and `lin_max` terms inside it. It
+is float, as the tables are, and frozen: merging two forms or scaling one makes a new
+form and leaves the children's lists as they were.
 
 | Node, `expr` | Table | Linear form |
 |---|---|---|
 | `CpNode`, a symbol | its input's column | none: its column as one list |
 | `CpNode`, a number | one value on `Unit` | its constant |
-| `CpNode`, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | one table over its inputs, or from its parts | none: `as_linear` is the table as one list |
+| `CpNode`, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions, `RelayoutCharge` | one table over its inputs, or from its parts | none: `as_linear` is the table as one list |
 | `CpLinearNode`, an Add | the same | the children's `as_linear` added, where lists on one index become one list |
-| `CpLinearNode`, a Mul | the same, or the fold of Min/Max factors (rule 2) | constants times one child, through `expr.as_coeff_Mul()`: that child's `as_linear`, scaled. Otherwise rule 4: switched on one factor's values, with a 0/1 literal as the gate |
+| `CpLinearNode`, a Mul | the same, or the fold of Min/Max factors (rule 2) | constants times one child, through `expr.as_coeff_Mul()`: that child's `as_linear`, scaled. Otherwise switched tables (rule 4): one factor pushed into every list of the rest, each pair one numpy table, a 0/1 literal the two-value case |
 | `CpLinearNode`, a Max or Min | the same, or by rung (rule 1) | `lin_max` or `lin_min` over the children's `as_linear`, kept only under half the table's entries |
-| `CpLinearNode`, a `RelayoutCharge` | the same; normalizing has made one on a source this solve does not divide the number 0 | its literal as a gate on the price list |
 
 - **The reader picks the read.** Pass 1 tells a node whether a linear reader can reach
   it, but not which read that reader will make, so the `CpNode` keeps both, `table` and
@@ -1469,8 +1474,8 @@ makes a new form and leaves the children's lists as they were.
   `CpLinearNode` its `linear` or its `table`, whichever has fewer entries, the table on
   a tie; a Min/Max keeps its linear form only under half the entries of its table
   (rule 3). The objective reads the root with `as_linear`. Only a `CpLinearNode` holding
-  an Add, Mul, Max or Min calls `as_linear` on its children; it and one holding a
-  `RelayoutCharge` build `linear`, on a marked node only. A `CpNode` holding any other
+  an Add, Mul, Max or Min calls `as_linear` on its children and builds `linear`, on a
+  marked node only. A `CpNode` holding any other
   operation reads `table` only: under `Max(...) ** 0.5` the Max is read as its table,
   and where the Max has none, the power has none either and raises.
 - **Multipliers go down in float.** Scaling a linear form makes a new form, its lists
@@ -1479,8 +1484,8 @@ makes a new form and leaves the children's lists as they were.
 - **Refusal.** A node that ends pass 2 with neither a table nor a linear form raises
   `TableLoweringError` from its own `visit_op`, with itself as `node` and the reason: a
   symbol with no input, no table under the cap and no linear reader, a child with no
-  table under a nonlinear node, a pair or fold past the cap, two factors too wide to
-  pair, or a switched factor too wide for its precision. Nothing is passed up for a
+  table under a nonlinear node, a pair, fold or switched table past the cap, or a
+  factor of mixed sign pushed into a Min/Max. Nothing is passed up for a
   parent to work around; a relayout charge on a source this solve does not divide is
   already the number 0, from the normalization. One refusal comes later, in the build:
   an entry past 2^50, found at the rounding. Whichever it is, the entry point swaps its
@@ -1507,8 +1512,7 @@ builds a variable only when the plan reads it:
    one `add_element`. An affine list is a linear expression with no table, and a
    constant list is a number.
 
-Floats become integers in step 3. The one other place is the `p/q` of a switched
-factor (rule 4).
+Floats become integers in step 3, and nowhere else.
 
 The emitter is the seam for the table constraint. `AllowedEmitter` builds the same plan
 with `add_allowed_assignments`, and neither the walk nor a `CpIndex` changes for it
@@ -1587,7 +1591,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 | 5 | a Max and a Min as `CpLinearNode`s with a table by rung: `Extreme`, ladders, rungs, clamping |
 | 6 | a Mul's table by fold |
 | 7 | the linear form of a Max or Min: `lin_max` and `lin_min`, margin 2, operands behind proxies |
-| 8 | the switch and the gate in a Mul's linear form, and a `RelayoutCharge` as a `CpLinearNode` with its gate |
+| 8 | switched tables in a Mul's linear form: a factor pushed into every list of the rest, and into Min/Max operands |
 | 9 | `AllowedEmitter` |
 | 10 | `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
 | 11 | nothing in the module: the flag, the solver's call and the docs |
@@ -1608,7 +1612,7 @@ integrate: first with the printer's maps, then with the solver behind the flag.
 | 5 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
 | 6 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
 | 7 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes |
-| 8 | rule 4: switched products and literal gates | a factor too wide to pair, residency gates, relayout charges |
+| 8 | rule 4: switched tables, a factor pushed into every list of the rest | a product with a factor too wide to pair, residency literals |
 | 9 | the table constraint, `AllowedEmitter`, built beside `CpEmitter` | the same plans, as table constraints |
 | 10 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
 | 11 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, docs | every compile, with the flag on |
@@ -1877,7 +1881,8 @@ A Max and a Min gain their linear form, and a reader picks between it and the ta
 
 - A Min/Max too wide to index, or whose table is over twice its linear form, stays a
   `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
-  sums, constant factors and other Min/Max nodes here, and the switch of Stage 8.
+  sums, constant factors and other Min/Max nodes here, and the switched tables of
+  Stage 8, which push a factor of one sign into its operands.
 - A coefficient on the Min/Max is applied to its operands' lists before they are
   collapsed. A negative one turns Min into Max.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
@@ -1892,29 +1897,45 @@ a fractional coefficient on a linear Min is within the largest operand's bound; 
 operand is a single variable; a Max too wide to index under a power, a log or a division
 raises, and the same Max under a sum, a constant and a Min stays linear.
 
-### Stage 8: rule 4, switches and gates
+### Stage 8: rule 4, switched tables
 
-A Mul gains its switch and gate, and a `RelayoutCharge` becomes a `CpLinearNode` with its
-gate.
+A Mul with two or more factors that are not constants gains its switched tables. It is
+linear in its children only with constant factors (Stage 3); every other product is
+tables.
 
-- A product whose factor cannot pair with the rest is switched on the factor's value.
-  Whole values take one equality per value. Fractional values take the floor pair below.
-  This is the one form where a float multiplies a sum already collapsed, with the bound
-  stated under "Collapsing float lists into linear terms".
-- The switch scale: for a factor with fractional values, the power of two `q` that holds
-  each value as `p/q` with every product inside int64; the floor pair
-  `q*P <= p*w`, `q*P >= p*w - (q-1)` then makes `P = (p*w) // q`.
-- A 0/1 literal, one minus it, or a multiple of either, times a term is the two-value
-  case: the term is lowered with the literal fixed on, and no table reads the literal. A
-  relayout charge is its literal times a price by division.
-- A gate whose rest is constant is a coefficient on the literal.
+- One factor is switched: the one with the fewest distinct values, ranked to them. The
+  rest, the product of the other factors, is read with `as_linear`.
+- The factor is pushed into every list of the rest. The list and the factor's distinct
+  values make one numpy table, `outer(values, list)`, on the pair of their positions, or
+  on the list's own position when the factor's inputs are among the list's, whichever
+  has fewer entries (rule 3). The factor's position picks the row, so the switch is a
+  lookup. The rest's constant becomes the factor's list times it.
+- A Min/Max kept linear in the rest takes the factor into each operand when the factor's
+  values have one sign, a negative sign turning Min into Max. A factor of mixed sign
+  raises there.
+- A switched table is float until the collapse and rounded once, so it is within half a
+  unit, and no float multiplies a collapsed integer.
+- A 0/1 literal, one minus it, or a multiple of either, is the two-value case: the
+  table is the rest's list where the literal is on and 0 where it is off. A relayout
+  charge needs nothing here: since Stage 1 it is one table over its literal and its
+  division.
+- A switched table past the cap raises, naming the product.
 
-Tests: the switch scale is 1 for whole values and otherwise keeps `p * w` under 2^60;
-the floor pair admits only `P = (p*w) // q`, negatives included; a fractional factor
-times a sum of lists with fractional entries is within the rule 4 bound; a factor times
-a Min too wide to pair is exact, also inside a Min; a relayout charge and a gated term
-are exact with no table larger than the menu; a constant rest adds no table; two wide
-factors raise; a product too wide for its factor's precision raises.
+The risk is measured, not argued: #6315 found this form 5 times slower than a switch on
+a collapsed sum on the auto-tiling prefill objectives, 3 times over the whole replay,
+and tabled literal terms 2 to 2.5 times slower on small kernels ("Collapsing float lists
+into linear terms"). Stage 10's replay compares. If switched tables cannot be made to
+work, one more stage adds the fallback: the factor's values scaled to integers by one
+`add_element`, multiplied by the rest collapsed to one integer with
+`add_multiplication_equality`, and divided by the scale.
+
+Tests: a factor times a sum of lists over several buffers is exact, with one table per
+list and one rounding per table; a factor whose inputs are among a list's adds no
+position, so `(1 - x) * (c - c*x + c*x/t)` on a literal `x` is `c * (1 - x)`, affine,
+with no table over the tile's division; a factor times a Min too wide to pair is exact,
+also inside a Min; a negative factor turns that Min into a Max; a factor of mixed sign
+pushed into a Min raises; a gated term and a relayout charge are exact; a constant rest
+adds no table; a switched table past the cap raises.
 
 ### Stage 9: the table constraint
 
@@ -2016,17 +2037,22 @@ After Stage 10, posted on that PR, with the replay calling `lower_cost_with_tabl
    capture, beside the table in Estimates, for `CpEmitter` and for `AllowedEmitter`.
    Entries also with each stage's optimization turned off alone. A capture with more
    entries or a slower solve than #6315 is explained in the PR.
+3. **Rule 4 against #6315's switch.** Lowering and solve time of the 14B and 24B
+   auto-tiling prefill objectives, 5.9 and 5.2 s under #6315's switch, and of the small
+   default-config kernels with gated terms (softmax 4096x2048 at 0.15 s, add_mul,
+   rmsnorm). If switched tables are far
+   behind, the multiplication fallback is built as one more stage before Stage 11.
 
 After Stage 11, posted on that PR:
 
-3. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`:
+4. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`:
    `test_scratchpad_solver.py`, `test_scratchpad_use.py`,
    `test_cost_model_replication.py` and `test_solver_relayout_decision.py`. #6315's CI
    ran every shard with the tables on the default path and all passed; its one red job
    was a card fault (`DdrInitRetryLimitExceeded`). No suite may raise
    `TableLoweringError`: a refusal fails the run, since with the flag on it fails a
    compile.
-4. **Flag off.** The same suites with no flag, unchanged.
+5. **Flag off.** The same suites with no flag, unchanged.
 
 ## Next step
 
