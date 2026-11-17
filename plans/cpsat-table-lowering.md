@@ -705,17 +705,20 @@ class CpLinear:
         proxy variables, and each switch is one literal per factor value."""
 
 
-@dataclass
+@dataclass(eq=False)
 class CpNode:
     """The CP-SAT counterpart of one sympy node, which it never changes.
 
-    A parent reads it as a table or linearly. Each read is made on first request and
-    memoized, so a node shared by two parents that read it differently makes both, and
-    a read nobody requests is never made.
+    The CpNodes form the same graph as the sympy nodes: children holds the CpNodes of
+    the sympy node's children, made before it, and a subexpression shared by two
+    parents is one CpNode that both hold. A parent reads a child as a table or
+    linearly. Each read is made on first request and memoized, so a node that two
+    parents read differently makes both, and a read nobody requests is never made.
     """
 
     expr: sympy.Basic                 # the sympy node, read only
-    linear_ok: bool = False           # pass 1: a linear reader can reach it
+    children: tuple[CpNode, ...]      # its children's CpNodes, in children_of order
+    linear_ok: bool                   # pass 1: a linear reader can reach it
 
     def as_table(self) -> CpTable:
         """The node read as a table, from pass 2's candidate. Raises TableLoweringError
@@ -737,9 +740,10 @@ class TableLowering:
     def lower(self, root: sympy.Basic) -> cp_model.LinearExprT:
         """root as a CP-SAT objective in COST_SCALE units.
 
-        Pass 1 iterates preorder_traversal and sets linear_ok, repeats kept. Pass 2
-        iterates postorder_traversal and gives each node, once, its candidate table and
-        linear form, reading its children with as_table and as_linear. Only then does
+        Pass 1 iterates preorder_traversal and marks the sympy nodes a linear reader can
+        reach, repeats kept. Pass 2 iterates postorder_traversal and makes each node's
+        CpNode once, from its children's CpNodes, with its candidate table and linear
+        form, reading the children with as_table and as_linear. Only then does
         it return the root's as_linear().cp_expr(model), which makes just the variables
         that form requests. Every refusal raises TableLoweringError during the passes,
         before any variable is made, so the model is untouched when it raises.
@@ -770,10 +774,13 @@ its input and column ("How a table maps onto CP-SAT"), and `sym_map` and `buffer
 are the printer's two maps. With `Inputs` as an empty class the sketch passes mypy with
 torch-spyre's settings (`pyproject.toml:131`), the bodies being empty.
 
-- **One `CpNode` per sympy node.** The map is keyed by the sympy node, which is hashable
-  and compares by structure, so a subexpression that two terms share has one `CpNode`:
-  both terms read one list and one position. Every result lives on the `CpNode`. The
-  expression is the same object, unchanged, after the lowering.
+- **One `CpNode` per sympy node, in the same graph.** Pass 2 makes a node's `CpNode` from
+  its children's, which it made earlier, so the `CpNode`s form the sympy graph again
+  with their own edges. It finds a node's `CpNode` through a map keyed by the sympy
+  node, which is hashable and compares by structure, so a subexpression that two terms
+  share is one `CpNode` that both parents hold: both read one list and one position.
+  Every result lives on the `CpNode`. The expression is the same object, unchanged,
+  after the lowering.
 - **Read as a table or linearly.** Pass 2 leaves each `CpNode` with a candidate table, a
   candidate linear form, or both. A parent reads a child with `as_table` or `as_linear`,
   and each read is made on first request and memoized: a node read both ways, such as a
@@ -784,9 +791,9 @@ torch-spyre's settings (`pyproject.toml:131`), the bodies being empty.
 - **Pre-order, then post-order, no recursion.** Pass 1 keeps the repeats: pre-order
   yields a shared node once under each parent, after that parent, which is what lets a
   mark from its second parent reach its children. Pass 2 skips them: a node's first
-  post-order occurrence comes after its whole subtree, so its arguments' `CpNode`s are
-  done. `lower` owns both walks. A method is handed a `CpNode` and its children's
-  `CpNode`s, and never walks. Stage 1's `numpy_value` is the pass 2 loop with arrays for
+  post-order occurrence comes after its whole subtree, so its children's `CpNode`s exist
+  and are done. `lower` owns both walks. A method is handed a new `CpNode`, whose
+  `children` are done, and never walks. Stage 1's `numpy_value` is the pass 2 loop with arrays for
   results.
 - **The walks are short.** On the 50 replayed objectives each yields 589 to 71,914
   nodes, 3 to 11 per distinct node, in at most 0.1 s. Expressions are 6 to 17 deep, so
@@ -812,11 +819,10 @@ linear nodes only (see "How a table is read"). The first pass finds those nodes 
 any list is computed:
 
 ```python
-nodes: dict[sympy.Basic, CpNode] = {root: CpNode(root, linear_ok=True)}
+linear_ok: set[sympy.Basic] = {root}                 # the objective reads the root
 for expr in sympy.preorder_traversal(root):           # parents first, repeats kept
-    if nodes.setdefault(expr, CpNode(expr)).linear_ok:
-        for child in linear_children(expr):           # see "Linear children" below
-            nodes.setdefault(child, CpNode(child)).linear_ok = True
+    if expr in linear_ok:
+        linear_ok.update(linear_children(expr))       # see "Linear children" below
 ```
 
 - **Parents first, shared nodes included.** `preorder_traversal` repeats a shared node
