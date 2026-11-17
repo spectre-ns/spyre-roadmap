@@ -520,7 +520,8 @@ two: `[division_a, division_b, rank_m]` with 6 rows and `[rank_m, division_c, co
 12.
 
 Both forms were run on the roll-up and agree at all 24 assignments. Which solves faster on
-real objectives is not measured. Both sit behind one helper. The default is combine and
+real objectives is not measured. The table constraint is one more `IndexMap`,
+`Allowed(rows)`, injected in place of `Combine` and `Compact`. The default is combine and
 compact, and the last PR reports both on the replay.
 
 **What the chain must guarantee.** Let D be the decision variables a term reads.
@@ -610,9 +611,9 @@ and each of those makes its CP-SAT variables itself, on first request:
 ```python
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Protocol
 
 import numpy as np
 import sympy
@@ -627,30 +628,74 @@ class TableLoweringError(Exception):
     """
 
 
+class IndexMap(Protocol):
+    """One mapping step, injected into a CpIndex: from the positions of its parts to a
+    position 0 .. size - 1. A new kind of step is a new IndexMap; CpIndex and the walk
+    do not change."""
+
+    @property
+    def entries(self) -> int:
+        """The table entries the step puts in the model, 0 for an arithmetic step."""
+
+    def __call__(self, *parts: np.ndarray) -> np.ndarray:
+        """The step in numpy: the position for each combination of the parts' positions,
+        broadcast across the parts."""
+
+    def cp_expr(
+        self, model: cp_model.CpModel, parts: Sequence[cp_model.LinearExprT], size: int
+    ) -> cp_model.LinearExprT:
+        """The step in model, from its parts' CP-SAT expressions."""
+
+
+@dataclass(frozen=True)
+class Input:
+    """IndexMap of a variable's own position, d -> d: no parts, no entries, and the
+    variable as its CP-SAT expression. The variable is already in the model."""
+
+    var: cp_model.IntVar
+
+
+@dataclass(frozen=True)
+class Combine:
+    """IndexMap (left, right) -> left * right_size + right: one linear expression, no
+    entries."""
+
+    right_size: int
+
+
+@dataclass(frozen=True)
+class Compact:
+    """IndexMap parent -> remap[parent]: one add_element, len(remap) entries."""
+
+    remap: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Extreme:
+    """IndexMap (rung_1, ..., rung_k) -> their max, or min: one lin_max or lin_min, no
+    entries. Exact because a ladder keeps order."""
+
+    is_max: bool
+
+
 @dataclass(frozen=True)
 class CpIndex:
-    """A map from the inputs' positions to a position in one table, 0 .. size - 1, and
-    the recipe for its CP-SAT expression.
+    """A map from the inputs' positions to a position in one table, 0 .. size - 1: its
+    mapping applied to its parts.
 
-    One of five kinds: an input, the position of its variable; a combine,
-    left * right.size + right, a linear expression; a compact, remap[parent], one
-    element lookup; a min or max of rungs, one lin_min or lin_max. Made from the inputs
-    by these alone, so the final index of a term is a function of every input it was
-    made from. The walk interns it: two nodes that make the same position get the same
-    CpIndex object, so its expression is made once.
+    Made from Input leaves by injected IndexMap steps alone, so the final index of a
+    term is a function of every input it was made from. The walk interns it: two nodes
+    that make the same position get the same CpIndex object, so its expression is made
+    once.
     """
 
     size: int
-    kind: Literal["input", "combine", "compact", "min", "max"]
-    parts: tuple[CpIndex, ...] = ()           # combine: left, right; compact: parent;
-                                              # min or max: the rungs
-    remap: tuple[int, ...] = ()               # compact: parent position -> position
-    var: cp_model.IntVar | None = None        # input: its variable, already in the model
+    mapping: IndexMap
+    parts: tuple[CpIndex, ...] = ()
 
     def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
-        """The position as a CP-SAT expression, made in model on the first call and
-        memoized: an input's variable, a combine's linear expression, a compact's
-        element lookup, or a min or max of rungs. Its parts are made first."""
+        """mapping.cp_expr on the parts' cp_expr, made in model on the first call and
+        memoized. Its parts are made first."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -772,7 +817,9 @@ def lower_cost_with_tables(
 The sketch is the public interface only: signatures and docstrings, with the bodies left
 to the stages. The walk makes no CP-SAT variable: a `CpIndex` is the recipe for one, so
 a refusal leaves the model untouched. `cp_expr` makes them after the walk, when the
-objective's form requests them, each once. Inside `TableLowering`, the dispatch to one
+objective's form requests them, each once. `Input`, `Combine`, `Compact` and `Extreme`
+each implement the three members of `IndexMap`; the sketch shows their fields only.
+Inside `TableLowering`, the dispatch to one
 method per node class, the
 methods (`generic_visit`, `visit_Add`, `visit_Mul`, `visit_Min`, `visit_Max`,
 `visit_RelayoutCharge`), `tabulate` and the reader that applies rule 3 are private, and
@@ -931,10 +978,11 @@ calls CP-SAT, and it makes a variable only when a form requests it:
    and nothing else reaches the model: a table used only to compute a parent's table in
    numpy, or a candidate no parent read, adds no variable.
 2. **Positions, on request.** `CpIndex.cp_expr` makes each position once and memoizes
-   it: an input is its variable, a combine is a linear expression, a compact is one
-   `add_element`, and a min or max of rungs is one constraint. Its parts are made first,
-   and interning makes a shared position one object. This method is the one helper of
-   Stage 3, so the table constraint replaces it without a change to the walk.
+   it, through its injected `IndexMap`: an `Input` is its variable, a `Combine` is a
+   linear expression, a `Compact` is one `add_element`, and an `Extreme` is one
+   `lin_max` or `lin_min`. Its parts are made first, and interning makes a shared
+   position one object. The `IndexMap` is the seam: the table constraint is another
+   one, injected without a change to the walk.
 3. **Collapse, on request.** `CpLinear.cp_expr` rounds each list once and reads it with
    one `add_element`. An affine list is a linear expression with no table, and a
    constant list is a number.
@@ -1130,7 +1178,8 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
   `visit_Add`, `visit_RelayoutCharge` and the `cp_expr` methods. `tabulate`
   realizes a leaf, a node whose children share an index, and a node whose inputs fit one
   table.
-- Positions are made by two moves only, combine and compact, behind one helper.
+- Positions are made by injected `IndexMap` steps: `Input`, `Combine` and `Compact` here,
+  `Extreme` in Stage 4.
 - Inputs are mapped from the printer's two maps. A buffer's symbols share its division as
   their index. Any other variable is indexed by its domain, through a position lookup
   when the domain has gaps. A domain past the cap is not an input.
@@ -1182,8 +1231,8 @@ parts, and the choice between the two.
 - A function of an indexed node keeps that node's index.
 - A node takes the cheaper of one table over its inputs and the form built from its parts
   (rule 3).
-- The same helper can build a roll-up as one table constraint, for the measurement in the
-  last PR.
+- `Allowed(rows)`, one more `IndexMap`, builds a roll-up as one table constraint, for the
+  measurement in the last PR.
 
 Tests:
 
