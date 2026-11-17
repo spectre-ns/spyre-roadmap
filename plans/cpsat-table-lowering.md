@@ -672,7 +672,8 @@ class Input(IndexMap):
 
 @dataclass(frozen=True)
 class Combine(IndexMap):
-    """(left, right) -> left * right_size + right."""
+    """(left, right) -> left * right_size + right. right_size is a constant, the right
+    part's size, so this is linear: no two variables are multiplied."""
 
     right_size: int
 
@@ -791,7 +792,9 @@ class CpLinear:
     def __mul__(self, coeff: float) -> CpLinear:
         """Every list, the constant and every operand scaled in float before any
         rounding, so 7 * split ** 0.5 at split 2 is 10137, not 7 * 1448. A negative
-        coeff turns each lin_min into a lin_max and back."""
+        coeff turns each lin_min into a lin_max and back. coeff is a number: two
+        CpLinear are never multiplied. A product of non-constant factors is one table,
+        a pair of ranks, or a switch on one factor's values (rule 4)."""
 
     __rmul__ = __mul__
 
