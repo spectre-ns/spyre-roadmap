@@ -105,6 +105,12 @@ computed with numpy functions, and the code arrives in layers, each with its own
   - A position is one class, `CpIndex`, whose steps hold their parts as fields:
     `Combine(left, right)`, as a node holds its children. It replaces `IndexMap` and
     `CpIndex`, which referred to each other: the step took the `CpIndex` it sat in.
+    `Compact`, `Extreme` and `Locate`, written on it, type-check and are exact in CP-SAT
+    on the step-by-step graph at the real menus: the ranked product in 68 entries, the
+    Max by rung in 63 (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/merged/`). One thing
+    is given up: a part reached twice in one build is built twice, where `IndexMap`'s
+    walk built it once. That is free while no step writes the model, and Stage 4 builds
+    positions once.
   - Each kind of node, form and position step is a thin subclass of a small interface,
     so an operation, a form or a step is added without changing the others. Changing
     how something is emitted means changing its class's `cp_expr`.
@@ -1138,7 +1144,9 @@ was built, and the entry point's copy and swap back (Decisions) restores the mod
 `CpTable.cp_expr` a table (rounded once; a number, adding nothing,
 when constant; otherwise one `add_element` on its position) and `CpNode.cp_expr` a
 node's form. Only `cp_expr` methods touch the model. In Stage 1 each call builds anew,
-which is enough while only the root is built.
+and a part reached twice is built twice: enough while only the root is built and no
+step writes the model. Stage 3 builds a node once and Stage 4 a position once, through
+one memo per build.
 
 **The copy.** `lower_cost_with_tables` copies the model with `model.clone()` before it
 maps an input. A failure in the build can come after variables were made: an entry past
@@ -1171,13 +1179,13 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 | Stage | Hook |
 |---|---|
 | 2 | a node's numpy step on its children's lists, where they share a position |
-| 3 | `CpLinear` and `CpAdd`, with a sum always realized as a `CpLinear`; `CpMul` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's form is linear (a power, a log, a Piecewise). What was built is kept on the node once a node has several readers, and a position on the node that makes it |
-| 4 | the switch form; the `Compact` step; a second way to realize a node, and with it the choice between ways by entries (rule 3) |
+| 3 | `CpLinear` and `CpAdd`, with a sum always realized as a `CpLinear`; `CpMul` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's form is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
+| 4 | the switch form; the `Compact` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the forms it weighs: the switch and `CpLinear` |
 | 5 | the gate, and `RelayoutCharge` as its own node |
 | 6 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 6 decides whether a node keeps its two best tables for its reader |
 | 7 | the `Extreme` step; a Min/Max node with its ladder |
 | 8 | the fold, one more way to realize a product |
-| 9 | the `lin_max`/`lin_min` form |
+| 9 | the `lin_max`/`lin_min` form, with its entry count for margin 2 |
 | 11 | the `Locate` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
 
 Open in Stage 3: whether terms of one sum that are tables on equal positions are added
@@ -1426,8 +1434,11 @@ affine list needs no table" of "How the tables are kept small", with the collaps
   power, a log, a Piecewise): one table over its inputs, as Stage 1 realizes it, read
   only when such a parent asks. A sum read that way is one table again, and raises past
   the cap.
-- Built once: a node read by several parents keeps its `cp_expr`, and a position is kept
-  on the node that makes it, so a shared subexpression is built once.
+- Built once: the entry point makes one memo per build and passes it with the model,
+  as #32 did before its hooks were cut (92d7bd42). A node read by several parents is
+  built once through it. It lives for one build: the swap back after a failure drops it
+  with the copy, so nothing built into the discarded model is reused. Positions go
+  through it from Stage 4, when a step first writes the model.
 - `CpTable.cp_expr` reads a list that is affine in its position as a linear
   expression, with no table.
 - Open: whether terms of one sum that are tables on equal positions are added before
@@ -1462,8 +1473,17 @@ its rest is a form Stage 3 already makes. It brings two things later stages reus
   is the one switched on. Where its list repeats a value, it is ranked to its distinct
   values by `Compact`, a new `CpIndex` step: one lookup from its position to the rank
   of its value. Where it does not, its position is its rank. Its values stay numbers.
-  `Compact` is the first step that adds to the model, so it is built once per model
-  however many tables read it, by Stage 3's build-once.
+  `Compact` is the first step that writes the model, so from here a position is built
+  once per build: `CpIndex.cp_expr` looks it up in the build memo by its value. Two
+  tables on equal positions share one lookup even when two nodes made them, and a part
+  reached twice in one position is built once. Without it each is built twice: two
+  rank lookups where one is needed
+  (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/merged/future_steps.py`). A step's data
+  is a tuple, never an array, so that it hashes.
+- **The true/falses.** `add_map_domain` takes the factor's position as it is, any linear
+  expression: ortools 9.15 writes it as enforced linear constraints, so the position
+  needs no variable of its own. An `Input` with `lo` passes its variable and `lo` as the
+  offset.
 - **The rest.** The product of the other factors, read as their form: one child's
   form when one is left, a further switch when more are. It may hold lists on several
   buffers, a constant and other switches, and from Stage 9 a Min/Max kept linear. All
@@ -1493,6 +1513,11 @@ its rest is a form Stage 3 already makes. It brings two things later stages reus
   product's one table over its inputs. A factor with a repeated value times a short
   list can keep its table: `[1, 1, 2]` times a list of 2 is 6 entries as a table and 7
   as a switch. Under a nonlinear reader the product is its table, as in Stage 3.
+- **Entries.** `CpForm` stays `cp_expr` alone; the forms the choice weighs get an entry
+  count here. The switch counts its rest's entries, one per factor value and the
+  factor's `Compact`. `CpLinear` counts its terms', since a switch's rest can be a sum:
+  `derate * (A + B)` weighs its switch, over `A`'s and `B`'s tables, against one table
+  over every input of the product.
 - **The cap.** A factor's values count as entries; a factor with more values than the
   cap has no switch.
 
@@ -1518,6 +1543,8 @@ Tests:
 - a factor whose values are all whole is exact within its values times the rest's
   bound, with one constraint per value;
 - two products with one factor are one switch with one `w`;
+- two tables on equal `Compact` positions, made by two nodes, add one rank lookup, and
+  a `Compact` reached twice in one position adds one;
 - a factor of mixed sign, and a negative one, times a sum of lists over two buffers is
   exact;
 - a factor with a repeated value is ranked by one `Compact`, and one with distinct
@@ -1694,6 +1721,8 @@ A Max and a Min gain their linear form, and a reader picks between it and the ta
   forms, so a switch or a gate inside one is one more term there.
 - A coefficient on the Min/Max is applied to its operands' lists before they are
   collapsed. A negative one turns Min into Max.
+- The linear form counts its entries, its operands' lists, which margin 2 weighs
+  against the table's.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
   `lin_max`, CP-SAT's presolve ran out of memory (`bad_alloc` past 40 GB on a Qwen3 0.6B
   prefill objective). The proxies also carry the speed: without them, margin 2 solves
