@@ -68,7 +68,7 @@ computed with numpy functions, and the code arrives in layers, each with its own
   - Its rest's entries count once; a relayout charge's table over the literal and the
     division held them twice, its off half zeros.
 
-  This is rule 5, built in Stage 9, right after the switch it optimizes. #6315 measured
+  This is rule 5, built in Stage 5, right after the switch it optimizes. #6315 measured
   this form against tabling the literal:
   - small default-config kernels went from 2 to 2.5 times the printer's solve time to
     the printer's own: softmax 4096x2048 0.39 to 0.15 s (printer 0.15 s), add_mul 0.11
@@ -111,6 +111,25 @@ computed with numpy functions, and the code arrives in layers, each with its own
   class?", "Drop visitation it's not as clean as using the open closed principle",
   "Drop CpEmitter", "Lets build the hooks when they're needed", "Implement a CpForm base
   class". Spectre-ns/torch-spyre#32 is built this way. See Architecture.
+- **The switch and the gate right after the linear sums (2026-11-18).** The order is
+  1 base, 2 numpy, 3 linear sums, 4 the switch, 5 the gate, 6 ranks and pairs, 7 rungs,
+  8 the fold, 9 `lin_max`. It was 4 ranks, 5 rungs, 6 the fold, 7 `lin_max`, 8 the
+  switch, 9 the gate.
+  - The switch needs only Stage 3: its rest is a form Stage 3 makes, a table or a
+    `CpLinear`. It brings `Compact` and the choice between ways by entries (rule 3),
+    which Stage 6 extends.
+  - It serves both kinds of term: it takes the literals out of the narrow terms' tables
+    and splits the wide products. On the step-by-step graph's product it is 38 entries
+    against 68 as a pair at the real menus.
+  - Each `IndexMap` step lands with the stage that first uses it: `Input`, `Unit` and
+    `Combine` in Stage 1, `Compact` in 4, `Extreme` in 7, `Locate` in 11. `Locate` left
+    #32 because no replayed objective needs it: none of the 4,159 non-buffer variables
+    the 50 replayed objectives read has a domain with gaps
+    (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/locate/`).
+
+  The owner asked "Do we need all the IndexMap specializations before we implement the
+  optimizations?" and, given this order and `Locate`'s move, said "Do that". The end
+  state is the same, so Stage 11's replay against #6315 does not change.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
   #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
@@ -185,7 +204,7 @@ is never one table.
 | prefill batch GQA test | 91 | 662 | 401 | 3 | 58399 | 115667 | 5.94 | 13.49 |
 
 The narrow estimate is one list per division and literal, sized by the menu: the form of
-rule 4's switch, which collapses a literal term's rest once, from Stage 8. Before it a
+rule 4's switch, which collapses a literal term's rest once, from Stage 4. Before it a
 literal's term is one table over the literal and the division (Stage 3): twice that,
 its off half zeros. The estimate ignores lists that turn out affine and cost nothing.
 
@@ -197,13 +216,13 @@ its off half zeros. The estimate ignores lists that turn out affine and cost not
   other 56 read four or more literals. It lowers none of the 50 objectives end to end:
   each has at least one term whose inputs pass the cap, and the lowering is all or
   nothing.
-- On the wide terms, entry count is decided in Stages 4 to 8, on 1 to 4 terms per
+- On the wide terms, entry count is decided in Stages 4 and 6 to 9, on 1 to 4 terms per
   objective.
-- Stage 8, the switch, takes the literals out of the narrow terms' tables: a literal's
+- Stage 4, the switch, takes the literals out of the narrow terms' tables: a literal's
   term is its rest collapsed once, sized by its menu alone, as the estimate counts it. A
-  term on one menu with k literals is one list under k switches, where Stages 3 to 7 made
-  one table of 2^k times the menu. Until Stage 8 the narrow entries are about twice the
-  estimate. Stage 9's gate then drops the literal from the rest and makes a fractional
+  term on one menu with k literals is one list under k switches, where Stage 3 made one
+  table of 2^k times the menu. Until Stage 4 the narrow entries are about twice the
+  estimate. Stage 5's gate then drops the literal from the rest and makes a fractional
   coefficient exact. How many of the 56 the switch brings under the cap is reported by
   Stage 11's replay.
 - Lowering time matters most where the model is smallest. At the default config a decode
@@ -464,14 +483,15 @@ Every row was run through CP-SAT at all 4620 assignments: one solution per assig
 minimizing and maximizing agree at each, and the worst error stays within the collapse
 bound.
 
-Three more reductions are not in this graph, which reads no residency literal:
-- **The switch (rule 4)** reads a product too wide for one table by collapsing its rest
-  once into an integer and multiplying that by each of the factor's values, one enforced
-  constraint per value.
+Three more reductions are not in the table above:
+- **The switch (rule 4)** reads a product by collapsing its rest once into an integer
+  and multiplying that by each of the factor's values, one enforced constraint per
+  value. It applies to this graph's product: 38 entries against the ranks' 36 + 21 +
+  11 = 68, so with it the built-up total is 122 (Stage 4).
 - **The gate (rule 5)** is the switch on a 0/1 literal. Its rest's entries count once,
-  and no table reads the literal.
+  and no table reads the literal. This graph reads no literal.
 - **The fold (rule 2)** reads a product of Min/Max factors over shared inputs by the
-  tuples of rungs that can occur together.
+  tuples of rungs that can occur together. This graph multiplies no Min/Max.
 
 On the model blocks, one table over the widest term alone would hold 3.6e4 to 7.5e18
 entries, and #6315's lowering of the whole objective holds 396 to 21998 (Estimates).
@@ -521,7 +541,7 @@ flowchart LR
 ```
 
 - **Offset.** A variable in `lo..hi` has the position `var - lo`. A domain with gaps
-  gets its position from a lookup.
+  gets its position from a lookup, `Locate` (Stage 11).
 - **Stride.** A position is multiplied by the product of the sizes of the variables
   after it: 2 * 3 = 6 for `x`, 3 for `y`, 1 for `z`.
 - **Linear.** The strides are constants, so the index is a linear expression: no two
@@ -586,6 +606,7 @@ The only lookup is `add_element(index, table, target)`, which enforces
 - Any other integer variable has its domain's values, ascending. Its index is `var - lo`
   when the domain has no gaps. With gaps it is a position `pos` under
   `add_element(pos, domain_values, var)`; the values are distinct, so one position fits.
+  That lookup is `Locate`, from Stage 11: no replayed objective reads such a variable.
 
 **Each way a list is made.** Lists are built from the leaves of the expression upward: a
 node's list is made from its arguments' lists.
@@ -768,8 +789,8 @@ assignment of the inputs, so an entry read from the wrong position fails.
 Three layers, each a small interface with thin subclasses, so that adding an operation,
 a form or a position step changes nothing else:
 
-- **Values.** A *position* is a `CpIndex`: one `IndexMap` step (`Input`, `Locate`,
-  `Unit`, `Combine`, and later `Compact`, `Extreme`) applied to its parts. A *form* is
+- **Values.** A *position* is a `CpIndex`: one `IndexMap` step (`Input`, `Unit`,
+  `Combine`; later `Compact`, `Extreme` and `Locate`) applied to its parts. A *form* is
   what a node is realized as, a `CpForm`: a `CpTable` (a float list on a position) and,
   from Stage 3, a `CpLinear`. Values hold no model.
 - **Nodes.** `TableLowering` is a factory. It makes one `CpNode` per distinct sympy
@@ -819,8 +840,8 @@ class TableLoweringError(Exception):
 
 class IndexMap(ABC):
     """One step of a position: from its parts' positions to a position 0 .. size - 1,
-    in numpy and in CP-SAT. Input, Locate, Unit and Combine are its subclasses in
-    Stage 1; Compact (Stage 4) and Extreme (Stage 5) join them."""
+    in numpy and in CP-SAT. Input, Unit and Combine are its subclasses in Stage 1;
+    Compact (Stage 4), Extreme (Stage 7) and Locate (Stage 11) join them."""
 
     @abstractmethod
     def size_from(self, parts: Sequence[CpIndex]) -> int:
@@ -847,7 +868,7 @@ class IndexMap(ABC):
 @dataclass(frozen=True)
 class Input(IndexMap):
     """A leaf, and the thinnest step: a variable's own position, v - lo, for a domain
-    lo .. lo + size - 1. Locate, Unit and Combine are as thin."""
+    lo .. lo + size - 1. Unit and Combine are as thin."""
 
     var: cp_model.IntVar
     size: int
@@ -1142,13 +1163,13 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 |---|---|
 | 2 | a node's numpy step on its children's lists, where they share a position |
 | 3 | `CpLinear` and `CpAdd`, with a sum always realized as a `CpLinear`; `CpMul` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's form is linear (a power, a log, a Piecewise). What was built is kept on the node once a node has several readers, and a position on the node that makes it |
-| 4 | a second way to realize a node, from its parts, and with it the choice between ways by entries (rule 3). Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 4 decides whether a node keeps its two best tables for its reader |
-| 5 | `Compact` and `Extreme` steps; a Min/Max node with its ladder |
-| 6 | the fold, one more way to realize a product |
-| 7 | the `lin_max`/`lin_min` form |
-| 8 | the switch form |
-| 9 | the gate, and `RelayoutCharge` as its own node |
-| 11 | `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
+| 4 | the switch form; the `Compact` step; a second way to realize a node, and with it the choice between ways by entries (rule 3) |
+| 5 | the gate, and `RelayoutCharge` as its own node |
+| 6 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 6 decides whether a node keeps its two best tables for its reader |
+| 7 | the `Extreme` step; a Min/Max node with its ladder |
+| 8 | the fold, one more way to realize a product |
+| 9 | the `lin_max`/`lin_min` form |
+| 11 | the `Locate` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
 
 Open in Stage 3: whether terms of one sum that are tables on equal positions are added
 before the rounding, one lookup and one rounding (`split ** 0.5 + split ** 0.7` is 3112
@@ -1158,17 +1179,17 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 
 | Stage | Adds to the architecture |
 |---|---|
-| 1 | the values (`IndexMap` with `Input`, `Locate`, `Unit`, `Combine`; `CpIndex`; `CpForm`, `CpTable`), each with `cp_expr`; `values_on_grid` by lambdify; `CpNode`, `CpSymbol`, `CpConstant`; `TableLowering`, the factory; `TableLoweringError` |
+| 1 | the values (`IndexMap` with `Input`, `Unit`, `Combine`; `CpIndex`; `CpForm`, `CpTable`), each with `cp_expr`; `values_on_grid` by lambdify; `CpNode`, `CpSymbol`, `CpConstant`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists |
 | 3 | `CpLinear`, `CpAdd`, `CpMul` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `CpTable.cp_expr` |
-| 4 | a node realized from its parts: `Compact`, ranks and pairs, and the choice between ways (rule 3) |
-| 5 | Min/Max nodes realized by rung: `Extreme`, ladders, rungs, clamping |
-| 6 | a product realized by fold |
-| 7 | the linear form of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
-| 8 | the switch: a product's linear form, the rest collapsed once and multiplied per factor value |
-| 9 | the gate, and `RelayoutCharge` as its own node |
+| 4 | the switch: a product's linear form, the rest collapsed once and multiplied per factor value; `Compact`; the choice between ways (rule 3) |
+| 5 | the gate, and `RelayoutCharge` as its own node |
+| 6 | a node realized from its parts: ranks and pairs |
+| 7 | Min/Max nodes realized by rung: `Extreme`, ladders, rungs, clamping |
+| 8 | a product realized by fold |
+| 9 | the linear form of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
 | 10 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
-| 11 | `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
+| 11 | `Locate`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
 | 12 | nothing in the module: the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
@@ -1184,12 +1205,12 @@ then with the solver behind the flag.
 | 1 | the base mechanics: inputs and an expression to a CP-SAT objective, one table per node, every value by lambdify | an expression whose inputs fit the cap together; no real objective |
 | 2 | numpy steps from a dict, lambdify for any class it does not hold | the same as Stage 1, in less lowering time |
 | 3 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
-| 4 | ranks and pairs: a node's table from its parts | products of short lists over several buffers |
-| 5 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
-| 6 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
-| 7 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes |
-| 8 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
-| 9 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
+| 4 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `Compact` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
+| 5 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
+| 6 | ranks and pairs: a node's table from its parts | nodes over several buffers read as tables: products under a power, a log or a Piecewise, short lists over several buffers |
+| 7 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
+| 8 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
+| 9 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes, products included |
 | 10 | not in the stack: the table constraint, a branch that changes the `cp_expr` methods, measured by Stage 11's replay | the same plans, as table constraints |
 | 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
 | 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
@@ -1199,30 +1220,44 @@ root's table is over every input the objective reads. On the 50 replayed objecti
 is 14 to 544 inputs and 10^13.4 to 10^401 entries, and 10^29.5 to 10^60.5 on the default
 and auto-tiling model blocks, against a cap of 8192. Stage 3 keeps the sum linear, which
 lowers 6465 of the 6521 narrow terms as one table each, but each objective still has a
-wide term past the cap (Estimates). Stages 4 to 8 are for those 1 to 4 wide terms, and
-Stage 9 gates the literals, so a narrow term costs its menu, not its menu times two for
-each literal. Real objectives are first lowered end to end at Stage 11, which maps the
-printer's inputs; at #6315's tip, with its gate and four rules, all 50 lower.
+wide term past the cap (Estimates). The switch comes next, in Stage 4, because it serves
+both kinds of term and needs only Stage 3: it takes the literals out of the narrow
+terms' tables, so a narrow term costs its menu, not its menu times two for each literal,
+and it splits the wide products. Stage 5 gates the literals. Stages 6 to 9 are for what
+is left of the 1 to 4 wide terms: a Min/Max, and a node read as a table. Real objectives
+are first lowered end to end at Stage 11, which maps the printer's inputs; at #6315's
+tip, with its gate and four rules, all 50 lower.
 
-**On the graph of "The process, step by step"**, at its own menus and at the real menus
-of "On real menus", after each stage that applies to it:
+**On the graph of "The process, step by step"**, term by term, after each stage that
+changes it. Each cell is entries at its own menus · at the real menus of "On real
+menus"; an empty cell is unchanged:
 
-| After stage | Entries, small menus | Entries, real menus | Largest table, real menus |
-|---|---|---|---|
-| 1 | 24 | 4620 | 4620 |
-| 3 | 24 | 4620 | 4620 |
-| 4 | 24 | 4620 | 4620 |
-| 5 | 23 | 152 | 36 |
-| 7 | 23 | 152 | 36 |
+| After stage | Two terms on `split_a` | The product | The Max | Entries |
+|---|---|---|---|---|
+| 1 | one table over the root | | | 24 · 4620 |
+| 3 | 3 · 21, one list | 6 · 231, one table | 24 · 4620, one table | 33 · 4872 |
+| 4 | | 5 · 38, the switch | | 32 · 4679 |
+| 6 | | 5 · 38, the switch; 6 · 68 as a pair | 22 · 268, from ranked parts | 30 · 327 |
+| 7 | | | 14 · 63, by rung | 22 · 122 |
 
-Every row was run through CP-SAT at every assignment: one solution per assignment, and
-within the collapse bound. Stages 3 and 4 change nothing here, because the Max reads all
-three divisions and its only form is one table over them: the root's linear form holds
-those 4620 entries and the other lists besides, more than one table over the root, and
-rule 3 keeps the table. Stage 2 changes no entry anywhere. Once Stage 5 reads the Max by
-rung, the linear sum and the ranked product pay at once. Stage 7 changes nothing either:
-the `lin_max`, 52 entries, is not under half of the rung form's 64. Stages 6, 8 and 9
-do not apply to this graph, which reads no literal and multiplies no Min/Max. The
+- From Stage 3 the sum is linear, so it holds each term's form: 33 entries where one
+  table over the root is 24. On menus this short the terms' tables together are larger
+  than the root's one table; at real sizes one table is never an option.
+- The two terms on `split_a` are one list if Stage 3 adds lists on one position before
+  the rounding (open there); kept apart, each total is 3 · 21 more.
+- Stage 4's switch takes the product from 231 entries to 38. Stage 6 leaves it a switch,
+  which has fewer entries than the pair.
+- The Max's ranked parts at Stage 6 assume ranks apply to a Min/Max before Stage 7
+  (review M2, open). If they do not, the Max stays one table until Stage 7, and Stage 6
+  changes nothing here.
+- Stage 9 changes nothing: the `lin_max`, 52 entries, is not under half of the rung
+  form's 63. Stages 2, 5 and 8 change no entry here: this graph reads no literal and
+  multiplies no Min/Max.
+
+Each term's form was run through CP-SAT at every assignment, minimizing and maximizing
+agreeing at each, within its bound: the switch and the ranked Max on 2026-11-18
+(`~/gap-probe/spyre-roadmap-pr22/2026-11-18/`), the one tables and the rung form in the
+2026-11-17 runs. The totals are sums of the terms, not runs of the whole objective. The
 reductions compound, so a stage is measured with the ones before it on.
 
 In the tests below, *exact* means: at every assignment of the inputs the lowered
@@ -1256,8 +1291,8 @@ lists, such an arm raises.
 
 **The lowering (`cpsat_table_lowering.py`).**
 
-- The values: `IndexMap` with `Input`, `Locate`, `Unit` and `Combine`; `CpIndex`, which
-  computes its size from its parts; `CpForm` and `CpTable`, with `entries` and
+- The values: `IndexMap` with `Input`, `Unit` and `Combine`; `CpIndex`, which computes
+  its size from its parts; `CpForm` and `CpTable`, with `entries` and
   `finite`; each with `cp_expr`; and `TableLoweringError`.
 - The nodes: `CpNode`, which realizes one table over its inputs; `CpSymbol`, its
   column; `CpConstant`, its value on `Unit`. `columns` and `form` are kept from their
@@ -1267,6 +1302,9 @@ lists, such an arm raises.
 - The build: `CpTable.cp_expr` rounds a list once onto `COST_SCALE`, makes a constant
   one a number without building its position, reads any other with one `add_element`,
   and refuses an entry past 2^50. The objective is the root's one lookup.
+
+`Locate`, the position of a variable whose domain has gaps, waits for Stage 11 and the
+printer's maps: no replayed objective reads such a variable.
 
 After this stage an expression whose inputs fit the cap together is lowered exactly.
 Anything wider raises, and on a real objective the root is always wider. Nothing
@@ -1284,8 +1322,7 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`, 30, device-free (run with
   the model as it was; a node is lambdified once, and only when its form is read;
   `lower(...).cp_expr` lambdifies the root alone;
 - a `CpForm` cannot be made, nor a subclass without `cp_expr`, and a `CpTable` is one; a
-  table builds its own lookup, and a constant one adds nothing to the model, its
-  position never built;
+  table builds its own lookup, and a constant one adds nothing to the model;
 - a list must have its index's size; a `CpIndex` refuses parts its step does not take;
   a `CpTable` takes `values` and `index` only, and its list cannot be written to or
   replaced; every position takes, at every assignment, the value `CpIndex.positions`
@@ -1293,7 +1330,7 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`, 30, device-free (run with
 - `values_on_grid`: row-major over three sizes, two symbols on one position, a constant
   broadcast;
 - exact (one solution per assignment, within half a unit): one table over two inputs of
-  different sizes, not symmetric in them; a variable with gaps and one above 0; a
+  different sizes, not symmetric in them; variables above and below 0; a
   Piecewise with an infinite arm not taken; `sympy.sec` and `sympy.sinc` at sympy's
   values; a relayout charge, one table over its literal and its division;
 - refused: a value that is not finite; a Piecewise with no arm true; an undefined
@@ -1401,102 +1438,23 @@ Tests:
 - a subexpression shared by two terms is built once;
 - terms on one position: one lookup or two, as the open question is settled.
 
-### Stage 4: ranks and pairs
-
-A node gains a second way to be realized, the table from its parts, and the choice
-between the two by entries (rule 3): "equal values share a rank". This is the stage
-that brings the ways to realize a node and the choice between them; Stage 1 had one.
-
-- Each child's list is compacted to its distinct values, a `Compact` on its position;
-  the positions are combined, and the node's numpy step is applied across them. A
-  product of two short lists over two buffers is one table over the pair of their
-  ranks.
-- A node takes the cheaper, in entries, of one table over its inputs and the table from
-  its parts.
-
-Tests:
-
-- a menu with repeated values reads the same entry through its rank as through its
-  division;
-- a product of two lists of different sizes, not symmetric in them, is exact;
-- equal values share a rank before pairing; a pair past the cap is refused;
-- a function of a short list adds no position;
-- the smaller form in entries wins, one case each way.
-
-### Stage 5: rule 1, a Min/Max by rung
-
-A Max and a Min get a node class of their own, `CpExtreme`, with one more way to be
-realized from their parts: by rung (rule 1), with clamping. "The Max is read by rung"
-and "values past the bound are clamped" of "How the tables are kept small".
-
-- The ladder of a Min/Max: the values it can return, ascending, and the bound past which
-  an operand's value is clamped.
-- Rungs: each of an operand's clamped values as its position on the ladder, a `Compact`;
-  then `Extreme`, the max or min of the rungs.
-
-Tests:
-
-- a Min's ladder drops the values above its smallest operand maximum; a Max mirrors it;
-- values equal to 12 digits share a rung; a value off the ladder gives none;
-- the Min of rungs is the rung of the Min (seeded random operands);
-- a Max over three buffers is exact with no table as large as one table over them, and
-  each operand lands on the rung of its clamped value;
-- the graph of "The process, step by step" at the real menus is exact at all 4620
-  assignments in 152 entries, where Stage 4 needs 4620.
-
-### Stage 6: rule 2, the fold
-
-Min/Max factors of one product, over shared inputs, become one indexed value over the
-reachable tuples of their rungs, when crossing their lists would pass the cap. It is one
-more candidate from a Mul's parts.
-
-- The reachable fold: for Min/Max factors given as rungs over their inputs, the tuples of
-  rungs that occur together and the steps that compute which one occurs, or none past
-  the cap. Each step is a combine and a compact.
-
-Tests:
-
-- the fold numbers only the tuples that occur together; a constant operand seeds its
-  start state; operands sharing an input join one group; a step past the cap is refused;
-- a product of four Max factors over three shared buffers is exact under a cap their
-  crossed ladders pass; no fold when the crossed lists fit.
-
-### Stage 7: rule 3 in the objective, a Min/Max kept linear
-
-A Max and a Min gain their linear form, and a reader picks between it and the table.
-
-- A Min/Max too wide to index, or whose table is over twice its linear form, stays a
-  `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
-  sums, constant factors and other Min/Max nodes here, and from Stage 8 any product,
-  whose switch multiplies the collapsed Min/Max by its factor's values.
-- A coefficient on the Min/Max is applied to its operands' lists before they are
-  collapsed. A negative one turns Min into Max.
-- Each operand sits behind a variable of its own. With a long sum of literals inside
-  `lin_max`, CP-SAT's presolve ran out of memory (`bad_alloc` past 40 GB on a Qwen3 0.6B
-  prefill objective). The proxies also carry the speed: without them, margin 2 solves
-  1.5 times slower on average and up to 29 times, and 7 of the 46 objectives above do
-  not solve in 60 s or crash.
-
-Tests: a Min of two sums of residency literals stays linear and is exact, with no table
-over its inputs; a near tie keeps the table; a negative coefficient gives a `lin_max`;
-a fractional coefficient on a linear Min is within the largest operand's bound; each
-operand is a single variable; a Max too wide to index under a power, a log or a division
-raises, and the same Max under a sum, a constant and a Min stays linear.
-
-### Stage 8: rule 4, the switch
+### Stage 4: rule 4, the switch
 
 A Mul with two or more factors that are not constants gains its linear form, a switch.
-Through Stage 7 such a product is a table only: one table over its inputs, or the pair
-of ranks from Stage 4. From here a linear reader can read it as its rest, collapsed
-once, times its factor's value, with no table crossing the two.
+Through Stage 3 such a product is one table over its inputs. From here a linear reader
+can read it as its rest, collapsed once, times its factor's value, with no table
+crossing the two. It comes right after the linear sums because it needs nothing else:
+its rest is a form Stage 3 already makes. It brings two things later stages reuse,
+`Compact` and the choice between a node's ways by entries (rule 3).
 
 - **The factor.** The factor with the fewest distinct values, among those with a table,
-  is the one switched on. Its list is ranked to its distinct values, a `Compact` on its
-  position. Its values stay numbers.
+  is the one switched on. Where its list repeats a value, it is ranked to its distinct
+  values by `Compact`, a new `IndexMap` step: one lookup from its position to the rank
+  of its value. Where it does not, its position is its rank. Its values stay numbers.
 - **The rest.** The product of the other factors, read as their form: one child's
-  form when one is left, a further switch when more are. It may hold lists on
-  several buffers, a constant, a Min/Max kept linear (Stage 7) and other switches, and
-  all of it collapses into one integer `w`.
+  form when one is left, a further switch when more are. It may hold lists on several
+  buffers, a constant and other switches, and from Stage 9 a Min/Max kept linear. All
+  of it collapses into one integer `w`.
 - **The cases.** `add_map_domain` on the factor's rank gives one true/false per value,
   on exactly where the factor takes it. One variable `g` takes, under each true/false:
   - for a whole value `v`, `g == v·w`;
@@ -1509,15 +1467,19 @@ once, times its factor's value, with no table crossing the two.
   rests into one switch. `factor·A + factor·B` builds one `w` for `A + B`, one set of
   true/falses and one `g`.
 - **Any sign.** The product is taken on the collapsed rest, so a factor of any sign
-  multiplies a `lin_max` or `lin_min` as it multiplies a list. No operand is touched,
-  and nothing is refused for its sign.
+  multiplies whatever the rest holds as it multiplies a list, a `lin_max` or `lin_min`
+  too once Stage 9 keeps one. No operand is touched, and nothing is refused for its
+  sign.
 - **Literals.** A 0/1 literal times a term is the two-value case: two true/falses, on at
   0 and at 1, over the rest collapsed once. From here a literal's term costs its rest's
-  entries, not twice them as Stage 3's one table held it. Stage 9 optimizes this case.
-  A relayout charge stays one table over its literal and its division until Stage 9.
-- **The choice.** Rule 3 compares the switch, its rest's entries plus one per factor
-  value, with the product's table. A small factor times a small list keeps its pair
-  table.
+  entries, not twice them as Stage 3's one table held it. Stage 5 optimizes this case.
+  A relayout charge stays one table over its literal and its division until Stage 5.
+- **The choice (rule 3).** A node gains a second way to be realized, and the choice
+  between its ways by entries, which Stages 6 to 9 extend. The switch, its rest's
+  entries plus one per factor value and the factor's `Compact`, is weighed against the
+  product's one table over its inputs. A factor with a repeated value times a short
+  list can keep its table: `[1, 1, 2]` times a list of 2 is 6 entries as a table and 7
+  as a switch. Under a nonlinear reader the product is its table, as in Stage 3.
 - **The cap.** A factor's values count as entries; a factor with more values than the
   cap has no switch.
 
@@ -1528,6 +1490,12 @@ entries on the 14B and 24B auto-tiling prefill objectives and took 26 to 27 s. T
 switch took 5.9 and 5.2 s, and the whole replay 144.6 s against 443.8 s, with the largest
 error 1.2e-7 of the cost. Stage 11's replay compares against #6315's tip.
 
+On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, the
+switch is 5 entries against the table's 6 at its own menus, and 38 against 231 at the
+real menus: the rest's 21, the factor's 6 values and its `Compact` of 11. At every
+assignment minimizing and maximizing agree, within 0.66 and 0.91 units
+(`~/gap-probe/spyre-roadmap-pr22/2026-11-18/switch_product.py`).
+
 Tests:
 
 - a factor with a whole value, a fraction and 0, times a sum of lists over two buffers,
@@ -1537,18 +1505,22 @@ Tests:
 - a factor whose values are all whole is exact within its values times the rest's
   bound, with one constraint per value;
 - two products with one factor are one switch with one `w`;
-- a factor of mixed sign, and a negative one, times a Min kept linear is exact;
+- a factor of mixed sign, and a negative one, times a sum of lists over two buffers is
+  exact;
+- a factor with a repeated value is ranked by one `Compact`, and one with distinct
+  values adds none;
 - a product of three non-constant factors is a switch inside a switch, and is exact;
 - a literal times a sum over several buffers is the two-value switch, with the rest's
   entries counted once;
-- a small factor times a short list keeps its pair table where that has fewer entries;
+- a factor with a repeated value times a short list keeps its table where that has
+  fewer entries; under a power or a log a product is its table, not its switch;
 - a factor with more values than the cap has no switch, and with no table either, the
   product raises, naming it.
 
-### Stage 9: rule 5, a 0/1 literal gates its term
+### Stage 5: rule 5, a 0/1 literal gates its term
 
-An optimization of Stage 8's switch for a factor of one 0/1 literal that is 0 at one of
-its values. From Stage 8 such a product is already its rest collapsed once, under two
+An optimization of Stage 4's switch for a factor of one 0/1 literal that is 0 at one of
+its values. From Stage 4 such a product is already its rest collapsed once, under two
 true/falses, with `g == v·w` for its nonzero value `v` and `g == 0` for the other.
 Three savings are left:
 - the literal is its own true/false, so it needs no rank and no `add_map_domain`;
@@ -1582,14 +1554,14 @@ table over its literal and its division, twice the menu, its off half zeros.
   negation, as the kept case's true/false: `g == w` under it and `g == 0` under the
   other. `g` is the linear term. The gate adds no error to its rest's: within the rest's
   bound where it keeps the term, exactly 0 elsewhere.
-- **The choice.** A gate replaces Stage 8's two-value switch whenever the factor is a
+- **The choice.** A gate replaces Stage 4's two-value switch whenever the factor is a
   gate: it never has more entries, since its rest reads the literal no more. A gate is
   read only linearly: under a power, a log or any other nonlinear node, the product is
   its table, as in Stage 3.
 - **Inside other forms.** A product of a gate and other non-constant factors is the
-  gate's switch, its rest the product of the others, switched by Stage 8 when more than
-  one is left. A gate inside the rest of another switch, or inside an operand of a
-  Min/Max kept linear (Stage 7), is one more term there.
+  gate's switch, its rest the product of the others, switched by Stage 4 when more than
+  one is left. A gate inside the rest of another switch is one more term there, and so,
+  from Stage 9, is a gate inside an operand of a Min/Max kept linear.
 
 #6315 measured this form against tabling the literal (Decisions). Small default-config
 kernels went from 2 to 2.5 times the printer's solve time to the printer's own. Once a
@@ -1597,12 +1569,13 @@ gate in any form was recognised, the GQA test went from 306,811 entries to 115,6
 Stage 11's replay reports entries with this stage on and off.
 
 After this stage no table reads a gating literal, and a gate's fractional coefficient
-is exact. A term on one menu whose k literals all gate it is one list under k gates,
-where Stages 3 to 7 made one table of 2^k times the menu.
+is exact. A term on one menu whose k literals all gate it is one list under k gates.
+Stage 3 made it one table of 2^k times the menu, and Stage 4 one list under k two-value
+switches, each with its own `add_map_domain`.
 
 Tests:
 
-- every gated case below gives Stage 8's two-value switch's cost, within its bound, at
+- every gated case below gives Stage 4's two-value switch's cost, within its bound, at
   every assignment, with the literal in no table and no more entries;
 - `x * f(split)` on a literal `x` is exact, with one list of the menu's length on the
   division and no table over `x`. So are `(1 - x) * f(split)`, `3*x * f(split)` and
@@ -1616,12 +1589,110 @@ Tests:
 - the rest reads no literal: `x * Max(x * a, b)` reads `x` only through its gate;
 - `(1 - x) * (c - c*x + c*x/t)` is `c * (1 - x)`: affine, with no gate and no table over
   the tile's division;
-- `(1 + x)` times a list is not gated: it stays Stage 8's switch, with values 1 and 2;
-- `(0.5 - 0.5*x) * f(split)` is exact within half a unit, where Stage 8's switch is
+- `(1 + x)` times a list is not gated: it stays Stage 4's switch, with values 1 and 2;
+- `(0.5 - 0.5*x) * f(split)` is exact within half a unit, where Stage 4's switch is
   within one unit more;
 - a relayout charge is exact as a gate of its prices on its division, with as many
   entries as the menu; under a power it is its table over the literal and the division;
 - a gated product under a power or a log is its one table, as in Stage 3.
+
+### Stage 6: ranks and pairs
+
+A node gains one more way to be realized, the table from its parts: "equal values share
+a rank". Stage 4's choice by entries (rule 3) picks among its ways.
+
+- Each child's list is compacted to its distinct values, a `Compact` (Stage 4) on its
+  position; the positions are combined, and the node's numpy step is applied across
+  them. A product of two short lists over two buffers is one table over the pair of
+  their ranks.
+- A node takes the cheapest, in entries, of its ways: one table over its inputs, the
+  table from its parts, and for a product its switch. A nonlinear reader's `table` read
+  takes the cheaper of the two tables.
+- Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the
+  roll-up, and the review showed it can refuse an objective that lowers. This stage
+  decides whether a node keeps its two best tables for its reader.
+
+With the switch before it, a product of two lists on one buffer each, under a linear
+reader, stays its switch: the switch never has more entries than the pair. With `n` the
+rest's positions, `d` and `d_f` the rest's and the factor's distinct values, the switch
+is `n + d_f` against `d * d_f`, plus `n` when the rest repeats a value, both with the
+factor's `Compact`. On the step-by-step graph's product that is 38 against 68. So the
+pairs of this stage pay where a table is read: under a power, a log or a Piecewise, and
+at nodes that are not products, such as a Max over several buffers before Stage 7.
+
+Tests:
+
+- a menu with repeated values reads the same entry through its rank as through its
+  division;
+- a product of two lists of different sizes, not symmetric in them, read as its table
+  under a power, is exact as their pair;
+- equal values share a rank before pairing; a pair past the cap is refused;
+- a function of a short list adds no position;
+- the smallest way in entries wins: the table from parts over one table, one table over
+  the table from parts, and a switch over a pair.
+
+### Stage 7: rule 1, a Min/Max by rung
+
+A Max and a Min get a node class of their own, `CpExtreme`, with one more way to be
+realized from their parts: by rung (rule 1), with clamping. "The Max is read by rung"
+and "values past the bound are clamped" of "How the tables are kept small".
+
+- The ladder of a Min/Max: the values it can return, ascending, and the bound past which
+  an operand's value is clamped.
+- Rungs: each of an operand's clamped values as its position on the ladder, a `Compact`;
+  then `Extreme`, the max or min of the rungs.
+
+Tests:
+
+- a Min's ladder drops the values above its smallest operand maximum; a Max mirrors it;
+- values equal to 12 digits share a rung; a value off the ladder gives none;
+- the Min of rungs is the rung of the Min (seeded random operands);
+- a Max over three buffers is exact with no table as large as one table over them, and
+  each operand lands on the rung of its clamped value;
+- the graph of "The process, step by step" at the real menus is exact at all 4620
+  assignments in 122 entries, with the two terms on `division_a` added (open in
+  Stage 3), where ranks alone need 327.
+
+### Stage 8: rule 2, the fold
+
+Min/Max factors of one product, over shared inputs, become one indexed value over the
+reachable tuples of their rungs, when crossing their lists would pass the cap. It is one
+more candidate from a Mul's parts.
+
+- The reachable fold: for Min/Max factors given as rungs over their inputs, the tuples of
+  rungs that occur together and the steps that compute which one occurs, or none past
+  the cap. Each step is a combine and a compact.
+
+Tests:
+
+- the fold numbers only the tuples that occur together; a constant operand seeds its
+  start state; operands sharing an input join one group; a step past the cap is refused;
+- a product of four Max factors over three shared buffers is exact under a cap their
+  crossed ladders pass; no fold when the crossed lists fit.
+
+### Stage 9: rule 3 in the objective, a Min/Max kept linear
+
+A Max and a Min gain their linear form, and a reader picks between it and the table.
+
+- A Min/Max too wide to index, or whose table is over twice its linear form, stays a
+  `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
+  sums, constant factors, other Min/Max nodes, and any product, whose switch (Stage 4)
+  multiplies the collapsed Min/Max by its factor's values. Its operands are linear
+  forms, so a switch or a gate inside one is one more term there.
+- A coefficient on the Min/Max is applied to its operands' lists before they are
+  collapsed. A negative one turns Min into Max.
+- Each operand sits behind a variable of its own. With a long sum of literals inside
+  `lin_max`, CP-SAT's presolve ran out of memory (`bad_alloc` past 40 GB on a Qwen3 0.6B
+  prefill objective). The proxies also carry the speed: without them, margin 2 solves
+  1.5 times slower on average and up to 29 times, and 7 of the 46 objectives above do
+  not solve in 60 s or crash.
+
+Tests: a Min of two sums of residency literals stays linear and is exact, with no table
+over its inputs; a near tie keeps the table; a negative coefficient gives a `lin_max`;
+a fractional coefficient on a linear Min is within the largest operand's bound; each
+operand is a single variable; a factor of mixed sign, and a negative one, times a Min
+kept linear is exact; a Max too wide to index under a power, a log or a division raises,
+and the same Max under a sum, a constant, a product and a Min stays linear.
 
 ### Stage 10: the table constraint, an experiment off the stack
 
@@ -1643,9 +1714,11 @@ occur is missing.
 
 - `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
   share its division as their position. Any other variable is indexed by its domain:
-  `Input` with its offset, or `Locate`, a position lookup, when the domain has gaps. A
-  domain past the cap is not an input. Mapping the inputs adds nothing to the model: a
-  `Locate`'s lookup is built by its `cp_expr`, when a table on it is built.
+  `Input` with its offset, or, when the domain has gaps, `Locate`, the `IndexMap` step
+  this stage adds: a position lookup. None of the 4,159 non-buffer variables the 50
+  replayed objectives read has gaps, so `Locate` is for objectives the replay does not
+  hold. A domain past the cap is not an input. Mapping the inputs adds nothing to the
+  model: a `Locate`'s lookup is built by its `cp_expr`, when a table on it is built.
 - `lower`'s normalization: a relayout charge on a source this solve does not divide
   becomes 0.
 - `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=...)` copies the
@@ -1749,7 +1822,7 @@ After Stage 11, posted on that PR, with the replay calling `lower_cost_with_tabl
 3. **The switch and the gate against #6315.** Lowering and solve time of the 14B and
    24B auto-tiling prefill objectives (847607 captures): 3.28 and 3.12 s at #6315's tip,
    5.94 and 5.24 s when it first switched. Entries and solve time of the default-config
-   objectives with Stage 9's gate on and off: #6315's gate brought the small kernels
+   objectives with Stage 5's gate on and off: #6315's gate brought the small kernels
    whose terms it gates to the printer's solve time (softmax 4096x2048 0.15 s, add_mul
    0.055 s, rmsnorm 0.065 s).
 
