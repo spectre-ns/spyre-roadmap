@@ -76,6 +76,17 @@ computed with numpy functions, and the code arrives in layers, each with its own
   - recognising the gate in any form, as sympy writes `2*(1 - x)` as `2 - 2*x`, cut the
     GQA test from 306,811 entries to 115,667, and the Mistral 24B prefill from 59,152 to
     21,696.
+- **A value that is not a finite number raises (2026-11-18).** A NaN, `inf` or `-inf` in
+  any list the walk makes raises `TableLoweringError` at the node that made it, naming
+  it. That covers one table over the inputs, a table from its parts (including
+  combinations of positions that cannot occur), a Piecewise arm whether it is taken or
+  not, a rank, a ladder, a bound and a switch's values. Nothing is computed from such a
+  value, so a NaN cannot reach a Min/Max's bound, a sign or a comparison and turn into a
+  silent wrong cost. On the 50 replayed objectives, none of the 59,492 arms of their
+  15,975 Piecewise nodes is ever non-finite, and every Piecewise has an arm true at
+  every assignment (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/nonfinite/`). Stage 1
+  (#32) refused such a value only when it was read into the objective; it changes to
+  this rule.
 - **Behaviour, not code.** The stages below say what each layer does. #6315 is cited for
   its results only.
 - **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
@@ -107,9 +118,11 @@ computed with numpy functions, and the code arrives in layers, each with its own
   reason, with the model untouched. The printer cannot stand in: on the replay it fails
   every auto-tiling objective (`calling ** on a linear expression`), and when it fails,
   `main` solves a traffic objective that ignores the cost model with every relayout copy
-  pinned out (`ilp_solver_ortools.py:886`, `:1449`). `TableLoweringError` subclasses none
-  of `RuntimeError`, `TypeError` or `ValueError`, so that `except` cannot turn it into
-  that solve. At #6315's tip all 50 replayed objectives lower without a refusal.
+  pinned out (`ilp_solver_ortools.py:886`, `:1449`). On `main` the allocator withholds
+  those objectives from CP-SAT altogether. With the flag on, Stage 12 hands them over.
+  `TableLoweringError` subclasses none of `RuntimeError`, `TypeError` or `ValueError`,
+  so that `except` cannot turn it into that solve. At #6315's tip all 50 replayed
+  objectives lower without a refusal.
 - **Copy the model, swap it back when the build fails (2026-11-17).** The entry point
   copies the model before it maps an input. When any step fails, in the walk or in the
   build, it swaps the copy back and raises `TableLoweringError`, from the original
@@ -1099,9 +1112,9 @@ class CpNode:
         their grid; or the table from its children's tables, its numpy step applied
         across them. The step is lambdify of expr in Stage 1; from Stage 2 it is the
         numpy function the dict holds for type(expr), and lambdify where it holds
-        none. Raises TableLoweringError(expr, reason)
-        when it ends with no table: a symbol with no input, a child with no table, or
-        no candidate under the cap."""
+        none. Raises TableLoweringError(expr, reason) when a list it makes holds a
+        NaN, inf or -inf, and when it ends with no table: a symbol with no input, a
+        child with no table, or no candidate under the cap."""
 
     def as_linear(self) -> CpLinear:
         """The node read linearly: its table, a CpTable being a CpLinear."""
@@ -1163,7 +1176,8 @@ class TableLowering:
         """node's table from its children's tables: the cheaper, in entries, of one
         table over its inputs and the form from its parts (rule 3). None when a child
         has no table or neither fits the cap. It never raises for those: a
-        CpLinearNode may still have its linear form."""
+        CpLinearNode may still have its linear form. Raises TableLoweringError when a
+        list it computes holds a NaN, inf or -inf."""
 
     def lower(self, root: sympy.Basic) -> CpLinear:
         """root as a plan, the form the objective reads, in four steps.
@@ -1560,9 +1574,14 @@ Every list of the lowering is made here, and a list is never made without its in
    entries are its list plus the remaps under its index. A candidate's size is known
    before its list is computed, so one past the cap is never evaluated. With no
    candidate under the cap the node has no table.
+6. **Finite or raise.** Every list a candidate computes is checked as it is made. A NaN,
+   `inf` or `-inf` raises `TableLoweringError` at the node, naming it, whichever
+   candidate it came from and whether or not a position holding it can occur
+   (Decisions).
 
-`tabulate` returns `None` for a node with no table and does not raise: a `CpLinearNode`
-may still have its linear form. `visit_op` raises when the node ends with neither.
+`tabulate` returns `None` for a node with no table under the cap, and raises only for a
+value that is not finite: a `CpLinearNode` may still have its linear form. `visit_op`
+raises when the node ends with neither.
 
 ### A node that is not one list
 
@@ -1599,14 +1618,15 @@ form and leaves the children's lists as they were.
   negative factor turns one into the other. Through a switch it scales the rests, and
   the factor's values are not touched. A factor's own values never go down into the
   rest; the switch multiplies after the collapse, so it needs no rule on their sign.
-- **Refusal.** A node that ends pass 2 with neither a table nor a linear form raises
-  `TableLoweringError` from its own `visit_op`, with itself as `node` and the reason: a
-  symbol with no input, no table under the cap and no linear reader, a child with no
-  table under a nonlinear node, or a pair, fold or switch past the cap. Nothing is
-  passed up for a parent to work around; a relayout charge on a source this solve does
-  not divide is already the number 0, from the normalization. One refusal comes later, in the build:
-  an entry past 2^50, found at the rounding. Whichever it is, the entry point swaps its
-  copy of the model back before the error leaves (Decisions).
+- **Refusal.** A node raises `TableLoweringError` from its own `visit_op`, with itself
+  as `node` and the reason, when a list it makes holds a NaN, `inf` or `-inf`, or when
+  it ends pass 2 with neither a table nor a linear form: a symbol with no input, no
+  table under the cap and no linear reader, a child with no table under a nonlinear
+  node, or a pair, fold or switch past the cap. Nothing is passed up for a parent to
+  work around; a relayout charge on a source this solve does not divide is already the
+  number 0, from the normalization. One refusal comes later, in the build: an entry
+  past 2^50, found at the rounding. Whichever it is, the entry point swaps its copy of
+  the model back before the error leaves (Decisions).
 
 This is the table of "Which form a node takes", read from the leaves up.
 
@@ -1713,7 +1733,7 @@ was visited once: 10 visits for an expression of 15 nodes.
 | 9 | the gate: a switch on a 0/1 literal, the literal its own true/false, `lower`'s first normalization (a gated product's rest read with the literal fixed), the nonzero value pushed into the rest; `RelayoutCharge` as a `CpLinearNode` |
 | 10 | `AllowedEmitter` |
 | 11 | `inputs_from_maps`, `lower`'s relayout normalization, and `lower_cost_with_tables` with its copy and swap back |
-| 12 | nothing in the module: the flag, the solver's call and the docs |
+| 12 | nothing in the module: the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
 
@@ -1735,7 +1755,7 @@ integrate: first with the printer's maps, then with the solver behind the flag.
 | 9 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
 | 10 | the table constraint, `AllowedEmitter`, built beside `CpEmitter` | the same plans, as table constraints |
 | 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
-| 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, docs | every compile, with the flag on |
+| 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
 
 **At the start, real objectives do not lower.** Stage 1 makes one table per node, so the
 root's table is over every input the objective reads. On the 50 replayed objectives that
@@ -1783,11 +1803,11 @@ by `sympy.lambdify`; numpy steps come in Stage 2.
 
 **Values by lambdify.** `values_on_grid(expr, columns, shape)` lambdifies `expr` over its
 free symbols with the `numpy` module, once per node and cached, and evaluates it at every
-joint assignment of the node's inputs, row-major, the last input fastest. A value need
-not be finite inside the walk: an arm of a Piecewise is infinite where it is not taken,
-and every node has its own table. A list read into the objective must be finite, which
-is how a Piecewise with no arm true is refused: lambdify writes it as
-`select(..., default=nan)`. A node whose lambdified function takes scalars
+joint assignment of the node's inputs, row-major, the last input fastest. Every list it
+returns must be finite: a NaN, `inf` or `-inf` raises `TableLoweringError` at that node
+(Decisions). That includes an arm of a Piecewise that is infinite where it is not taken,
+and a Piecewise with no arm true, which lambdify writes as `select(..., default=nan)`.
+A node whose lambdified function takes scalars
 only is evaluated point by point: `RelayoutCharge`'s `_imp_` rounds its division with
 `round`, which an array does not take (checked on sympy 1.14). lambdify maps each sympy
 function to sympy's own meaning: `sinc(1)` is 0.84, as in sympy.
@@ -1830,10 +1850,11 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`:
 - a variable with gaps in its domain reads the entry of its value, through `Locate`, and
   so does one whose domain starts above 0;
 - `values_on_grid`: row-major order over axes of three sizes, two symbols on one axis, a
-  constant broadcast; a value that is not finite is refused when read into the
-  objective; each node is lambdified once;
-- a Piecewise cost, with an infinite value in an arm not taken, is exact, and one with
-  no arm true is refused; `sympy.sec` and `sympy.sinc` give sympy's values; a relayout
+  constant broadcast; a NaN, `inf` or `-inf` raises at the node that makes it, with that
+  node in the error, even when no parent reads it; each node is lambdified once;
+- a Piecewise arm with an infinite value raises at the arm, also where the arm is not
+  taken, and a Piecewise with no arm true raises at the Piecewise; `sympy.sec` and
+  `sympy.sinc` give sympy's values; a relayout
   charge, one table over its literal and its division, is exact; an undefined function
   with no `_imp_` is refused;
 - a coefficient is applied before the rounding: `7 * split ** 0.5` at split 2 is 10137,
@@ -1893,7 +1914,7 @@ Tests, `tests/inductor/test_cost_expr_numpy.py`:
 - the cost model's own forms: `floor(1024/split)**-0.25`, `Min(c*log(a), Max(0, 3.0 -
   c*log(b)))`, `1/split >= Rational(5, 128)` as a condition, an Or of Ge, nested
   Piecewise, ITE with `False`, `x**0.0`;
-- Piecewise: an infinite value in an arm not taken is discarded; no arm true is refused;
+- Piecewise: an arm with an infinite value raises, taken or not; no arm true raises;
 - `RelayoutCharge` agrees with its `_imp_`, with no lambdify;
 - a class not in the dict (`sympy.sec`, an implemented function) raises
   `NotImplementedError` and is then evaluated through lambdify, once;
@@ -2219,9 +2240,28 @@ Tests:
   the reason, and so is any other failure inside the lowering, so the `except` at `:886`
   catches neither. A constant objective comes back as an `int`, which the guard at
   `:866` already leaves out of `minimize`.
+- **Auto tiling gets the cost expression.** `CpSatLayoutSolver.linear_cost_only()`
+  (`:652`) returns `True`, and with `auto_coarse_tiling` on the allocator then hands
+  CP-SAT no cost expression (`allocator.py:3397-3421`, "cost objective skipped"). The
+  capability says the solver "can only minimize a cost expression that lowers to linear
+  terms, so the objective must avoid the cost model's fractional powers". That is the
+  printer's limit, not the tables', so with the flag on it returns `False`:
+  `return not config.cpsat_table_lowering`. With the flag off, nothing changes.
+  - The pin `"linear_cost_only": True` in `test_scratchpad_use.py:1906` becomes the
+    flag-off answer, with a flag-on twin.
+  - The capability checks in `plan_solver.py` call it when a class is made, at the
+    import-time config, and read the same either way, because `linear_cost_only`
+    requires only `chooses_core_divisions`.
+  - The allocator's comment gives two more reasons for the gate. The cost model scores
+    every tiling alike, so the choice falls to whichever optimum the portfolio reaches
+    first. And building the expression raised on symbolic args once an op was output
+    tiled (#3810). Of the 50 replayed objectives, 33 were captured with the gate lifted,
+    so the expression is built there. Whether ties between tilings matter is what this
+    stage's auto-tiling suite runs report.
 - Docs: rows in the env var table of `docs/source/api/torch_spyre.rst`; the file table
   and objective paragraph in `docs/source/compiler/scratchpad_planning.md` (`:300`,
-  `:636-648`); `docs/source/compiler/co_optimizer.md` (`:296`, `:424-431`).
+  `:636-648`, the gate at `:645`); `docs/source/compiler/co_optimizer.md` (`:296`, the
+  gate at `:297`, and `:424-431`).
 
 Tests, with `config.patch` as the suites do:
 
@@ -2231,7 +2271,10 @@ Tests, with `config.patch` as the suites do:
   `TableLoweringError` too, and no traffic-objective solve follows;
 - flag off: a `CpSatLayoutSolver` solve never calls the table module (patched to raise);
 - flag on: the same solve never calls the printer, ends `OPTIMAL`, and its plan's exact
-  cost is no higher than the printer's plan, within one `COST_SCALE` unit per table.
+  cost is no higher than the printer's plan, within one `COST_SCALE` unit per table;
+- flag on with `auto_coarse_tiling`: the allocator hands the solver its cost
+  expression, and the solve lowers it; flag off with `auto_coarse_tiling`: the
+  expression is still withheld, as on `main`.
 
 Known difference: the tables' objective is `COST_SCALE` (1024) times the cost, and the
 printer's is in cost units. Only the uniqueness probe reads it
@@ -2269,7 +2312,8 @@ After Stage 11, posted on that PR, with the replay calling `lower_cost_with_tabl
 
 After Stage 12, posted on that PR:
 
-4. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`:
+4. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`, once as they are and
+   once with `AUTO_COARSE_TILING=1`, which now gives CP-SAT the cost expression:
    `test_scratchpad_solver.py`, `test_scratchpad_use.py`,
    `test_cost_model_replication.py` and `test_solver_relayout_decision.py`. #6315's CI
    ran every shard with the tables on the default path and all passed; its one red job
