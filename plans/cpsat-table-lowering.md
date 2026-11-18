@@ -1301,8 +1301,9 @@ lists, such an arm raises.
 **The lowering (`cpsat_table_lowering.py`).**
 
 - The values: `CpIndex`, a position, with its steps `Input`, `Unit` and `Combine`, each
-  holding its parts as fields (`Combine(left, right)`, its size computed from them); `CpForm` and `CpTable`, with `entries` and
-  `finite`; each with `cp_expr`; and `TableLoweringError`.
+  holding its parts as fields (`Combine(left, right)`, its size computed from them);
+  `CpForm` and `CpTable`, with `entries` and `finite`; each with `cp_expr`; and
+  `TableLoweringError`.
 - The nodes: `CpNode`, which realizes one table over its inputs; `CpSymbol`, its
   column; `CpConstant`, its value on `Unit`. `columns` and `form` are kept from their
   first read. A table past the cap is never evaluated and raises, naming the node.
