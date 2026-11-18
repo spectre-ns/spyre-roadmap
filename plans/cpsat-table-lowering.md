@@ -99,9 +99,12 @@ computed with numpy functions, and the code arrives in layers, each with its own
     what it reads and does nothing else.
   - A node realizes its own form the first time it is read (`realize`, kept as
     `form`), so a node nobody reads is never realized.
-  - A form builds its own CP-SAT side (`cp_expr`), as a position step already does
-    (`IndexMap.cp_expr`), and there is no emitter. The objective is
+  - A form builds its own CP-SAT side (`cp_expr`), as a position already does
+    (`CpIndex.cp_expr`), and there is no emitter. The objective is
     `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
+  - A position is one class, `CpIndex`, whose steps hold their parts as fields:
+    `Combine(left, right)`, as a node holds its children. It replaces `IndexMap` and
+    `CpIndex`, which referred to each other: the step took the `CpIndex` it sat in.
   - Each kind of node, form and position step is a thin subclass of a small interface,
     so an operation, a form or a step is added without changing the others. Changing
     how something is emitted means changing its class's `cp_expr`.
@@ -110,7 +113,9 @@ computed with numpy functions, and the code arrives in layers, each with its own
   The owner's words: "Can we redesign this so the tabulation should be on the node base
   class?", "Drop visitation it's not as clean as using the open closed principle",
   "Drop CpEmitter", "Lets build the hooks when they're needed", "Implement a CpForm base
-  class". Spectre-ns/torch-spyre#32 is built this way. See Architecture.
+  class", and on positions "IndexMap's interface should take IndexMap rather than
+  CpIndex", "The relationship is circular right now", "Yeah merge them together".
+  Spectre-ns/torch-spyre#32 is built this way. See Architecture.
 - **The switch and the gate right after the linear sums (2026-11-18).** The order is
   1 base, 2 numpy, 3 linear sums, 4 the switch, 5 the gate, 6 ranks and pairs, 7 rungs,
   8 the fold, 9 `lin_max`. It was 4 ranks, 5 rungs, 6 the fold, 7 `lin_max`, 8 the
@@ -121,7 +126,7 @@ computed with numpy functions, and the code arrives in layers, each with its own
   - It serves both kinds of term: it takes the literals out of the narrow terms' tables
     and splits the wide products. On the step-by-step graph's product it is 38 entries
     against 68 as a pair at the real menus.
-  - Each `IndexMap` step lands with the stage that first uses it: `Input`, `Unit` and
+  - Each `CpIndex` step lands with the stage that first uses it: `Input`, `Unit` and
     `Combine` in Stage 1, `Compact` in 4, `Extreme` in 7, `Locate` in 11. `Locate` left
     #32 because no replayed objective needs it: none of the 4,159 non-buffer variables
     the 50 replayed objectives read has a domain with gaps
@@ -789,8 +794,8 @@ assignment of the inputs, so an entry read from the wrong position fails.
 Three layers, each a small interface with thin subclasses, so that adding an operation,
 a form or a position step changes nothing else:
 
-- **Values.** A *position* is a `CpIndex`: one `IndexMap` step (`Input`, `Unit`,
-  `Combine`; later `Compact`, `Extreme` and `Locate`) applied to its parts. A *form* is
+- **Values.** A *position* is a `CpIndex`: one step that holds its parts (`Input`,
+  `Unit`, `Combine`; later `Compact`, `Extreme` and `Locate`). A *form* is
   what a node is realized as, a `CpForm`: a `CpTable` (a float list on a position) and,
   from Stage 3, a `CpLinear`. Values hold no model.
 - **Nodes.** `TableLowering` is a factory. It makes one `CpNode` per distinct sympy
@@ -809,7 +814,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, TypeAlias
 
@@ -838,79 +843,83 @@ class TableLoweringError(Exception):
 # ------------------------------------------------------------------------- positions
 
 
-class IndexMap(ABC):
-    """One step of a position: from its parts' positions to a position 0 .. size - 1,
-    in numpy and in CP-SAT. Input, Unit and Combine are its subclasses in Stage 1;
-    Compact (Stage 4), Extreme (Stage 7) and Locate (Stage 11) join them."""
+class CpIndex(ABC):
+    """A position: from the inputs' values to 0 .. size - 1, in numpy and in CP-SAT.
+    Each kind of step is a subclass that holds its parts as its own fields, so a step
+    depends on CpIndex alone. Input, Unit and Combine are its subclasses in Stage 1;
+    Compact (Stage 4), Extreme (Stage 7) and Locate (Stage 11) join them. Steps are
+    frozen dataclasses: equal positions compare equal and hash alike."""
 
+    size: int  # a field of each step, given or computed from its parts
+
+    @property
     @abstractmethod
-    def size_from(self, parts: Sequence[CpIndex]) -> int:
-        """The positions the step maps onto; ValueError for parts it does not take."""
+    def parts(self) -> tuple[CpIndex, ...]:
+        """The positions it is made from, () for a leaf."""
 
     @property
     @abstractmethod
     def entries(self) -> int:
-        """The table entries the step puts in the model, 0 for an arithmetic step."""
+        """The table entries the step itself puts in the model, 0 for arithmetic."""
 
     @abstractmethod
-    def positions(
-        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
-    ) -> np.ndarray:
-        """The step in numpy, from its parts' positions."""
+    def positions(self, values: Values) -> np.ndarray:
+        """The numpy side, from its parts' positions."""
 
     @abstractmethod
-    def cp_expr(
-        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
-    ) -> CpExpr:
-        """The step in model, from its parts' expressions."""
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """The CP-SAT side, from its parts' cp_expr."""
+
+    def under(self) -> list[CpIndex]:
+        """This position and every position it is made from, each once, parts first."""
 
 
 @dataclass(frozen=True)
-class Input(IndexMap):
+class Input(CpIndex):
     """A leaf, and the thinnest step: a variable's own position, v - lo, for a domain
-    lo .. lo + size - 1. Unit and Combine are as thin."""
+    lo .. lo + size - 1. Unit is as thin."""
 
     var: cp_model.IntVar
     size: int
     lo: int = 0
 
-    def size_from(self, parts: Sequence[CpIndex]) -> int:
-        """size, with no parts."""
+    @property
+    def parts(self) -> tuple[CpIndex, ...]:
+        """(), a leaf."""
 
     @property
     def entries(self) -> int:
         """0."""
 
-    def positions(
-        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
-    ) -> np.ndarray:
+    def positions(self, values: Values) -> np.ndarray:
         """values[var] - lo."""
 
-    def cp_expr(
-        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
-    ) -> CpExpr:
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """var - lo: no variable, no constraint."""
 
 
 @dataclass(frozen=True)
-class CpIndex:
-    """A position: its mapping applied to its parts. Two equal positions hash alike."""
+class Combine(CpIndex):
+    """(left, right) -> left * right.size + right: linear, as right.size is a
+    constant."""
 
-    mapping: IndexMap
-    parts: tuple[CpIndex, ...] = ()
+    left: CpIndex
+    right: CpIndex
+    size: int = field(init=False, repr=False, compare=False)  # left.size * right.size
 
-    @cached_property
-    def size(self) -> int:
-        """mapping.size_from(parts): computed, never passed in."""
+    @property
+    def parts(self) -> tuple[CpIndex, ...]:
+        """(left, right)."""
+
+    @property
+    def entries(self) -> int:
+        """0."""
 
     def positions(self, values: Values) -> np.ndarray:
-        """The numpy side: its position at each assignment in values."""
+        """left's positions * right.size + right's."""
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The CP-SAT side: its steps' cp_expr, parts first."""
-
-    def under(self) -> list[CpIndex]:
-        """This position and every position it is made from, each once, parts first."""
+        """left.cp_expr(model) * right.size + right.cp_expr(model)."""
 
 
 # ----------------------------------------------------------------------------- forms
@@ -1096,8 +1105,8 @@ model = cp_model.CpModel()
 division_a = model.new_int_var(0, 2, "division_a")   # split_a's menu: 1, 2, 4
 division_b = model.new_int_var(0, 1, "division_b")   # split_b's menu: 1, 3
 split_a, split_b = sympy.symbols("split_a split_b", positive=True)
-pos_a = CpIndex(Input(division_a, size=3))
-pos_b = CpIndex(Input(division_b, size=2))
+pos_a = Input(division_a, size=3)
+pos_b = Input(division_b, size=2)
 inputs = {
     split_a: CpTable(values=np.array([1.0, 2.0, 4.0]), index=pos_a),
     split_b: CpTable(values=np.array([1.0, 3.0]), index=pos_b),
@@ -1125,8 +1134,8 @@ root's read comes before any write, so a refusal leaves the model as it was. Fro
 3, when one sum's terms are built in turn, a later term can refuse after an earlier one
 was built, and the entry point's copy and swap back (Decisions) restores the model.
 
-**The build.** `IndexMap.cp_expr` builds one step, `CpIndex.cp_expr` a position (its
-steps, parts first), `CpTable.cp_expr` a table (rounded once; a number, adding nothing,
+**The build.** `CpIndex.cp_expr` builds a position, each step building its parts first,
+`CpTable.cp_expr` a table (rounded once; a number, adding nothing,
 when constant; otherwise one `add_element` on its position) and `CpNode.cp_expr` a
 node's form. Only `cp_expr` methods touch the model. In Stage 1 each call builds anew,
 which is enough while only the root is built.
@@ -1179,7 +1188,7 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 
 | Stage | Adds to the architecture |
 |---|---|
-| 1 | the values (`IndexMap` with `Input`, `Unit`, `Combine`; `CpIndex`; `CpForm`, `CpTable`), each with `cp_expr`; `values_on_grid` by lambdify; `CpNode`, `CpSymbol`, `CpConstant`; `TableLowering`, the factory; `TableLoweringError` |
+| 1 | the values (`CpIndex` with its steps `Input`, `Unit`, `Combine`; `CpForm`, `CpTable`), each with `cp_expr`; `values_on_grid` by lambdify; `CpNode`, `CpSymbol`, `CpConstant`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists |
 | 3 | `CpLinear`, `CpAdd`, `CpMul` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `CpTable.cp_expr` |
 | 4 | the switch: a product's linear form, the rest collapsed once and multiplied per factor value; `Compact`; the choice between ways (rule 3) |
@@ -1291,8 +1300,8 @@ lists, such an arm raises.
 
 **The lowering (`cpsat_table_lowering.py`).**
 
-- The values: `IndexMap` with `Input`, `Unit` and `Combine`; `CpIndex`, which computes
-  its size from its parts; `CpForm` and `CpTable`, with `entries` and
+- The values: `CpIndex`, a position, with its steps `Input`, `Unit` and `Combine`, each
+  holding its parts as fields (`Combine(left, right)`, its size computed from them); `CpForm` and `CpTable`, with `entries` and
   `finite`; each with `cp_expr`; and `TableLoweringError`.
 - The nodes: `CpNode`, which realizes one table over its inputs; `CpSymbol`, its
   column; `CpConstant`, its value on `Unit`. `columns` and `form` are kept from their
@@ -1323,7 +1332,8 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`, 30, device-free (run with
   `lower(...).cp_expr` lambdifies the root alone;
 - a `CpForm` cannot be made, nor a subclass without `cp_expr`, and a `CpTable` is one; a
   table builds its own lookup, and a constant one adds nothing to the model;
-- a list must have its index's size; a `CpIndex` refuses parts its step does not take;
+- a list must have its index's size; a step takes the parts it names, and equal steps
+  are one position, hashing alike;
   a `CpTable` takes `values` and `index` only, and its list cannot be written to or
   replaced; every position takes, at every assignment, the value `CpIndex.positions`
   gives;
@@ -1449,8 +1459,10 @@ its rest is a form Stage 3 already makes. It brings two things later stages reus
 
 - **The factor.** The factor with the fewest distinct values, among those with a table,
   is the one switched on. Where its list repeats a value, it is ranked to its distinct
-  values by `Compact`, a new `IndexMap` step: one lookup from its position to the rank
+  values by `Compact`, a new `CpIndex` step: one lookup from its position to the rank
   of its value. Where it does not, its position is its rank. Its values stay numbers.
+  `Compact` is the first step that adds to the model, so it is built once per model
+  however many tables read it, by Stage 3's build-once.
 - **The rest.** The product of the other factors, read as their form: one child's
   form when one is left, a further switch when more are. It may hold lists on several
   buffers, a constant and other switches, and from Stage 9 a Min/Max kept linear. All
@@ -1714,7 +1726,7 @@ occur is missing.
 
 - `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
   share its division as their position. Any other variable is indexed by its domain:
-  `Input` with its offset, or, when the domain has gaps, `Locate`, the `IndexMap` step
+  `Input` with its offset, or, when the domain has gaps, `Locate`, the `CpIndex` step
   this stage adds: a position lookup. None of the 4,159 non-buffer variables the 50
   replayed objectives read has gaps, so `Locate` is for objectives the replay does not
   hold. A domain past the cap is not an input. Mapping the inputs adds nothing to the
