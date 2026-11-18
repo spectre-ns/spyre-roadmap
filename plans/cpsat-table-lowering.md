@@ -36,22 +36,39 @@ computed with numpy functions, and the code arrives in layers, each with its own
   node, and cannot lower a real objective: its one table would hold 10^13.4 to 10^401
   entries. Stages 2 to 10 each add one optimization. Stages 11 and 12 integrate with the
   printer's maps and then with the solver.
-- **Rule 4 as switched tables, a multiplication as the fallback (2026-11-17).** A Mul is
-  linear in its children only when its other factors are constants. Any other product
-  pushes one factor into every list of the rest as numpy tables, the factor's position
-  switching the row. #6315 left this form for a switch on a collapsed sum, measured 5
-  times faster on the auto-tiling prefill objectives and 3 times over the whole replay
-  ("Collapsing float lists into linear terms"). Stage 11's replay measures it again,
-  and if it cannot be made to work, `add_multiplication_equality` is the fallback.
+- **Rule 4 as a switch on the collapsed rest (2026-11-18).** A Mul is linear in its
+  children only when its other factors are constants. Any other product is a switch.
+  - The factor with the fewest distinct values stays constants, one per value, and its
+    inputs pick which one applies, through one true/false per value.
+  - The rest, the other factors, is collapsed once into one integer `w`, however many
+    lists it holds.
+  - Per value `c`, one enforced linear constraint gives the product `g == c·w`; a
+    fraction `p/q` takes two, `q·g <= p·w <= q·g + q - 1`, so `g` is the floor.
+
+  No table crosses factor and rest, and no two variables are multiplied. This replaces
+  the 2026-11-17 decision, switched tables with `add_multiplication_equality` as the
+  fallback. #6315 measured both:
+  - switched tables put 45k of the 80k entries of the 14B and 24B auto-tiling prefill
+    objectives into pairs with the 80-value derate factor;
+  - CP-SAT's presolve expanded those pairs into 74k enforced constraints, and lowering
+    and solving took 26 to 27 s;
+  - the switch took 5.9 and 5.2 s, and the whole replay 144.6 s against 443.8 s.
+
+  `add_multiplication_equality` is the generic form of the same product: CP-SAT splits
+  it into cases itself only when one factor is 0/1, and it takes no fraction.
 - **A 0/1 literal gates its term, an optimization of the switch (2026-11-18).**
   Multiplying by a literal is multiplying by 0 or 1, the switch's two-value case with
   one value 0. A product with a factor that reads one 0/1 literal and is 0 at one of its
   values (`x`, `1 - x`, `2 - 2*x`), and a relayout charge, its literal times a price by
-  division, is its rest where the literal keeps it and 0 where it does not. Two enforced
-  linear constraints hold it. No table reads the literal, so the term costs its rest's
-  entries, not twice them with the off half zeros, and it adds no rounding: a collapsed
-  integer times 0 or 1 is exact. This is rule 5, built in Stage 9, right after the
-  switch it optimizes. #6315 measured this form against tabling the literal:
+  division, is its rest where the literal keeps it and 0 where it does not.
+  - Two enforced linear constraints hold it, and the literal is its own true/false.
+  - The rest is read with the literal fixed and the one nonzero value pushed into it in
+    float, so the gate adds no rounding.
+  - Its rest's entries count once; a relayout charge's table over the literal and the
+    division held them twice, its off half zeros.
+
+  This is rule 5, built in Stage 9, right after the switch it optimizes. #6315 measured
+  this form against tabling the literal:
   - small default-config kernels went from 2 to 2.5 times the printer's solve time to
     the printer's own: softmax 4096x2048 0.39 to 0.15 s (printer 0.15 s), add_mul 0.11
     to 0.055 s, rmsnorm 0.13 to 0.065 s;
@@ -147,9 +164,9 @@ is never one table.
 | prefill batch GQA test | 91 | 662 | 401 | 3 | 58399 | 115667 | 5.94 | 13.49 |
 
 The narrow estimate is one list per division and literal, sized by the menu: the form of
-rule 5's gate, from Stage 9. Before it a literal's term is one table over the literal
-and the division (Stage 3), then the switch's two-value case (Stage 8): twice that, its
-off half zeros. The estimate ignores lists that turn out affine and cost nothing.
+rule 4's switch, which collapses a literal term's rest once, from Stage 8. Before it a
+literal's term is one table over the literal and the division (Stage 3): twice that,
+its off half zeros. The estimate ignores lists that turn out affine and cost nothing.
 
 **What it says about the stages.**
 
@@ -161,11 +178,13 @@ off half zeros. The estimate ignores lists that turn out affine and cost nothing
   nothing.
 - On the wide terms, entry count is decided in Stages 4 to 8, on 1 to 4 terms per
   objective.
-- Stage 9, the gate, takes the literals out of the narrow terms' tables. From it a
-  literal's term is sized by its menu alone, as the estimate counts it, and a term on one
-  menu with k literals that gate it is one list, where Stages 3 to 8 made one table of
-  2^k times the menu. Until Stage 9 the narrow entries are about twice the estimate. How
-  many of the 56 it brings under the cap is reported by Stage 11's replay.
+- Stage 8, the switch, takes the literals out of the narrow terms' tables: a literal's
+  term is its rest collapsed once, sized by its menu alone, as the estimate counts it. A
+  term on one menu with k literals is one list under k switches, where Stages 3 to 7 made
+  one table of 2^k times the menu. Until Stage 8 the narrow entries are about twice the
+  estimate. Stage 9's gate then drops the literal from the rest and makes a fractional
+  coefficient exact. How many of the 56 the switch brings under the cap is reported by
+  Stage 11's replay.
 - Lowering time matters most where the model is smallest. At the default config a decode
   block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. How much of that the
   numpy steps of Stage 2 save over Stage 1's lambdify is not measured, and Stage 11's
@@ -189,8 +208,8 @@ off half zeros. The estimate ignores lists that turn out affine and cost nothing
   cost, and `lin_max` takes the max of the costs, with no table for the Min/Max itself.
 - *Kept linear* is open to a Min/Max only when every node between it and the objective
   is linear in it: a sum, a constant factor (a negative one turns Max into Min), another
-  Min/Max, a product whose factor has values of one sign, which rule 4 pushes into the
-  Min/Max's operands, or a gate on a 0/1 literal (rule 5). `Max(...) ** 0.5` is not:
+  Min/Max, or a product, whose switch multiplies the Min/Max's collapsed value by each of
+  the factor's values, of any sign (rules 4 and 5). `Max(...) ** 0.5` is not:
   CP-SAT has no root of a `lin_max`. Neither is a log, a floor, a division by the
   Min/Max or a condition on it. Under such a node the Min/Max must be a table, by rung or
   over its inputs, and when neither fits the cap the lowering raises (Decisions).
@@ -208,19 +227,21 @@ The five rules that keep lists short:
    from its parts. A Min/Max with only linear nodes above it stays linear when that needs
    under half the entries of its table.
 4. A product is linear in its children only when its other factors are constants. Any
-   other product is switched tables: one factor's distinct values are pushed into every
-   list of the rest, each list and the factor one numpy table on the pair of their
-   positions, so the factor's position switches the row. A 0/1 literal times a term is
-   the two-value case, which rule 5 optimizes. If switched tables cannot be made to
-   work, the fallback is one multiplication in the solver (Decisions).
+   other product is a *switch*. The factor with the fewest distinct values stays
+   constants, and its inputs pick one through a true/false per value. The rest is
+   collapsed once into an integer `w`, and the true/false that is on enforces
+   `g == c·w` for its value `c`: one linear constraint per value, two for a fraction,
+   `g == 0` for 0. No table crosses factor and rest.
 5. An optimization of rule 4's two-value case when one value is 0. A product with a
    *gate*, a factor that reads one 0/1 literal and is 0 at one of its values (`x`,
-   `1 - x`, `3*x`, `2 - 2*x`), is not switched. It is its rest where the literal is at
-   the other value, the kept value, and 0 elsewhere. The rest is read with the literal
-   fixed at that value, so no table reads the literal, and the gate's value there is a
-   coefficient on the rest. In the model the rest is collapsed into `w`, and one
-   variable equals `w` where the literal keeps the term and 0 where it does not. A
-   relayout charge, its literal times a price by division, is gated the same way.
+   `1 - x`, `3*x`, `2 - 2*x`), is a switch on the literal itself, with three savings:
+   - the literal is its own true/false;
+   - the rest is read with the literal fixed at its other value, the kept value, so no
+     table reads the literal;
+   - the gate's value there is pushed into the rest's lists before the rounding, so the
+     case is `g == w`, exact even for a fraction.
+
+   A relayout charge, its literal times a price by division, is gated the same way.
 
 ## The process, step by step
 
@@ -422,15 +443,18 @@ Every row was run through CP-SAT at all 4620 assignments: one solution per assig
 minimizing and maximizing agree at each, and the worst error stays within the collapse
 bound.
 
-Three more reductions are not in this graph, which reads no residency literal. A gate
-(rule 5) reads a product with a 0/1 literal as its rest where the literal keeps it and 0
-elsewhere, so the rest's entries count once and no table reads the literal. A fold
-(rule 2) reads a product of Min/Max factors over shared inputs by the tuples of rungs
-that can occur together. Switched tables (rule 4) push a factor into each list of a rest
-too wide to pair with it as one table. On the model blocks one table over the widest
-term alone would hold 3.6e4 to 7.5e18 entries, and #6315's lowering of the whole
-objective holds 396 to 21998 (Estimates). Stage 11's replay reports entries per capture
-with each reduction.
+Three more reductions are not in this graph, which reads no residency literal:
+- **The switch (rule 4)** reads a product too wide for one table by collapsing its rest
+  once into an integer and multiplying that by each of the factor's values, one enforced
+  constraint per value.
+- **The gate (rule 5)** is the switch on a 0/1 literal. Its rest's entries count once,
+  and no table reads the literal.
+- **The fold (rule 2)** reads a product of Min/Max factors over shared inputs by the
+  tuples of rungs that can occur together.
+
+On the model blocks, one table over the widest term alone would hold 3.6e4 to 7.5e18
+entries, and #6315's lowering of the whole objective holds 396 to 21998 (Estimates).
+Stage 11's replay reports entries per capture with each reduction.
 
 Two subsections below add what the graph does not show: a buffer with several symbols on
 one division, and one table over several integer variables. Every table in this section
@@ -514,12 +538,10 @@ the lowering raises.
 
 - *A table* is one table over the node's inputs, or the form from its parts: a rank, a
   pair, a Min/Max by rung, a fold (rules 1 to 3).
-- *Linear* nodes are a sum, a constant times one child, a product with a gate or a
-  relayout charge (rule 5), and a Min/Max kept as a `lin_min`/`lin_max`. A product with
-  another factor is switched tables (rule 4): its form is a sum of tables, which only a
-  linear reader reads. A gated form is one variable, which also only a linear reader
-  reads. Pass 1 of Architecture
-  marks the nodes that only linear nodes sit above.
+- *Linear* nodes are a sum, a constant times one child, any other product as a switch
+  (rule 4), a product with a gate or a relayout charge as a gated switch (rule 5), and a
+  Min/Max kept as a `lin_min`/`lin_max`. A switch is one variable that only a linear
+  reader reads. Pass 1 of Architecture marks the nodes that only linear nodes sit above.
 - The objective reads the root's linear form. A root with only a table is one linear
   term, a single lookup.
 
@@ -653,14 +675,13 @@ value; and the worst error is 0.43 units.
 the menus, and each list made from them. CP-SAT cannot hold a float, so below a linear
 term it holds positions only (divisions, ranks, rungs, pair and fold positions), and no
 cost value. A *linear term* is where a list must become a CP-SAT integer: a term of the
-objective's sum, a term of an operand of a Min/Max kept linear, or a term of a gate's
+objective's sum, a term of an operand of a Min/Max kept linear, or a term of a switch's
 rest. There the list is collapsed, in this order:
 
 1. Every float multiplier above the list is applied to it in numpy: the term's
    coefficient, the constant factors of a product, a gate's value where it keeps the
-   term (rule 5), a coefficient pushed through a linear Min/Max, where a negative one
-   turns Min into Max, and a switched factor's values, which pair the list with the
-   factor (rule 4).
+   term (rule 5), and a coefficient pushed through a linear Min/Max, where a negative one
+   turns Min into Max.
 2. Lists on one index in the same sum are added.
 3. The list is rounded once, `table[i] = rint(COST_SCALE * values[i])`. An entry past
    2^50 is refused, so a sum of thousands of entries stays inside int64. This refusal
@@ -670,36 +691,52 @@ rest. There the list is collapsed, in this order:
    A list is affine when its rounded entries are, so `table[0] + step * index` equals
    the table entry for entry.
 
-No integer made by a collapse is multiplied by a float afterwards. A unit is
-1/`COST_SCALE` of the cost. Each collapsed list is within half a unit of its float
-value, a sum of T lists and a constant is within (T + 1) / 2 units, a linear Min/Max
-is within the largest bound among its operands, and a gate is within its rest's bound
-where it keeps the term and exact where it does not.
+A collapsed integer is multiplied afterwards in one place only: a switch multiplies its
+rest's `w` by each of its factor's values (rule 4). A unit is 1/`COST_SCALE` of the
+cost.
+- Each collapsed list is within half a unit of its float value.
+- A sum of T lists and a constant is within (T + 1) / 2 units.
+- A linear Min/Max is within the largest bound among its operands.
+- A switch is within |v| times its rest's bound for a whole value `v`. For a fraction
+  it adds under one unit for the floor and |w| / (2q) for writing `v` as `p/q`.
+- A gate is within its rest's bound where it keeps the term, and exact where it does not.
 
-Rule 5 keeps this. A gate multiplies a collapsed integer, but by 0 or 1 only, and an
-integer times 0 or 1 is itself or 0. Its rest is collapsed into `w` as any linear form
-is, every list in it rounded once, and one variable `g` takes `g == w` where the gate's
-literals are at their kept values and `g == 0` where one is not: two enforced linear
-constraints for one literal, one more for each further literal. The gate's coefficient,
-`2` in `2 - 2*x`, is applied to the rest's lists before the rounding, by step 1. The
-literal reaches no table: the rest was read with it fixed at the kept value.
+**Rule 4 multiplies after the collapse, by constants.**
+- A switch's rest is collapsed into `w` as any linear form is, every list in it rounded
+  once.
+- Its factor's distinct values `v_1 .. v_K` stay numbers. One true/false per value is
+  on exactly where the factor takes that value: `add_map_domain` on the factor's rank,
+  or a literal is its own.
+- One variable `g` takes, under the true/false of each value:
+  - for a whole value, `g == v·w`, exact;
+  - for a fraction, `q·g <= p·w <= q·g + q - 1`, which makes `g` the floor of
+    `p·w / q`. Here `p` is `v·q` rounded, and `q` is the largest power of two up to 2^24
+    that keeps every `p·w` under 2^60. A factor whose values are all whole takes q = 1.
+  - for 0, `g == 0`.
+- Every constraint is linear, its coefficients the factor's values, so no two variables
+  are multiplied and no table crosses factor and rest. `add_multiplication_equality`
+  states the same product generically: CP-SAT splits it into cases itself only when
+  one factor is 0/1, and it takes no fraction.
+- The product is taken after the collapse, so the rest may be anything linear: a sum of
+  lists on several buffers, a Min/Max kept linear, whatever the sign of the factor, or
+  another switch, so a product of three factors switches twice.
+- Products with one factor and one set of values are one switch: factor·A + factor·B
+  is factor·(A + B), their rests added before the collapse.
 
-Rule 4 keeps this: a factor that multiplies a sum is paired with each of the sum's lists
-in numpy, before the rounding, so each switched table is one list rounded once. #6315
-began with this form and left it. On the 14B and 24B auto-tiling prefill objectives the
-derate factor has 80 values; the paired tables held 45k of their 80k entries, CP-SAT's
-presolve expanded them into 74k enforced constraints, and lowering and solving took 26
-to 27 s. #6315 replaced them with a switch on the sum already collapsed to one integer
-`w`: one literal per factor value, and the product `floor(p * w / q)` held by two
-enforced inequalities per value. That took 5 to 6 s, and the whole replay 144.6 s
-against 443.8 s. Tabling a residency literal's term, the two-value case, had made
-small default-config kernels solve 2 to 2.5 times slower than the printer, which is why
-rule 5 optimizes that case into a gate (Decisions). Stage 11's replay
-measures switched tables against those numbers. If they cannot be made to work, rule 4
-falls back to one multiplication in the solver: the factor's values scaled to integers
-over one power of two `q` and read by one `add_element`, times the rest collapsed to one
-integer by `add_multiplication_equality`, divided by `q`. The largest error #6315
-measured over the 50 objectives is 1.2e-7 of the cost.
+#6315 measured this form against pushing the factor into every list of the rest
+(Decisions). Its largest error over the 50 objectives is 1.2e-7 of the cost.
+
+**Rule 5 makes the two-value case exact and smaller.** A gate is a switch on a 0/1
+literal whose value at one of the literal's values is 0.
+- Its other value is pushed into the rest's lists before the rounding, by step 1. `2`
+  in `2 - 2*x` is one such value. So the case is `g == w`, and the gate adds no
+  rounding.
+- The 0 case is `g == 0`, and the literal is its own true/false: two enforced linear
+  constraints for one literal, and one more for each further literal.
+- The rest was read with the literal fixed at the kept value, so no table reads it.
+
+Tabling a residency literal's term had made small default-config kernels solve 2 to 2.5
+times slower than the printer; the gate is #6315's answer to that (Decisions).
 
 The *exact* tests of every stage are the check on this mapping: they solve at every
 assignment of the inputs, so an entry read from the wrong position fails.
@@ -974,14 +1011,18 @@ class LinearExtreme:
 
 
 @dataclass(frozen=True, eq=False)
-class LinearGate:
-    """A term kept by 0/1 literals (rule 5): rest where every literal is at its kept
-    value, 0 elsewhere. rest was read with the literals fixed there, so it reads none
-    of them, and the gate's coefficient is already in its lists. Exact: a collapsed
-    integer times 0 or 1 is itself or 0."""
+class LinearSwitch:
+    """A product by cases (rule 4): where on's position is k, values[k] times
+    rests[k], each rest collapsed to an integer first. A value of 0 is the product 0.
 
-    keeps: tuple[tuple[CpIndex, int], ...]  # each literal's Input and its kept value
-    rest: CpLinear
+    rests holds one shared rest, unless on is a 0/1 literal: then each case's rest was
+    read with the literal fixed at that case, and a gate (rule 5) has its one nonzero
+    value already in that case's lists, values being 0 and 1. Two switches on equal
+    positions with equal values are one switch, their rests added case by case."""
+
+    on: CpIndex                   # the factor's position: a literal, or its rank
+    values: tuple[float, ...]     # the factor's value at each position
+    rests: tuple[CpLinear, ...]   # one per position, or one shared by all
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
@@ -994,7 +1035,7 @@ class CpLinear:
     constant: float = 0.0
     lists: Mapping[CpIndex, np.ndarray] = field(default_factory=dict)  # one per index
     extrema: tuple[LinearExtreme, ...] = ()
-    gates: tuple[LinearGate, ...] = ()  # one per set of kept literals
+    switches: tuple[LinearSwitch, ...] = ()  # one per position and values
 
     def __post_init__(self) -> None:
         """Refuses a list whose length is not its index's size, and marks each list
@@ -1003,7 +1044,8 @@ class CpLinear:
     @property
     def entries(self) -> int:
         """The entries the form puts in the model: its lists, the remaps under their
-        indexes, each once, and its operands' and its gates' rests' entries. What rule 3
+        indexes, each once, its operands' entries, and each switch's rests' entries plus
+        one per value of its factor. What rule 3
         compares. Counted before any rounding, so a list that turns out affine or
         constant still counts in full."""
 
@@ -1081,22 +1123,20 @@ class CpLinearNode(CpNode):
         - an Add: its children's as_linear merged into a new form, constants added,
           the lists on one index added elementwise into one list, so
           split ** 0.5 + split ** 0.7 rounds once, to 3112 at split 2, not 1448 + 1663,
-          and gates on the same kept literals merged, their rests added;
+          and switches on equal positions and values merged, their rests added;
         - a Mul: through expr.as_coeff_Mul(), k times the one other child's as_linear,
-          a new form with its lists, constant, operands and gates' rests scaled by k,
-          so 7 * split ** 0.5 at split 2 is 10137, not 7 * 1448, and a negative k
-          turns each lin_min into a lin_max; with gates among its factors (rule 5),
-          one LinearGate of their literals over the rest's as_linear times the gates'
-          values where they keep the term, the rest no longer reading the literals
-          (lower's normalization); with more than one other child and no gate,
-          switched tables (rule 4): one factor's table, ranked, pushed into every list
-          of the rest's as_linear and of its gates' rests, each list and the factor
-          one numpy table on the pair of their positions, the rest's constant times
-          the factor's list, and the factor pushed into each Min/Max operand when its
-          values have one sign. Two linear forms are never multiplied;
+          a new form with its lists, constant, operands and switches' rests scaled by
+          k, so 7 * split ** 0.5 at split 2 is 10137, not 7 * 1448, and a negative k
+          turns each lin_min into a lin_max; with more than one other child, a switch
+          (rule 4): the factor with the fewest distinct values, its table ranked, is
+          on, and the rest is the product of the other factors, its as_linear when one
+          is left and a further switch when more are. A gate (rule 5) is the switch on
+          its literal, with each case's rest read with the literal fixed (lower's
+          normalization) and the gate's nonzero value pushed into its lists. Two
+          linear forms are never multiplied;
         - a Max or Min: lin_max or lin_min over its children's as_linear;
-        - a RelayoutCharge: one LinearGate of its literal, kept at 1, over its prices,
-          a list on its division.
+        - a RelayoutCharge: one switch on its literal, 0 where it is off and its
+          prices, a list on its division, where it is on.
 
         Raises TableLoweringError(expr, reason) when it ends with neither.
         """
@@ -1169,10 +1209,11 @@ class CpEmitter:
         """form as a CP-SAT expression in COST_SCALE units, built once per form: its
         constant, plus self.table of each list, already summed per index, so a sum of
         T lists and a constant is within (T + 1) / 2 units of its float value. Each
-        lin_min or lin_max is over operands behind proxy variables. Each gate is one
-        variable g, its domain from 0 and the bounds of its rest's collapse w, with
-        g == w enforced where every literal is at its kept value and g == 0 enforced
-        where one is not, one constraint for each literal."""
+        lin_min or lin_max is over operands behind proxy variables. Each switch is
+        one variable g: one true/false per value of its factor, by add_map_domain on
+        its position (a literal is its own), its rests collapsed to integers w, and
+        under each true/false g == v * w for a whole value v, q * g <= p * w <=
+        q * g + q - 1 for a fraction p / q, and g == 0 for 0."""
 
 
 def inputs_from_maps(
@@ -1469,7 +1510,7 @@ for expr in reversed(order):                          # every parent before its 
   its first parent, before the second is seen, and has to walk the shared subtree again
   to carry a later mark down. Pass 2 iterates the same `order` forward.
 - **Linear children.** A sum's terms, a Min/Max's operands, and a product's factors, any
-  of which may be the rest of switched tables (rule 4). Every other node passes no mark
+  of which may be in the rest of a switch (rule 4). Every other node passes no mark
   down: the children of a power, a log, a floor, a Piecewise, a relational or a function
   are read as tables.
 - **A shared node can need both forms.** In `Max(...) ** 0.5 + 3 * Max(...)` the Max is
@@ -1538,7 +1579,7 @@ form and leaves the children's lists as they were.
 | `CpNode`, a number | one value on `Unit` | its constant |
 | `CpNode`, Pow, floor, log, Piecewise, relationals, And, Or, Not, ITE, functions | one table over its inputs, or from its parts | none: `as_linear` is the table as one list |
 | `CpLinearNode`, an Add | the same | the children's `as_linear` added, where lists on one index become one list and gates on the same kept literals one gate |
-| `CpLinearNode`, a Mul | the same, or the fold of Min/Max factors (rule 2) | constants times one child, through `expr.as_coeff_Mul()`: that child's `as_linear`, scaled. With a gate among its factors, the rest's `as_linear` kept where the gate's literal is at its kept value and 0 elsewhere (rule 5). Otherwise switched tables (rule 4): one factor pushed into every list of the rest, each pair one numpy table |
+| `CpLinearNode`, a Mul | the same, or the fold of Min/Max factors (rule 2) | constants times one child, through `expr.as_coeff_Mul()`: that child's `as_linear`, scaled. Otherwise a switch (rule 4): the factor with the fewest distinct values picks a constant, and the rest's `as_linear`, collapsed once, is multiplied by it. With a gate among its factors, the switch on its literal, the rest read with the literal fixed (rule 5) |
 | `CpLinearNode`, a Max or Min | the same, or by rung (rule 1) | `lin_max` or `lin_min` over the children's `as_linear`, kept only under half the table's entries |
 | `CpLinearNode`, a `RelayoutCharge` | one table over its literal and its division | its prices, a list on its division, kept where its literal is 1 and 0 elsewhere (rule 5) |
 
@@ -1555,15 +1596,15 @@ form and leaves the children's lists as they were.
   and where the Max has none, the power has none either and raises.
 - **Multipliers go down in float.** Scaling a linear form makes a new form, its lists
   multiplied in numpy. Through a `lin_min` or `lin_max` it scales the operands, and a
-  negative factor turns one into the other. Through a gate it scales the rest; the
-  literal is not touched, since a gate's 0 times anything is 0.
+  negative factor turns one into the other. Through a switch it scales the rests, and
+  the factor's values are not touched. A factor's own values never go down into the
+  rest; the switch multiplies after the collapse, so it needs no rule on their sign.
 - **Refusal.** A node that ends pass 2 with neither a table nor a linear form raises
   `TableLoweringError` from its own `visit_op`, with itself as `node` and the reason: a
   symbol with no input, no table under the cap and no linear reader, a child with no
-  table under a nonlinear node, a pair, fold or switched table past the cap, or a
-  factor of mixed sign pushed into a Min/Max. Nothing is passed up for a
-  parent to work around; a relayout charge on a source this solve does not divide is
-  already the number 0, from the normalization. One refusal comes later, in the build:
+  table under a nonlinear node, or a pair, fold or switch past the cap. Nothing is
+  passed up for a parent to work around; a relayout charge on a source this solve does
+  not divide is already the number 0, from the normalization. One refusal comes later, in the build:
   an entry past 2^50, found at the rounding. Whichever it is, the entry point swaps its
   copy of the model back before the error leaves (Decisions).
 
@@ -1586,8 +1627,8 @@ builds a variable only when the plan reads it:
    key, so a position two terms share is built once.
 3. **Collapse, on request.** `CpEmitter.table` rounds each list once and reads it with
    one `add_element`. An affine list is a linear expression with no table, and a
-   constant list is a number. A gate is its rest collapsed, then one variable held by
-   enforced linear constraints on its literals.
+   constant list is a number. A switch is its rests collapsed, then one variable held by
+   one or two enforced linear constraints per value of its factor.
 
 Floats become integers in step 3, and nowhere else.
 
@@ -1668,8 +1709,8 @@ was visited once: 10 visits for an expression of 15 nodes.
 | 5 | a Max and a Min as `CpLinearNode`s with a table by rung: `Extreme`, ladders, rungs, clamping |
 | 6 | a Mul's table by fold |
 | 7 | the linear form of a Max or Min: `lin_max` and `lin_min`, margin 2, operands behind proxies |
-| 8 | switched tables in a Mul's linear form: a factor pushed into every list of the rest, and into Min/Max operands |
-| 9 | the gate: `LinearGate` in a Mul's linear form, `RelayoutCharge` as a `CpLinearNode`, `lower`'s first normalization (a gated product's rest read with the literal fixed), and the gate's variable and enforced constraints in `CpEmitter` |
+| 8 | the switch in a Mul's linear form: `LinearSwitch`, the factor's true/falses by `add_map_domain`, the rest collapsed once, and the per-value enforced constraints in `CpEmitter` |
+| 9 | the gate: a switch on a 0/1 literal, the literal its own true/false, `lower`'s first normalization (a gated product's rest read with the literal fixed), the nonzero value pushed into the rest; `RelayoutCharge` as a `CpLinearNode` |
 | 10 | `AllowedEmitter` |
 | 11 | `inputs_from_maps`, `lower`'s relayout normalization, and `lower_cost_with_tables` with its copy and swap back |
 | 12 | nothing in the module: the flag, the solver's call and the docs |
@@ -1690,8 +1731,8 @@ integrate: first with the printer's maps, then with the solver behind the flag.
 | 5 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
 | 6 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
 | 7 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes |
-| 8 | rule 4: switched tables, a factor pushed into every list of the rest | a product with a factor too wide to pair |
-| 9 | rule 5: a 0/1 literal gates its term, and a relayout charge its prices, with no table over the literal | the same sums, each literal's term at its rest's entries, not twice them |
+| 8 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
+| 9 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
 | 10 | the table constraint, `AllowedEmitter`, built beside `CpEmitter` | the same plans, as table constraints |
 | 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
 | 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, docs | every compile, with the flag on |
@@ -1963,8 +2004,8 @@ A Max and a Min gain their linear form, and a reader picks between it and the ta
 
 - A Min/Max too wide to index, or whose table is over twice its linear form, stays a
   `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
-  sums, constant factors and other Min/Max nodes here, then the switched tables of
-  Stage 8, which push a factor of one sign into its operands, and Stage 9's gates.
+  sums, constant factors and other Min/Max nodes here, and from Stage 8 any product,
+  whose switch multiplies the collapsed Min/Max by its factor's values.
 - A coefficient on the Min/Max is applied to its operands' lists before they are
   collapsed. A negative one turns Min into Max.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
@@ -1979,55 +2020,81 @@ a fractional coefficient on a linear Min is within the largest operand's bound; 
 operand is a single variable; a Max too wide to index under a power, a log or a division
 raises, and the same Max under a sum, a constant and a Min stays linear.
 
-### Stage 8: rule 4, switched tables
+### Stage 8: rule 4, the switch
 
-A Mul with two or more factors that are not constants gains its switched tables. It is
-linear in its children only with constant factors (Stage 3); every other product is
-tables.
+A Mul with two or more factors that are not constants gains its linear form, a switch.
+Through Stage 7 such a product is a table only: one table over its inputs, or the pair
+of ranks from Stage 4. From here a linear reader can read it as its rest, collapsed
+once, times its factor's value, with no table crossing the two.
 
-- One factor is switched: the one with the fewest distinct values, ranked to them. The
-  rest, the product of the other factors, is read with `as_linear`.
-- The factor is pushed into every list of the rest. The list and the factor's distinct
-  values make one numpy table, `outer(values, list)`, on the pair of their positions, or
-  on the list's own position when the factor's inputs are among the list's, whichever
-  has fewer entries (rule 3). The factor's position picks the row, so the switch is a
-  lookup. The rest's constant becomes the factor's list times it.
-- A Min/Max kept linear in the rest takes the factor into each operand when the factor's
-  values have one sign, a negative sign turning Min into Max. A factor of mixed sign
-  raises there.
-- A switched table is float until the collapse and rounded once, so it is within half a
-  unit, and no float multiplies a collapsed integer.
-- A 0/1 literal, one minus it, or a multiple of either, is the two-value case: the
-  table is the rest's list where the literal is on and 0 where it is off, on the pair of
-  the literal and the list's position. A relayout charge needs nothing here: since
-  Stage 1 it is one table over its literal and its division. Stage 9 optimizes both.
-- A switched table past the cap raises, naming the product.
+- **The factor.** The factor with the fewest distinct values, among those with a table,
+  is the one switched on. Its list is ranked to its distinct values, a `Compact` on its
+  position. Its values stay numbers.
+- **The rest.** The product of the other factors, read with `as_linear`: one child's
+  linear form when one is left, a further switch when more are. It may hold lists on
+  several buffers, a constant, a Min/Max kept linear (Stage 7) and other switches, and
+  all of it collapses into one integer `w`.
+- **The cases.** `add_map_domain` on the factor's rank gives one true/false per value,
+  on exactly where the factor takes it. One variable `g` takes, under each true/false:
+  - for a whole value `v`, `g == v·w`;
+  - for a fraction, `q·g <= p·w <= q·g + q - 1`, with `p` the value times `q` rounded
+    and `q` the largest power of two up to 2^24 that keeps every `p·w` under 2^60;
+  - for 0, `g == 0`.
 
-The risk is measured, not argued: #6315 found this form 5 times slower than a switch on
-a collapsed sum on the auto-tiling prefill objectives and 3 times over the whole replay,
-and tabled literal terms 2 to 2.5 times slower on small kernels ("Collapsing float lists
-into linear terms"). The second is what Stage 9's gate removes. Stage 11's replay
-compares. If switched tables cannot be made to work, one more stage adds the fallback:
-the factor's values scaled to integers by one `add_element`, multiplied by the rest
-collapsed to one integer with `add_multiplication_equality`, and divided by the scale.
+  A factor whose values are all whole takes q = 1. `g` is the linear term.
+- **One switch per factor.** Products with one factor and one set of values add their
+  rests into one switch. `factor·A + factor·B` builds one `w` for `A + B`, one set of
+  true/falses and one `g`.
+- **Any sign.** The product is taken on the collapsed rest, so a factor of any sign
+  multiplies a `lin_max` or `lin_min` as it multiplies a list. No operand is touched,
+  and nothing is refused for its sign.
+- **Literals.** A 0/1 literal times a term is the two-value case: two true/falses, on at
+  0 and at 1, over the rest collapsed once. From here a literal's term costs its rest's
+  entries, not twice them as Stage 3's one table held it. Stage 9 optimizes this case.
+  A relayout charge stays one table over its literal and its division until Stage 9.
+- **The choice.** Rule 3 compares the switch, its rest's entries plus one per factor
+  value, with the product's table. A small factor times a small list keeps its pair
+  table.
+- **The cap.** A factor's values count as entries; a factor with more values than the
+  cap has no switch.
 
-Tests: a factor times a sum of lists over several buffers is exact, with one table per
-list and one rounding per table; a factor whose inputs are among a list's adds no
-position; a factor times a Min too wide to pair is exact, also inside a Min; a negative
-factor turns that Min into a Max; a factor of mixed sign pushed into a Min raises; a
-literal times a sum over several buffers and a relayout charge are exact as the
-two-value case; a constant rest adds no table; a switched table past the cap raises.
+The error: a whole value scales its rest's bound, and a fraction adds under one unit
+plus `|w| / (2q)` ("Collapsing float lists into linear terms"). This is the form #6315
+settled on (Decisions). Pushing the factor into every list instead held 45k of the 80k
+entries on the 14B and 24B auto-tiling prefill objectives and took 26 to 27 s. The
+switch took 5.9 and 5.2 s, and the whole replay 144.6 s against 443.8 s, with the largest
+error 1.2e-7 of the cost. Stage 11's replay compares against #6315's tip.
+
+Tests:
+
+- a factor with a whole value, a fraction and 0, times a sum of lists over two buffers,
+  is exact within the switch's bound at every assignment: minimizing and maximizing
+  agree, one table per list, and no table over factor and rest together;
+- each case's true/false is on exactly where the factor takes its value;
+- a factor whose values are all whole is exact within its values times the rest's
+  bound, with one constraint per value;
+- two products with one factor are one switch with one `w`;
+- a factor of mixed sign, and a negative one, times a Min kept linear is exact;
+- a product of three non-constant factors is a switch inside a switch, and is exact;
+- a literal times a sum over several buffers is the two-value switch, with the rest's
+  entries counted once;
+- a small factor times a short list keeps its pair table where that has fewer entries;
+- a factor with more values than the cap has no switch, and with no table either, the
+  product raises, naming it.
 
 ### Stage 9: rule 5, a 0/1 literal gates its term
 
-An optimization of Stage 8's switch. Multiplying by a 0/1 literal is multiplying by 0 or
-1: a switch on two values, one of them 0. Through Stage 8 the term is a table over the
-literal and the rest's positions, Stage 3's one table or Stage 8's two-value case:
-twice the rest's entries, the off half zeros. A relayout charge is one table over its
-literal and its division. The 0 case needs no table, and the 1 case needs none over the
-literal, so a gate keeps the rest once and drops the literal from every table. Most
-narrow terms read one literal (Estimates), so this is where their tables come down to
-the menu's size.
+An optimization of Stage 8's switch for a factor of one 0/1 literal that is 0 at one of
+its values. From Stage 8 such a product is already its rest collapsed once, under two
+true/falses, with `g == v·w` for its nonzero value `v` and `g == 0` for the other.
+Three savings are left:
+- the literal is its own true/false, so it needs no rank and no `add_map_domain`;
+- the rest can be read with the literal fixed, so no table under the switch reads it;
+- the nonzero value can go into the rest's lists in float, so the case is `g == w`, and
+  a fractional coefficient such as `0.5 - 0.5*x` adds no rounding.
+
+A relayout charge, which is not a Mul, gets the same form here. Until now it was one
+table over its literal and its division, twice the menu, its off half zeros.
 
 - **The gate.** A factor of a Mul is a gate when it reads one 0/1 literal and is 0 at
   one of the literal's values: `x`, `1 - x`, `3*x`, or `2 - 2*x`, which is how sympy
@@ -2040,42 +2107,40 @@ the menu's size.
   gate is a constant times the gate's list on its literal, which is affine (Stage 3): no
   gate and no table. So `(1 - x) * (c - c*x + c*x/t)` becomes `c * (1 - x)`, with no
   table over the tile's division.
-- **The linear form.** A gated Mul's linear form is one `LinearGate`: its literals with
-  their kept values, and the rest's `as_linear` times the gates' coefficients, in float.
-  An Add merges gates on the same kept literals into one, their rests added, so the
-  lists on one position inside them are one list and round once.
+- **The linear form.** A gate is a `LinearSwitch` on the literal's `Input`, with values 0
+  and 1. Its kept case's rest is the rest's `as_linear` times the gate's value, in
+  float, and the other case is empty. A product with gates on several literals is a
+  switch inside a switch. An Add merges gates on one literal into one, their rests added
+  case by case, so lists on one position inside them are one list and round once.
 - **A relayout charge** becomes a `CpLinearNode`. Its linear form gates its prices, a
   list on its division, by its literal kept at 1, so it costs the division's menu
   once. Its table over the literal and the division stays for a nonlinear reader.
-- **The build.** `CpEmitter` collapses the rest into `w` as it collapses any form. It
-  then makes one variable `g`, whose domain spans 0 and the bounds of `w`, with
-  `g == w` enforced where every literal is at its kept value and `g == 0` enforced
-  where one is not, one constraint per literal. `g` is the linear term. The gate adds
-  no error to its rest's: within the rest's bound where it keeps the term, exactly 0
-  elsewhere.
-- **The choice.** Rule 3 compares the gated form, its rest's entries, with the
-  product's one table over the literal and the rest's inputs, which doubles them for
-  each literal. A gate is read only linearly: under a power, a log or any other
-  nonlinear node, the product is its table, as in Stage 3.
-- **With the switch.** A gate takes the place of the two-value case: a product with a
-  gate is gated, not switched, and its literal is never the switched factor. A factor
-  that Stage 8 pushes into a form holding gates goes into each gate's rest, never across
-  its literal. A gate inside an operand of a Min/Max kept linear (Stage 7) is one more
-  term of that operand.
+- **The build.** `CpEmitter` builds a gate as it builds any switch, with the literal, or
+  its negation, as the kept case's true/false: `g == w` under it and `g == 0` under the
+  other. `g` is the linear term. The gate adds no error to its rest's: within the rest's
+  bound where it keeps the term, exactly 0 elsewhere.
+- **The choice.** A gate replaces Stage 8's two-value switch whenever the factor is a
+  gate: it never has more entries, since its rest reads the literal no more. A gate is
+  read only linearly: under a power, a log or any other nonlinear node, the product is
+  its table, as in Stage 3.
+- **Inside other forms.** A product of a gate and other non-constant factors is the
+  gate's switch, its rest the product of the others, switched by Stage 8 when more than
+  one is left. A gate inside the rest of another switch, or inside an operand of a
+  Min/Max kept linear (Stage 7), is one more term there.
 
 #6315 measured this form against tabling the literal (Decisions). Small default-config
 kernels went from 2 to 2.5 times the printer's solve time to the printer's own. Once a
 gate in any form was recognised, the GQA test went from 306,811 entries to 115,667.
 Stage 11's replay reports entries with this stage on and off.
 
-After this stage each literal's term costs its rest's entries. A term on one menu whose
-k literals all gate it is one list, where Stages 3 to 8 made one table of 2^k times the
-menu.
+After this stage no table reads a gating literal, and a gate's fractional coefficient
+is exact. A term on one menu whose k literals all gate it is one list under k gates,
+where Stages 3 to 7 made one table of 2^k times the menu.
 
 Tests:
 
-- every gated case below gives the same cost at every assignment as Stage 8's two-value
-  case, with the literal in no table and fewer entries;
+- every gated case below gives Stage 8's two-value switch's cost, within its bound, at
+  every assignment, with the literal in no table and no more entries;
 - `x * f(split)` on a literal `x` is exact, with one list of the menu's length on the
   division and no table over `x`. So are `(1 - x) * f(split)`, `3*x * f(split)` and
   `(2 - 2*x) * f(split)`, the last kept where `x` is 0, with coefficient 2;
@@ -2088,7 +2153,9 @@ Tests:
 - the rest reads no literal: `x * Max(x * a, b)` reads `x` only through its gate;
 - `(1 - x) * (c - c*x + c*x/t)` is `c * (1 - x)`: affine, with no gate and no table over
   the tile's division;
-- `(1 + x)` times a list is not gated;
+- `(1 + x)` times a list is not gated: it stays Stage 8's switch, with values 1 and 2;
+- `(0.5 - 0.5*x) * f(split)` is exact within half a unit, where Stage 8's switch is
+  within one unit more;
 - a relayout charge is exact as a gate of its prices on its division, with as many
   entries as the menu; under a power it is its table over the literal and the division;
 - a gated product under a power or a log is its one table, as in Stage 3.
@@ -2193,10 +2260,9 @@ After Stage 11, posted on that PR, with the replay calling `lower_cost_with_tabl
    capture, beside the table in Estimates, for `CpEmitter` and for `AllowedEmitter`.
    Entries also with each stage's optimization turned off alone. A capture with more
    entries or a slower solve than #6315 is explained in the PR.
-3. **Rule 4 against #6315's switch, and the gate against the printer.** Lowering and
-   solve time of the 14B and 24B auto-tiling prefill objectives, 5.9 and 5.2 s under
-   #6315's switch. If switched tables are far behind, the multiplication fallback is
-   built as one more stage before Stage 12. Entries and solve time of the default-config
+3. **The switch and the gate against #6315.** Lowering and solve time of the 14B and
+   24B auto-tiling prefill objectives (847607 captures): 3.28 and 3.12 s at #6315's tip,
+   5.94 and 5.24 s when it first switched. Entries and solve time of the default-config
    objectives with Stage 9's gate on and off: #6315's gate brought the small kernels
    whose terms it gates to the printer's solve time (softmax 4096x2048 0.15 s, add_mul
    0.055 s, rmsnorm 0.065 s).
