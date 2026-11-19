@@ -1488,13 +1488,15 @@ Earlier probe captures of the same tests, made with auto tiling on and derates, 
 larger: each also had a product past the cap, and flash attention's root was 10^135.8.
 
 - **The blocks, in one module.** `tests/inductor/common_blocks.py` holds each block's
-  function and the inputs its correctness test runs it on: `flash_attention`,
-  `causal_sdpa`, `simple_attention`, `chained_rms_norm` and `sliding_window_attention`
-  with `gqa_decode_inputs`. `test_building_blocks.py` and
+  function and the inputs its correctness test runs it on: `causal_sdpa`,
+  `chained_rms_norm`, `flash_attention`, `gqa_decode` (sliding-window attention on the
+  GQA decode shape) and `simple_attention`, each with its `_inputs`. The test lists them
+  as `(transform, inputs)` pairs, causal SDPA's length 64 as a lambda, and keys each
+  block by its function's name (owner, in review). `test_building_blocks.py` and
   `test_sliding_window_attention.py` import them instead of defining them inside their
   tests, so the correctness tests and the lowering compile the same code. The
-  sliding-window file keeps its private names for the helpers that moved
-  (`_inputs`, `_attention_mask`, `_attention`), by import.
+  sliding-window file keeps its private names for the helpers that moved (`_inputs`,
+  `_attention_mask`, `_attention`), by import.
 - **The objectives.** The test compiles each block on its inputs with
   `_compile_and_run`, as the correctness tests do, under `auto_coarse_tiling` off and
   the inductor caches off, with `ilp_solver_ortools.cost_expr_to_cpsat` patched to catch
