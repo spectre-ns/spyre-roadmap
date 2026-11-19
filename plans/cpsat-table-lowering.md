@@ -1,8 +1,10 @@
 # CP-SAT table lowering, rebuilt bottom-up behind a config flag
 
-Reference result: torch-spyre#6315 (`table-lowering-experimental`, tip `c26f6171`,
-draft). Code base: torch-spyre `cab4721d`, the PR's base. Line numbers are at that
-commit.
+Reference results: an earlier prototype of this lowering, called *the prototype* below,
+measured on 50 replayed objectives. Its results are kept in
+`~/pr6301-review/tableonly/`, and Stage 11's replay compares against them. The prototype
+is cited for its results only. Code base: torch-spyre `cab4721d`. Line numbers are at
+that commit.
 
 Short paths: `config.py` and `cost_model.py` are under `torch_spyre/_inductor/`.
 `cpsat_table_lowering.py`, `cost_expr_numpy.py`, `cpsat_expr_printer.py`,
@@ -11,13 +13,13 @@ Short paths: `config.py` and `cost_model.py` are under `torch_spyre/_inductor/`.
 
 ## Goal
 
-When the last PR of this plan merges, torch-spyre has a table lowering of the CP-SAT cost
-objective behind `config.cpsat_table_lowering`, off by default, that reproduces #6315's
-results. With the flag on, the objective is built from exact element tables, linear sums
-and `lin_min`/`lin_max`. An objective the tables cannot lower raises, and never reaches
-the printer. With the flag off, every solve goes through the printer as it does on
-`main`. Table values are
-computed with numpy functions, and the code arrives in layers, each with its own tests.
+When the last PR of this plan merges, torch-spyre has a table lowering of the CP-SAT
+cost objective behind `config.cpsat_table_lowering`, off by default, that reproduces the
+prototype's results. With the flag on, the objective is built from exact element tables,
+linear sums and `lin_min`/`lin_max`. An objective the tables cannot lower raises, and
+never reaches the printer. With the flag off, every solve goes through the printer as it
+does on `main`. Table values are computed with numpy functions, and the code arrives in
+layers, each with its own tests.
 
 ## Decisions (2026-11-16)
 
@@ -26,10 +28,11 @@ computed with numpy functions, and the code arrives in layers, each with its own
   a class the dict does not hold stays on lambdify. There is no generic lookup of numpy
   functions by name. This replaces the 2026-11-16 decision, numpy first by name with
   lambdify as the backup.
-- **A stack of PRs in the fork**, one per stage, each on the one before. Stage 1 is
-  spectre-ns/torch-spyre#32, on the fork's `main` (92582da3, torch-spyre `main` of
-  2026-11-17). #6315 stays open as the reference result and closes when the flag
-  reproduces it.
+- **A stack of PRs**, one per stage, each on the one before, from branches in the fork.
+  Stage 1 is torch-spyre/torch-spyre#6475 (2026-11-19), from the fork's
+  `table-lowering-1-base-experimental` on torch-spyre `main` of 2026-11-17 (92582da3).
+  It was first reviewed on the fork as spectre-ns/torch-spyre#32, which the plan cites
+  below for that review's decisions.
 - **Off by default.** Stages 1 to 11 add files nothing imports. Stage 12 adds the flag.
 - **Base mechanics first, then one optimization per stage, integration last
   (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
@@ -48,7 +51,7 @@ computed with numpy functions, and the code arrives in layers, each with its own
 
   No table crosses factor and rest, and no two variables are multiplied. This replaces
   the 2026-11-17 decision, switched tables with `add_multiplication_equality` as the
-  fallback. #6315 measured both:
+  fallback. The prototype measured both:
   - switched tables put 45k of the 80k entries of the 14B and 24B auto-tiling prefill
     objectives into pairs with the 80-value derate factor;
   - CP-SAT's presolve expanded those pairs into 74k enforced constraints, and lowering
@@ -68,8 +71,8 @@ computed with numpy functions, and the code arrives in layers, each with its own
   - Its rest's entries count once; a relayout charge's table over the literal and the
     division held them twice, its off half zeros.
 
-  This is rule 5, built in Stage 5, right after the switch it optimizes. #6315 measured
-  this form against tabling the literal:
+  This is rule 5, built in Stage 5, right after the switch it optimizes. The prototype
+  measured this form against tabling the literal:
   - small default-config kernels went from 2 to 2.5 times the printer's solve time to
     the printer's own: softmax 4096x2048 0.39 to 0.15 s (printer 0.15 s), add_mul 0.11
     to 0.055 s, rmsnorm 0.13 to 0.065 s;
@@ -91,10 +94,11 @@ computed with numpy functions, and the code arrives in layers, each with its own
   and checks its own list, whether or not the root's value depends on it: an arm that is
   not taken raises in Stage 1 too. The owner's words (2026-11-19): "The non-finite
   should just be a check in the child node".
-- **Behaviour, not code.** The stages below say what each layer does. #6315 is cited for
-  its results only.
-- **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
-  moves, combine and compact, and the table constraint is measured against them.
+- **Behaviour, not code.** The stages below say what each layer does. The prototype is
+  cited for its results only.
+- **Free to deviate.** The forms need not be the prototype's. Every roll-up is built
+  from two moves, combine and compact, and the table constraint is measured against
+  them.
 - **A factory of nodes that realize themselves (2026-11-18).** This replaces the
   2026-11-17 design of two passes, a visitor and an emitter.
   - `TableLowering` is a factory: it makes one `Node` per distinct sympy node, children
@@ -178,16 +182,17 @@ computed with numpy functions, and the code arrives in layers, each with its own
 
   The owner asked "Do we need all the IndexMap specializations before we implement the
   optimizations?" and, given this order and `LocateIndex`'s move, said "Do that". The
-  end state is the same, so Stage 11's replay against #6315 does not change.
+  end state is the same, so Stage 11's replay against the prototype's results does not
+  change.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
-  #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
-  each rule's solve time against margin 2's: always `lin_max` 1.35 to 1.52 times
-  (slower on 39 to 43 of them); margin 1, linear whenever it has fewer entries, 0.99 on
-  average but 1.22 in total, with the GQA test at 137 s against 82 s; a table whenever
-  one fits 2.07 on the 14 objectives it changes, `main.caps/compile_0` 24 times. An
-  exact-domain `lin_max` target and `linearization_level` 2 were within run-to-run
-  noise. All reach the same optimal cost.
+  the prototype. Replayed on the prototype on the 46 objectives where the choice changes
+  the model, each rule's solve time against margin 2's: always `lin_max` 1.35 to 1.52
+  times (slower on 39 to 43 of them); margin 1, linear whenever it has fewer entries,
+  0.99 on average but 1.22 in total, with the GQA test at 137 s against 82 s; a table
+  whenever one fits 2.07 on the 14 objectives it changes, `main.caps/compile_0` 24
+  times. An exact-domain `lin_max` target and `linearization_level` 2 were within
+  run-to-run noise. All reach the same optimal cost.
 
 - **Raise when the cap is hit (2026-11-17).** With the flag on there is no fallback. An
   objective the tables cannot lower raises `TableLoweringError`, naming the node and the
@@ -197,7 +202,7 @@ computed with numpy functions, and the code arrives in layers, each with its own
   pinned out (`ilp_solver_ortools.py:886`, `:1449`). On `main` the allocator withholds
   those objectives from CP-SAT altogether. With the flag on, Stage 12 hands them over.
   `TableLoweringError` subclasses none of `RuntimeError`, `TypeError` or `ValueError`,
-  so that `except` cannot turn it into that solve. At #6315's tip all 50 replayed
+  so that `except` cannot turn it into that solve. On the prototype all 50 replayed
   objectives lower without a refusal.
 - **Copy the model, swap it back when the build fails (2026-11-17).** The entry point
   copies the model before it maps an input. When any step fails, in realizing a node or
@@ -211,10 +216,10 @@ computed with numpy functions, and the code arrives in layers, each with its own
 
 ## Estimates
 
-Measured on the 50 replayed objectives: 45 captured compiles (model blocks at the default
-config and with auto tiling, plus tests) and 5 synthetic products. Two sources: a count
-of what each top-level term of the objective reads (2026-11-16), and #6315's lowering at
-a cap of 8192 (replay of 2026-11-15).
+Measured on the 50 replayed objectives: 45 captured compiles (model blocks at the
+default config and with auto tiling, plus tests) and 5 synthetic products. Two sources:
+a count of what each top-level term of the objective reads (2026-11-16), and the
+prototype's lowering at a cap of 8192 (replay of 2026-11-15).
 
 **Cost between buffers is rare.** Of 6663 terms:
 
@@ -243,7 +248,7 @@ is never one table.
   they take a fifth to two fifths of the entries at the default config and half to seven
   tenths with auto tiling.
 
-| Objective | Divisions | Largest menu | Terms | Wide | Narrow entries (est.) | Entries, #6315 | Lower (s) | Solve (s) |
+| Objective | Divisions | Largest menu | Terms | Wide | Narrow entries (est.) | Entries, prototype | Lower (s) | Solve (s) |
 |---|---|---|---|---|---|---|---|---|
 | default, decode block | 12 | 20-26 | 165-169 | 2 | 249-318 | 396-525 | 0.61-0.68 | 0.08-0.10 |
 | default, prefill block | 14 | 55-65 | 187-189 | 1 | 1056-1217 | 1304-1535 | 0.72-0.74 | 0.40-0.50 |
@@ -544,8 +549,8 @@ Three more reductions are not in the table above:
   tuples of rungs that can occur together. This graph multiplies no Min/Max.
 
 On the model blocks, one table over the widest term alone would hold 3.6e4 to 7.5e18
-entries, and #6315's lowering of the whole objective holds 396 to 21998 (Estimates).
-Stage 11's replay reports entries per capture with each reduction.
+entries, and the prototype's lowering of the whole objective holds 396 to 21998
+(Estimates). Stage 11's replay reports entries per capture with each reduction.
 
 Two subsections below add what the graph does not show: a buffer with several symbols on
 one division, and one table over several integer variables. Every table in this section
@@ -816,7 +821,7 @@ cost.
 - Products with one factor and one set of values are one switch: factor·A + factor·B
   is factor·(A + B), their rests added before the collapse.
 
-#6315 measured this form against pushing the factor into every list of the rest
+The prototype measured this form against pushing the factor into every list of the rest
 (Decisions). Its largest error over the 50 objectives is 1.2e-7 of the cost.
 
 **Rule 5 makes the two-value case exact and smaller.** A gate is a switch on a 0/1
@@ -829,7 +834,7 @@ literal whose value at one of the literal's values is 0.
 - The rest was read with the literal fixed at the kept value, so no table reads it.
 
 Tabling a residency literal's term had made small default-config kernels solve 2 to 2.5
-times slower than the printer; the gate is #6315's answer to that (Decisions).
+times slower than the printer; the gate is the prototype's answer to that (Decisions).
 
 The *exact* tests of every stage are the check on this mapping: they solve at every
 assignment of the inputs, so an entry read from the wrong position fails.
@@ -853,7 +858,7 @@ a realization or a position step changes nothing else:
   a position, a table, a node. There is no emitter. The objective is
   `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
 
-This is how spectre-ns/torch-spyre#32 is built. The design came out of review on that
+This is how torch-spyre/torch-spyre#6475 is built. The design came out of review on that
 PR on 2026-11-18, and replaces the two passes, the visitor, the pass that marked linear
 readers, and `CpEmitter` of the earlier plan (Decisions).
 
@@ -1248,7 +1253,7 @@ then with the solver behind the flag.
 | 8 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
 | 9 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes, products included |
 | 10 | not in the stack: the table constraint, a branch that changes the `cp_expr` methods, measured by Stage 11's replay | the same plans, as table constraints |
-| 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
+| 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against the prototype's results |
 | 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
 
 **At the start, real objectives do not lower.** Stage 1 makes one table per node, so the
@@ -1261,8 +1266,8 @@ both kinds of term and needs only Stage 3: it takes the literals out of the narr
 terms' tables, so a narrow term costs its menu, not its menu times two for each literal,
 and it splits the wide products. Stage 5 gates the literals. Stages 6 to 9 are for what
 is left of the 1 to 4 wide terms: a Min/Max, and a node read as a table. Real objectives
-are first lowered end to end at Stage 11, which maps the printer's inputs; at #6315's
-tip, with its gate and four rules, all 50 lower.
+are first lowered end to end at Stage 11, which maps the printer's inputs; on the
+prototype, with its gate and four rules, all 50 lower.
 
 **On the graph of "The process, step by step"**, term by term, after each stage that
 changes it. Each cell is entries at its own menus · at the real menus of "On real
@@ -1304,11 +1309,12 @@ determined, total and correct.
 
 ### Stage 1: the base mechanics
 
-Built: spectre-ns/torch-spyre#32. Inputs and an expression in, a CP-SAT objective out,
-with no optimization: `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The
-inputs are each symbol's variable and its value at each of the variable's values; tests
-make them by hand, as in Architecture. Every value is computed by `sympy.lambdify`;
-numpy steps come in Stage 2.
+Built: torch-spyre/torch-spyre#6475, first reviewed as spectre-ns/torch-spyre#32. Inputs
+and an expression in, a CP-SAT objective out, with no optimization:
+`TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The inputs are each
+symbol's variable and its value at each of the variable's values; tests make them by
+hand, as in Architecture. Every value is computed by `sympy.lambdify`; numpy steps come
+in Stage 2.
 
 **Values by lambdify.** `values_on_grid(expr, columns, positions)` lambdifies `expr`
 over its free symbols with the `numpy` module and evaluates it at every joint assignment
@@ -1562,11 +1568,12 @@ reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
   cap has no switch.
 
 The error: a whole value scales its rest's bound, and a fraction adds under one unit
-plus `|w| / (2q)` ("Collapsing float lists into linear terms"). This is the form #6315
-settled on (Decisions). Pushing the factor into every list instead held 45k of the 80k
-entries on the 14B and 24B auto-tiling prefill objectives and took 26 to 27 s. The
-switch took 5.9 and 5.2 s, and the whole replay 144.6 s against 443.8 s, with the largest
-error 1.2e-7 of the cost. Stage 11's replay compares against #6315's tip.
+plus `|w| / (2q)` ("Collapsing float lists into linear terms"). This is the form the
+prototype settled on (Decisions). Pushing the factor into every list instead held 45k of
+the 80k entries on the 14B and 24B auto-tiling prefill objectives and took 26 to 27 s.
+The switch took 5.9 and 5.2 s, and the whole replay 144.6 s against 443.8 s, with the
+largest error 1.2e-7 of the cost. Stage 11's replay compares against the prototype's
+results.
 
 On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, the
 switch is 5 entries against the table's 6 at its own menus, and 38 against 231 at the
@@ -1643,10 +1650,10 @@ one table over its literal and its division, twice the menu, its off half zeros.
   than one is left. A gate inside the rest of another switch is one more term there, and
   so, from Stage 9, is a gate inside an operand of a Min/Max kept linear.
 
-#6315 measured this form against tabling the literal (Decisions). Small default-config
-kernels went from 2 to 2.5 times the printer's solve time to the printer's own. Once a
-gate in any form was recognised, the GQA test went from 306,811 entries to 115,667.
-Stage 11's replay reports entries with this stage on and off.
+The prototype measured this form against tabling the literal (Decisions). Small
+default-config kernels went from 2 to 2.5 times the printer's solve time to the
+printer's own. Once a gate in any form was recognised, the GQA test went from 306,811
+entries to 115,667. Stage 11's replay reports entries with this stage on and off.
 
 After this stage no table reads a gating literal, and a gate's fractional coefficient
 is exact. A term on one menu whose k literals all gate it is one list under k gates.
@@ -1894,36 +1901,36 @@ Each PR:
 
 After Stage 11, posted on that PR, with the replay calling `lower_cost_with_tables`:
 
-1. **Same results as #6315.** Replay the 50 captured objectives
-   (`~/pr6301-review/replay.py`, #6315's results in `~/pr6301-review/tableonly/`). Every
-   capture is `OPTIMAL` at the exact cost #6315 reaches, and no objective is further from
-   exact than 1.2e-7. A different plan at that cost is a tie. None may raise
-   `TableLoweringError`.
+1. **Same results as the prototype.** Replay the 50 captured objectives
+   (`~/pr6301-review/replay.py`, the prototype's results in
+   `~/pr6301-review/tableonly/`). Every capture is `OPTIMAL` at the exact cost the
+   prototype reaches, and no objective is further from exact than 1.2e-7. A different
+   plan at that cost is a tie. None may raise `TableLoweringError`.
 2. **Size and time, reported.** Entries, largest table, lowering time and solve time per
    capture, beside the table in Estimates, for the stack and for Stage 10's branch.
    Entries also with each stage's optimization turned off alone. A capture with more
-   entries or a slower solve than #6315 is explained in the PR.
-3. **The switch and the gate against #6315.** Lowering and solve time of the 14B and
-   24B auto-tiling prefill objectives (847607 captures): 3.28 and 3.12 s at #6315's tip,
-   5.94 and 5.24 s when it first switched. Entries and solve time of the default-config
-   objectives with Stage 5's gate on and off: #6315's gate brought the small kernels
-   whose terms it gates to the printer's solve time (softmax 4096x2048 0.15 s, add_mul
-   0.055 s, rmsnorm 0.065 s).
+   entries or a slower solve than the prototype is explained in the PR.
+3. **The switch and the gate against the prototype.** Lowering and solve time of the 14B
+   and 24B auto-tiling prefill objectives (847607 captures): 3.28 and 3.12 s on the
+   prototype, 5.94 and 5.24 s when it first switched. Entries and solve time of the
+   default-config objectives with Stage 5's gate on and off: the prototype's gate
+   brought the small kernels whose terms it gates to the printer's solve time (softmax
+   4096x2048 0.15 s, add_mul 0.055 s, rmsnorm 0.065 s).
 
 After Stage 12, posted on that PR:
 
 4. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`, once as they are and
    once with `AUTO_COARSE_TILING=1`, which now gives CP-SAT the cost expression:
    `test_scratchpad_solver.py`, `test_scratchpad_use.py`,
-   `test_cost_model_replication.py` and `test_solver_relayout_decision.py`. #6315's CI
-   ran every shard with the tables on the default path and all passed; its one red job
-   was a card fault (`DdrInitRetryLimitExceeded`). No suite may raise
+   `test_cost_model_replication.py` and `test_solver_relayout_decision.py`. The
+   prototype's CI ran every shard with the tables on the default path and all passed;
+   its one red job was a card fault (`DdrInitRetryLimitExceeded`). No suite may raise
    `TableLoweringError`: a refusal fails the run, since with the flag on it fails a
    compile.
 5. **Flag off.** The same suites with no flag, unchanged.
 
 ## Next step
 
-Stage 1 is built: spectre-ns/torch-spyre#32, branch
+Stage 1 is built: torch-spyre/torch-spyre#6475, from the fork's branch
 `table-lowering-1-base-experimental`, 33 device-free tests, with the design of
-Architecture. Stage 2 stacks on it in the fork.
+Architecture. Stage 2 stacks on that branch in the fork.
