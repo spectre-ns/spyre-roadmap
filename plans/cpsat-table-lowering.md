@@ -1326,10 +1326,10 @@ determined, total and correct.
 
 Merged: torch-spyre/torch-spyre#6475 (290b5e0f, 2026-11-19), first reviewed as
 spectre-ns/torch-spyre#32. Inputs and an expression in, a CP-SAT objective out, with no
-optimization: `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The inputs are each
-symbol's variable and its value at each of the variable's values; tests make them by
-hand, as in Architecture. Every value is computed by `sympy.lambdify`; numpy steps come
-in Stage 2.
+optimization: `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The inputs
+are each symbol's variable and its value at each of the variable's values; tests make
+them by hand, as in Architecture. Every value is computed by `sympy.lambdify`; numpy
+steps come in Stage 2.
 
 **Values by lambdify.** `values_on_grid(expr, columns, positions)` lambdifies `expr`
 over its free symbols with the `numpy` module and evaluates it at every joint assignment
