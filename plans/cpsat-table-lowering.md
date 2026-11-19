@@ -2,7 +2,7 @@
 
 Reference results: an earlier prototype of this lowering, called *the prototype* below,
 measured on 50 replayed objectives. Its results are kept in
-`~/pr6301-review/tableonly/`, and Stage 12's replay compares against them. The prototype
+`~/pr6301-review/tableonly/`, and Stage 13's replay compares against them. The prototype
 is cited for its results only. Code base: torch-spyre `cab4721d`. Line numbers are at
 that commit.
 
@@ -24,10 +24,19 @@ layers, each with its own tests.
 ## Decisions (2026-11-16)
 
 - **lambdify first, then numpy from a dict (2026-11-17).** Stage 1 computes every value
-  with `sympy.lambdify`. Stage 3 adds numpy steps from a dict keyed by sympy class, and
+  with `sympy.lambdify`. Stage 4 adds numpy steps from a dict keyed by sympy class, and
   a class the dict does not hold stays on lambdify. There is no generic lookup of numpy
   functions by name. This replaces the 2026-11-16 decision, numpy first by name with
   lambdify as the backup.
+- **Caching first, then numpy (2026-11-19).** Stage 1 realizes each node once, but a
+  parent never reads its children's tables: it lambdifies its whole expression over its
+  inputs, so each operation runs again in every ancestor, and each node pays for its own
+  lambdify. Stage 3 keeps what is computed: a node's list is its own operation on its
+  operands' lists, and lambdify runs once per class. The numpy steps follow as Stage 4,
+  in place of those functions. The owner asked why the numpy steps were "so much more
+  complex than lambdify", and on the measurements (Stage 3) said "Lets defer conversion
+  to numpy", then "Ok let move this caching to a new stage. The caching comes first."
+  Every later stage is one later.
 - **A stack of PRs**, one per stage, each on the one before, from branches in the fork.
   Stage 1 is torch-spyre/torch-spyre#6475, from the fork's
   `table-lowering-1-base-experimental` on torch-spyre `main` of 2026-11-17 (92582da3).
@@ -44,27 +53,27 @@ layers, each with its own tests.
   - Stage 2: the tests move from `tests/inductor/` to `tests/`.
     `tests/inductor/conftest.py` allocates on a Spyre device for every session, so a
     device-free test there cannot run without a device.
-  - Stage 13: the table module guards its ortools import as the printer does. The review
+  - Stage 14: the table module guards its ortools import as the printer does. The review
     asks this of the stage that wires the module into the solver, which it numbers 11,
     counting the switch and the gate as one stage and with no stage of tests. Here that
-    stage is 13; until then nothing imports the module.
+    stage is 14; until then nothing imports the module.
 - **Stage 2 is synthetic examples of the later optimizations, as strict xfails
   (2026-11-19).** Stage 2 adds no code to the module. It adds one synthetic objective
-  per optimization of Stages 4 to 10, each one table past its cap, which no stage before
+  per optimization of Stages 5 to 11, each one table past its cap, which no stage before
   its own can lower and that stage's optimization can, plus a trivial example that
   lowers today so the check runs end to end. Each is marked `xfail` with `strict=True`
   until its stage, which drops the mark, so the marks show what each stage adds. The
   owner moved away from modelling real blocks ("we would need the whole cost model to do
   this right"), after a captured fixture, the real blocks compiled on the device, and
   the blocks' shapes written in sympy. The tests were first planned with the numpy
-  steps; the owner made them Stage 2, ahead of every optimization, so the numpy steps
-  are Stage 3 and every later stage is one later.
-- **Off by default.** Stages 1 to 12 add files nothing imports. Stage 13 adds the flag.
+  steps; the owner made them Stage 2, ahead of every optimization, and every later
+  stage moved one later.
+- **Off by default.** Stages 1 to 13 add files nothing imports. Stage 14 adds the flag.
 - **Base mechanics first, then one optimization per stage, integration last
   (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
   node, and cannot lower a real objective: its one table would hold 10^13.4 to 10^401
-  entries. Stage 2 adds tests only (2026-11-19). Stages 3 to 10 each add one
-  optimization, and Stage 11 is an experiment off the stack. Stages 12 and 13 integrate
+  entries. Stage 2 adds tests only (2026-11-19). Stages 3 to 11 each add one
+  optimization, and Stage 12 is an experiment off the stack. Stages 13 and 14 integrate
   with the printer's maps and then with the solver.
 - **Rule 4 as a switch on the collapsed rest (2026-11-18).** A Mul is linear in its
   children only when its other factors are constants. Any other product is a switch.
@@ -97,7 +106,7 @@ layers, each with its own tests.
   - Its rest's entries count once; a relayout charge's table over the literal and the
     division held them twice, its off half zeros.
 
-  This is rule 5, built in Stage 6, right after the switch it optimizes. The prototype
+  This is rule 5, built in Stage 7, right after the switch it optimizes. The prototype
   measured this form against tabling the literal:
   - small default-config kernels went from 2 to 2.5 times the printer's solve time to
     the printer's own: softmax 4096x2048 0.39 to 0.15 s (printer 0.15 s), add_mul 0.11
@@ -144,7 +153,7 @@ layers, each with its own tests.
     ranked product in 68 entries, the Max by rung in 63
     (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/merged/`). One thing is given up: a part
     reached twice in one build is built twice, where `IndexMap`'s walk built it once.
-    That is free while no step writes the model, and Stage 5 builds positions once.
+    That is free while no step writes the model, and Stage 6 builds positions once.
   - Each kind of node, realization and position step is a thin subclass of a small
     interface, so an operation, a realization or a step is added without changing the
     others. Changing how something is emitted means changing its class's `cp_expr`.
@@ -175,18 +184,19 @@ layers, each with its own tests.
   the owner has not named them one by one: `LinearRealization`, `AddNode`, `MulNode`,
   `ExtremeNode`, `CompactIndex`, `ExtremeIndex` and `LocateIndex`.
 - **The switch and the gate right after the linear sums (2026-11-18).** The order is 1
-  base, 2 the synthetic examples (from 2026-11-19), 3 numpy, 4 linear sums, 5 the
-  switch, 6 the gate, 7 ranks and pairs, 8 rungs, 9 the fold, 10 `lin_max`. Before
+  base, 2 the synthetic examples (from 2026-11-19), 3 caching (from 2026-11-19), 4
+  numpy, 5 linear sums, 6 the switch, 7 the gate, 8 ranks and pairs, 9 rungs, 10 the
+  fold, 11 `lin_max`. Before
   2026-11-18 ranks, rungs, the fold and `lin_max` came before the switch and the gate.
-  - The switch needs only Stage 4: its rest is a realization Stage 4 makes, a table or a
+  - The switch needs only Stage 5: its rest is a realization Stage 5 makes, a table or a
     `LinearRealization`. It brings `CompactIndex` and the choice between ways by entries
-    (rule 3), which Stage 7 extends.
+    (rule 3), which Stage 8 extends.
   - It serves both kinds of term: it takes the literals out of the narrow terms' tables
     and splits the wide products. On the step-by-step graph's product it is 38 entries
     against 68 as a pair at the real menus.
   - Each `Index` step lands with the stage that first uses it: `InputIndex`, `UnitIndex`
-    and `CombineIndex` in Stage 1, `CompactIndex` in 4, `ExtremeIndex` in 7,
-    `LocateIndex` in 11. `LocateIndex` left #32 because no replayed objective needs it:
+    and `CombineIndex` in Stage 1, `CompactIndex` in 6, `ExtremeIndex` in 9,
+    `LocateIndex` in 13. `LocateIndex` left #32 because no replayed objective needs it:
     none of the 4,159 non-buffer variables the 50 replayed objectives read has a domain
     with gaps (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/locate/`).
   - An `InputNode` makes its own `InputIndex` (2026-11-19, 9a5f45ab). The caller hands
@@ -202,13 +212,14 @@ layers, each with its own tests.
     entry count (`entries`, with `parts` and `under()` to walk an index),
     `TableRealization.entries`, and `positions`, the numpy side of a position. Stage 1
     asks an index for its size and its `cp_expr`, and the cap bounds the length of one
-    table's list. The entry counts come back in Stage 5, with the first step that has a
+    table's list. The entry counts come back in Stage 6, with the first step that has a
     lookup of its own. `positions` comes back with the first stage whose code reads a
-    position in numpy. Asked whether to move them out as well, the owner said "Yes".
+    position in numpy: Stage 3, as `Index.on_grid` (2026-11-19). Asked whether to move
+    them out as well, the owner said "Yes".
 
   The owner asked "Do we need all the IndexMap specializations before we implement the
   optimizations?" and, given this order and `LocateIndex`'s move, said "Do that". The
-  end state is the same, so Stage 12's replay against the prototype's results does not
+  end state is the same, so Stage 13's replay against the prototype's results does not
   change.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
@@ -226,7 +237,7 @@ layers, each with its own tests.
   every auto-tiling objective (`calling ** on a linear expression`), and when it fails,
   `main` solves a traffic objective that ignores the cost model with every relayout copy
   pinned out (`ilp_solver_ortools.py:886`, `:1449`). On `main` the allocator withholds
-  those objectives from CP-SAT altogether. With the flag on, Stage 13 hands them over.
+  those objectives from CP-SAT altogether. With the flag on, Stage 14 hands them over.
   `TableLoweringError` subclasses none of `RuntimeError`, `TypeError` or `ValueError`,
   so that `except` cannot turn it into that solve. On the prototype all 50 replayed
   objectives lower without a refusal.
@@ -236,7 +247,7 @@ layers, each with its own tests.
   original exception when that was of another type. So the model is as it was whenever
   the lowering raises, even when the failure comes after variables were made, as an
   entry past 2^50 does. And `TableLoweringError` is the only exception the lowering lets
-  out: a `ValueError` out of numpy, or Stage 3's `NotImplementedError`, which is a
+  out: a `ValueError` out of numpy, or Stage 4's `NotImplementedError`, which is a
   `RuntimeError`, cannot reach that `except` and become the traffic solve. On the 50
   replayed models the copy takes 0.2 to 9 ms.
 
@@ -284,31 +295,32 @@ is never one table.
 | prefill batch GQA test | 91 | 662 | 401 | 3 | 58399 | 115667 | 5.94 | 13.49 |
 
 The narrow estimate is one list per division and literal, sized by the menu: the form of
-rule 4's switch, which collapses a literal term's rest once, from Stage 5. Before it a
-literal's term is one table over the literal and the division (Stage 4): twice that,
+rule 4's switch, which collapses a literal term's rest once, from Stage 6. Before it a
+literal's term is one table over the literal and the division (Stage 5): twice that,
 its off half zeros. The estimate ignores lists that turn out affine and cost nothing.
 
 **What it says about the stages.**
 
 - Stage 1, one table per node, lowers none of the 50 objectives: the root's table is
   over every input, 10^13.4 to 10^401 entries.
-- Stage 4, linear sums, lowers 6465 of the 6521 narrow terms as one table each; the
+- Stage 5, linear sums, lowers 6465 of the 6521 narrow terms as one table each; the
   other 56 read four or more literals. It lowers none of the 50 objectives end to end:
   each has at least one term whose inputs pass the cap, and the lowering is all or
   nothing.
-- On the wide terms, entry count is decided in Stages 5 and 7 to 10, on 1 to 4 terms per
+- On the wide terms, entry count is decided in Stages 6 and 8 to 11, on 1 to 4 terms per
   objective.
-- Stage 5, the switch, takes the literals out of the narrow terms' tables: a literal's
+- Stage 6, the switch, takes the literals out of the narrow terms' tables: a literal's
   term is its rest collapsed once, sized by its menu alone, as the estimate counts it. A
-  term on one menu with k literals is one list under k switches, where Stage 4 made one
-  table of 2^k times the menu. Until Stage 5 the narrow entries are about twice the
-  estimate. Stage 6's gate then drops the literal from the rest and makes a fractional
+  term on one menu with k literals is one list under k switches, where Stage 5 made one
+  table of 2^k times the menu. Until Stage 6 the narrow entries are about twice the
+  estimate. Stage 7's gate then drops the literal from the rest and makes a fractional
   coefficient exact. How many of the 56 the switch brings under the cap is reported by
-  Stage 12's replay.
+  Stage 13's replay.
 - Lowering time matters most where the model is smallest. At the default config a decode
-  block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. How much of that the
-  numpy steps of Stage 3 save over Stage 1's lambdify is not measured, and Stage 12's
-  replay reports it.
+  block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. Stage 3's caching
+  lowers a 600-node expression in 0.060 s, 0.023 s once its functions are kept, against
+  0.198 s for Stage 1. What it and the numpy steps of Stage 4 save on the decode blocks
+  is reported by Stage 13's replay.
 
 ## How a table is read
 
@@ -568,7 +580,7 @@ Three more reductions are not in the table above:
 - **The switch (rule 4)** reads a product by collapsing its rest once into an integer
   and multiplying that by each of the factor's values, one enforced constraint per
   value. It applies to this graph's product: 38 entries against the ranks' 36 + 21 +
-  11 = 68, so with it the built-up total is 122 (Stage 5).
+  11 = 68, so with it the built-up total is 122 (Stage 6).
 - **The gate (rule 5)** is the switch on a 0/1 literal. Its rest's entries count once,
   and no table reads the literal. This graph reads no literal.
 - **The fold (rule 2)** reads a product of Min/Max factors over shared inputs by the
@@ -576,7 +588,7 @@ Three more reductions are not in the table above:
 
 On the model blocks, one table over the widest term alone would hold 3.6e4 to 7.5e18
 entries, and the prototype's lowering of the whole objective holds 396 to 21998
-(Estimates). Stage 12's replay reports entries per capture with each reduction.
+(Estimates). Stage 13's replay reports entries per capture with each reduction.
 
 Two subsections below add what the graph does not show: a buffer with several symbols on
 one division, and one table over several integer variables. Every table in this section
@@ -622,7 +634,7 @@ flowchart LR
 ```
 
 - **Offset.** A variable in `lo..hi` has the position `var - lo`. A domain with gaps
-  gets its position from a lookup, `LocateIndex` (Stage 12).
+  gets its position from a lookup, `LocateIndex` (Stage 13).
 - **Stride.** A position is multiplied by the product of the sizes of the variables
   after it: 2 * 3 = 6 for `x`, 3 for `y`, 1 for `z`.
 - **Linear.** The strides are constants, so the index is a linear expression: no two
@@ -687,7 +699,7 @@ The only lookup is `add_element(index, table, target)`, which enforces
 - Any other integer variable has its domain's values, ascending. Its index is `var - lo`
   when the domain has no gaps. With gaps it is a position `pos` under `add_element(pos,
   domain_values, var)`; the values are distinct, so one position fits. That lookup is
-  `LocateIndex`, from Stage 12: no replayed objective reads such a variable.
+  `LocateIndex`, from Stage 13: no replayed objective reads such a variable.
 
 **Each way a list is made.** Lists are built from the leaves of the expression upward: a
 node's list is made from its arguments' lists.
@@ -745,9 +757,9 @@ lookups, the max, the factor's rank and the cost lookup, with two:
 Both forms were run on the roll-up and agree at all 24 assignments. Which solves faster
 on real objectives is not measured. There is no emitter to swap (Architecture), so the
 table constraint is built by changing the `cp_expr` of the classes it replaces, on a
-branch that Stage 12's replay runs beside the stack (Stage 11). The plan is the same.
+branch that Stage 13's replay runs beside the stack (Stage 12). The plan is the same.
 Where the stack builds a position from two others by compacts and a combine, that branch
-lists the rows, read off `Index.positions`, and where a cost is read on such a position
+lists the rows, read off `Index.on_grid`, and where a cost is read on such a position
 it puts the rounded cost in the rows as `out`.
 
 Its rows are not the entries of the links they replace. A table constraint lists every
@@ -759,7 +771,7 @@ have 13. For the graph's Max over three divisions it is 24 rows against 9, and a
 real menus of "On real menus" 4620 against 52. So the table constraint pays only on a
 link whose columns' product is small, and it would give back rule 1 if it took in a
 Min/Max's operands. Which links it takes in, and how its rows count against the cap,
-are settled in Stage 11. The default is combine and compact, and Stage 12's replay
+are settled in Stage 12. The default is combine and compact, and Stage 13's replay
 reports both.
 
 **What the chain must guarantee.** Let D be the decision variables a term reads.
@@ -873,7 +885,7 @@ a realization or a position step changes nothing else:
 - **Values.** A *position* is an `Index`: one step that holds its parts (`InputIndex`,
   `UnitIndex`, `CombineIndex`; later `CompactIndex`, `ExtremeIndex` and `LocateIndex`).
   A *realization* is what a node is realized as, an `AbstractRealization`: a
-  `TableRealization` (a float list on a position) and, from Stage 4, a
+  `TableRealization` (a float list on a position) and, from Stage 5, a
   `LinearRealization`. Values hold no model.
 - **Nodes.** `TableLowering` is a factory. It makes one `Node` per distinct sympy node,
   of the class the node's sympy class calls for, and hands it what it reads. An
@@ -924,8 +936,8 @@ class Index(ABC):
     """A position: from the inputs' values to 0 .. size - 1, as a CP-SAT expression.
     Each kind of step is a subclass that holds its parts as its own fields, so a step
     depends on Index alone. InputIndex, UnitIndex and CombineIndex are its subclasses
-    in Stage 1; CompactIndex (Stage 5), ExtremeIndex (Stage 8) and LocateIndex (Stage
-    12) join them. Steps are frozen dataclasses: equal positions compare equal and hash
+    in Stage 1; CompactIndex (Stage 6), ExtremeIndex (Stage 9) and LocateIndex (Stage
+    13) join them. Steps are frozen dataclasses: equal positions compare equal and hash
     alike."""
 
     size: int  # a field of each step, given or computed from its parts
@@ -933,6 +945,11 @@ class Index(ABC):
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The position in model, from its parts' cp_expr."""
+
+    @abstractmethod
+    def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
+        """From Stage 3: the position at every point of a grid of input positions, from
+        its parts' on_grid. What cp_expr builds, computed."""
 
 
 @dataclass(frozen=True)
@@ -967,7 +984,7 @@ class CombineIndex(Index):
 
 class AbstractRealization(ABC):
     """What a node is realized as: the one thing a reader and the objective take of
-    it. A value that builds its own CP-SAT side: a TableRealization, and from Stage 4
+    it. A value that builds its own CP-SAT side: a TableRealization, and from Stage 5
     a LinearRealization, what a sum is realized as."""
 
     @abstractmethod
@@ -1068,7 +1085,7 @@ class TableLowering:
         sympy.postorder_traversal with its repeats dropped; no ExprCondPair."""
 
 
-# ------------------------------------------------------------------- from Stage 4 on
+# ------------------------------------------------------------------- from Stage 5 on
 
 
 @dataclass(frozen=True, eq=False)
@@ -1091,7 +1108,7 @@ class AddNode(Node):
         """LinearRealization of its children's realizations."""
 
 
-# ------------------------------------------------------------------ from Stage 12 on
+# ------------------------------------------------------------------ from Stage 13 on
 
 
 def inputs_from_maps(
@@ -1126,7 +1143,7 @@ parents hold:
   It makes its own position, an `InputIndex` on the variable.
 - A node with no free symbol becomes a `ConstantNode`: a number, `true`/`false`, or an
   operation on numbers such as `sqrt(2)`.
-- Any other node becomes a `Node`. From Stage 4, `Add` becomes `AddNode`, and each later
+- Any other node becomes a `Node`. From Stage 5, `Add` becomes `AddNode`, and each later
   operation gets its class the same way.
 
 `lower` returns the root's node and realizes nothing. On the 50 replayed objectives
@@ -1138,8 +1155,10 @@ them. A node nobody reads is never realized, and `lower` reads none. Realizing a
 reads its children's realizations first, so reading the root realizes every node under
 it, each once, as deep as the expression (6 to 17 on the replay). Each node checks its
 own list as it is realized, which is how a value that is not finite is refused at the
-node that makes it (Decisions). In Stage 1 that lambdifies every node, as the visitor of
-the earlier plan did, and Stage 3 replaces most of those calls with numpy steps. A node
+node that makes it (Decisions). In Stage 1 that lambdifies every node over its inputs,
+as the visitor of the earlier plan did. From Stage 3 a node's list is its own operation
+on its children's lists, lambdified once per class, and Stage 4 replaces most of those
+functions with numpy steps. A node
 past the cap raises before it reads a child, so nothing under it is evaluated.
 
 On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, Stage 1
@@ -1171,7 +1190,7 @@ and it has no realization:
 - a symbol with no input, raised by name when a parent reads its columns;
 - an input the symbol's node cannot make a position on, raised the same way: a variable
   that is not an `IntVar` (a negated literal), a variable whose domain has gaps (until
-  `LocateIndex` in Stage 12), or values that are not one number per value of the
+  `LocateIndex` in Stage 13), or values that are not one number per value of the
   variable;
 - one table past the cap, which is never evaluated;
 - a value that is not finite (`Node._finite`, wherever a table is realized), at the node
@@ -1192,12 +1211,12 @@ was built, and the entry point's copy and swap back (Decisions) restores the mod
 constant; otherwise one `add_element` on its position) and `Node.cp_expr` a node's
 realization. Only `cp_expr` methods touch the model. In Stage 1 each call builds anew,
 and a part reached twice is built twice: enough while only the root is built and no step
-writes the model. Stage 4 builds a node once and Stage 5 a position once, through one
+writes the model. Stage 5 builds a node once and Stage 6 a position once, through one
 memo per build.
 
 **The copy.** `lower_cost_with_tables` copies the model with `model.clone()` before it
 maps an input. A failure in the build can come after variables were made: an entry past
-2^50 is found only at the rounding, and from Stage 4 a term can refuse after another was
+2^50 is found only at the rounding, and from Stage 5 a term can refuse after another was
 built. So on any failure the entry point swaps the copy back,
 `model.proto.copy_from(copy.proto)` then `model.rebuild_constant_map()`, and the
 caller's variables stay valid. Without the second call, a constant made during the
@@ -1225,20 +1244,21 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 
 | Stage | Hook |
 |---|---|
-| 3 | a node's numpy step on its children's lists, where they share a position |
-| 4 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
-| 5 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
-| 6 | the gate, and `RelayoutCharge` as its own node |
-| 7 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 7 decides whether a node keeps its two best tables for its reader |
-| 8 | the `ExtremeIndex` step; a Min/Max node with its ladder |
-| 9 | the fold, one more way to realize a product |
-| 10 | the `lin_max`/`lin_min` realization, with its entry count for margin 2 |
-| 12 | the `LocateIndex` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
+| 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified once per class and form of operands, applied to its operands' lists |
+| 4 | a node's numpy step in place of its lambdified function |
+| 5 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
+| 6 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
+| 7 | the gate, and `RelayoutCharge` as its own node |
+| 8 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 8 decides whether a node keeps its two best tables for its reader |
+| 9 | the `ExtremeIndex` step; a Min/Max node with its ladder |
+| 10 | the fold, one more way to realize a product |
+| 11 | the `lin_max`/`lin_min` realization, with its entry count for margin 2 |
+| 13 | the `LocateIndex` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
 
-Not placed in a stage: `Index.positions`, the numpy side of a position. Stage 11's rows
-read it, and it comes with the first stage whose code calls it.
+`Index.positions`, the numpy side of a position, held back from Stage 1, is Stage 3's
+`Index.on_grid`. Stage 12's rows read it too.
 
-Open in Stage 4: whether terms of one sum that are tables on equal positions are added
+Open in Stage 5: whether terms of one sum that are tables on equal positions are added
 before the rounding, one lookup and one rounding (`split ** 0.5 + split ** 0.7` is 3112
 at split 2, against 1448 + 1663 = 3111), or kept apart.
 
@@ -1247,18 +1267,19 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 | Stage | Adds to the architecture |
 |---|---|
 | 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
-| 2 | nothing in the module: synthetic examples of Stages 4 to 10 as strict xfails, and a trivial one that lowers; Stage 1's tests moved to `tests/` and skipped without ortools |
-| 3 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists |
-| 4 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
-| 5 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
-| 6 | the gate, and `RelayoutCharge` as its own node |
-| 7 | a node realized from its parts: ranks and pairs |
-| 8 | Min/Max nodes realized by rung: `ExtremeIndex`, ladders, rungs, clamping |
-| 9 | a product realized by fold |
-| 10 | the linear realization of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
-| 11 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
-| 12 | `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
-| 13 | in the module, only its ortools import, guarded as the printer's is; outside it, the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
+| 2 | nothing in the module: synthetic examples of Stages 5 to 11 as strict xfails, and a trivial one that lowers; Stage 1's tests moved to `tests/` and skipped without ortools |
+| 3 | `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' lists (`Node.operands`), a Mul dividing by the base of a factor with a negative rational exponent; `values_on_grid` goes |
+| 4 | the dict of numpy steps, applied in place of a node's lambdified function |
+| 5 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
+| 6 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
+| 7 | the gate, and `RelayoutCharge` as its own node |
+| 8 | a node realized from its parts: ranks and pairs |
+| 9 | Min/Max nodes realized by rung: `ExtremeIndex`, ladders, rungs, clamping |
+| 10 | a product realized by fold |
+| 11 | the linear realization of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
+| 12 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
+| 13 | `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
+| 14 | in the module, only its ortools import, guarded as the printer's is; outside it, the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
 
@@ -1267,38 +1288,39 @@ one before, or on `main` once the one before has merged; Stage 1's was
 `table-lowering-1-base-experimental`, and the `-experimental` suffix is no longer needed
 (owner, 2026-11-19). Stage 1 builds the mechanics that lower an expression from its
 inputs, naively, by lambdify. Stage 2 adds tests only: a synthetic example per later
-optimization, each marked `xfail` until its stage. Stages 3 to 10 each add one
-optimization, and Stage 11 is an experiment off the stack. Stages 12 and 13 integrate:
+optimization, each marked `xfail` until its stage. Stages 3 to 11 each add one
+optimization, and Stage 12 is an experiment off the stack. Stages 13 and 14 integrate:
 first with the printer's maps, then with the solver behind the flag. A stage that lowers
-an example removes its `xfail` mark, and none is left after Stage 10.
+an example removes its `xfail` mark, and none is left after Stage 11.
 
 | # | PR adds | What it lowers |
 |---|---|---|
 | 1 | the base mechanics: inputs and an expression to a CP-SAT objective, one table per node, every value by lambdify | an expression whose inputs fit the cap together; no real objective |
 | 2 | synthetic examples of the later optimizations as strict xfails; Stage 1's tests out of `tests/inductor/`, skipped where ortools is not installed | the same as Stage 1; each example raises until its stage, and its test says so |
-| 3 | numpy steps from a dict, lambdify for any class it does not hold | the same as Stage 1, in less lowering time |
-| 4 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
-| 5 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `CompactIndex` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
-| 6 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
-| 7 | ranks and pairs: a node's table from its parts | nodes over several buffers read as tables: products under a power, a log or a Piecewise, short lists over several buffers |
-| 8 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
-| 9 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
-| 10 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes, products included |
-| 11 | not in the stack: the table constraint, a branch that changes the `cp_expr` methods, measured by Stage 12's replay | the same plans, as table constraints |
-| 12 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against the prototype's results |
-| 13 | integration with the solver: the module importable without ortools, `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
+| 3 | caching: each node's list from its operands' lists, its class lambdified once | the same as Stage 1, in less lowering time |
+| 4 | numpy steps from a dict, the lambdified function for any class it does not hold | the same as Stage 3 |
+| 5 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
+| 6 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `CompactIndex` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
+| 7 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
+| 8 | ranks and pairs: a node's table from its parts | nodes over several buffers read as tables: products under a power, a log or a Piecewise, short lists over several buffers |
+| 9 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
+| 10 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
+| 11 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes, products included |
+| 12 | not in the stack: the table constraint, a branch that changes the `cp_expr` methods, measured by Stage 13's replay | the same plans, as table constraints |
+| 13 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against the prototype's results |
+| 14 | integration with the solver: the module importable without ortools, `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
 
 **At the start, real objectives do not lower.** Stage 1 makes one table per node, so the
 root's table is over every input the objective reads. On the 50 replayed objectives that
 is 14 to 544 inputs and 10^13.4 to 10^401 entries, and 10^29.5 to 10^60.5 on the default
-and auto-tiling model blocks, against a cap of 8192. Stage 4 keeps the sum linear, which
+and auto-tiling model blocks, against a cap of 8192. Stage 5 keeps the sum linear, which
 lowers 6465 of the 6521 narrow terms as one table each, but each objective still has a
-wide term past the cap (Estimates). The switch comes next, in Stage 5, because it serves
-both kinds of term and needs only Stage 4: it takes the literals out of the narrow
+wide term past the cap (Estimates). The switch comes next, in Stage 6, because it serves
+both kinds of term and needs only Stage 5: it takes the literals out of the narrow
 terms' tables, so a narrow term costs its menu, not its menu times two for each literal,
-and it splits the wide products. Stage 6 gates the literals. Stages 7 to 10 are for what
+and it splits the wide products. Stage 7 gates the literals. Stages 8 to 11 are for what
 is left of the 1 to 4 wide terms: a Min/Max, and a node read as a table. Real objectives
-are first lowered end to end at Stage 12, which maps the printer's inputs; on the
+are first lowered end to end at Stage 13, which maps the printer's inputs; on the
 prototype, with its gate and four rules, all 50 lower.
 
 **On the graph of "The process, step by step"**, term by term, after each stage that
@@ -1308,23 +1330,23 @@ menus"; an empty cell is unchanged:
 | After stage | Two terms on `split_a` | The product | The Max | Entries |
 |---|---|---|---|---|
 | 1 | one table over the root | | | 24 · 4620 |
-| 4 | 3 · 21, one list | 6 · 231, one table | 24 · 4620, one table | 33 · 4872 |
-| 5 | | 5 · 38, the switch | | 32 · 4679 |
-| 7 | | 5 · 38, the switch; 6 · 68 as a pair | 22 · 268, from ranked parts | 30 · 327 |
-| 8 | | | 14 · 63, by rung | 22 · 122 |
+| 5 | 3 · 21, one list | 6 · 231, one table | 24 · 4620, one table | 33 · 4872 |
+| 6 | | 5 · 38, the switch | | 32 · 4679 |
+| 8 | | 5 · 38, the switch; 6 · 68 as a pair | 22 · 268, from ranked parts | 30 · 327 |
+| 9 | | | 14 · 63, by rung | 22 · 122 |
 
-- From Stage 4 the sum is linear, so it holds each term's realization: 33 entries where
+- From Stage 5 the sum is linear, so it holds each term's realization: 33 entries where
   one table over the root is 24. On menus this short the terms' tables together are
   larger than the root's one table; at real sizes one table is never an option.
-- The two terms on `split_a` are one list if Stage 4 adds lists on one position before
+- The two terms on `split_a` are one list if Stage 5 adds lists on one position before
   the rounding (open there); kept apart, each total is 3 · 21 more.
-- Stage 5's switch takes the product from 231 entries to 38. Stage 7 leaves it a switch,
+- Stage 6's switch takes the product from 231 entries to 38. Stage 8 leaves it a switch,
   which has fewer entries than the pair.
-- The Max's ranked parts at Stage 7 assume ranks apply to a Min/Max before Stage 8
-  (review M2, open). If they do not, the Max stays one table until Stage 8, and Stage 7
+- The Max's ranked parts at Stage 8 assume ranks apply to a Min/Max before Stage 9
+  (review M2, open). If they do not, the Max stays one table until Stage 9, and Stage 8
   changes nothing here.
-- Stage 10 changes nothing: the `lin_max`, 52 entries, is not under half of the table by
-  rung's 63. Stages 3, 6 and 9 change no entry here: this graph reads no literal and
+- Stage 11 changes nothing: the `lin_max`, 52 entries, is not under half of the table by
+  rung's 63. Stages 3, 4, 7 and 10 change no entry here: this graph reads no literal and
   multiplies no Min/Max.
 
 Each term's realization was run through CP-SAT at every assignment, minimizing and
@@ -1346,7 +1368,7 @@ spectre-ns/torch-spyre#32. Inputs and an expression in, a CP-SAT objective out, 
 optimization: `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The inputs
 are each symbol's variable and its value at each of the variable's values; tests make
 them by hand, as in Architecture. Every value is computed by `sympy.lambdify`; numpy
-steps come in Stage 3.
+steps come in Stage 4.
 
 **Values by lambdify.** `values_on_grid(expr, columns, positions)` lambdifies `expr`
 over its free symbols with the `numpy` module and evaluates it at every joint assignment
@@ -1389,13 +1411,13 @@ the root's value depends on it:
   constant one a number without building its position, reads any other with one
   `add_element`, and refuses an entry past 2^50. The objective is the root's one lookup.
 
-`LocateIndex`, the position of a variable whose domain has gaps, waits for Stage 12 and
+`LocateIndex`, the position of a variable whose domain has gaps, waits for Stage 13 and
 the printer's maps: no replayed objective reads such a variable. Until then an input
 node refuses one, naming its symbol.
 
 After this stage an expression whose inputs fit the cap together is lowered exactly.
 Anything wider raises, and on a real objective the root is always wider. Nothing
-imports the module until Stage 13, so the raise reaches no compile.
+imports the module until Stage 14, so the raise reaches no compile.
 
 Tests, `tests/inductor/test_cpsat_table_lowering.py` as merged, 33, device-free (run
 with `--noconftest` off a Spyre host until Stage 2 moves them to `tests/`):
@@ -1432,14 +1454,14 @@ with `--noconftest` off a Spyre host until Stage 2 moves them to `tests/`):
   fails at a point; an entry too large for int64 sums, naming its node; a symbol with no
   input, by name; an input node's variable that is not an `IntVar` or has gaps, and
   values that are too few or not numbers; the naive lowering past the cap, naming the
-  sum, which Stage 4 lowers;
+  sum, which Stage 5 lowers;
 - a coefficient is applied before the rounding (10137 at split 2, not 7 * 1448); a
   constant objective is an int and adds no variable.
 
 ### Stage 2: synthetic examples, expected to fail
 
 No code in the module. Stage 2 is tests: the two changes the review of Stage 1 asked for
-its tests, and a synthetic example per optimization of Stages 4 to 10, each marked to
+its tests, and a synthetic example per optimization of Stages 5 to 11, each marked to
 fail until its stage lowers it. From here every stage shows, in the marks it removes,
 what it adds.
 
@@ -1461,7 +1483,7 @@ merged, and none to its module:
   `tests/test_cpsat_table_lowering.py`, beside `test_frontend_timing_summarize.py`, where
   torch-spyre/torch-spyre#6457 puts its own device-free scratchpad test. Its config
   moves with it, to
-  `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`; Stage 3
+  `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`; Stage 4
   adds its numpy tests to it. The move costs no recorded timing: a config with fewer
   than 5 recorded runs runs as its own CI job until it has them
   (`.github/test_layout_policy.json`), and the old path has none in
@@ -1478,19 +1500,20 @@ stage's optimization can:
 | Example | Stage | Objective | Refused until then because |
 |---|---|---|---|
 | `trivial` | — | `a**0.5 + 3b - 2x`, menus of 8 and 6, a 0/1 literal | it lowers today, unmarked, so the check runs end to end on every stage |
-| `linear_sum` | 4, linear sums | four terms on a buffer each, menus of 10 | one table of 10^4 |
-| `switch` | 5, the switch | `k * (a**0.5 + log b + c**-0.25)`, `k` in {1, 2, 3} | one table of 12,288; `k` is never 0, so it is no gate |
-| `gate` | 6, the gate | `x * log(a + 1 + x·a/2)`, cap 40 | the switch's rest reads `x`: 80 entries; read with `x` fixed, 40 |
-| `ranks` | 7, ranks and pairs | `(floor(a/16) * floor(b/32))**0.5`, menus of 128 | one table of 16,384 under the power; 45 as a pair of ranks |
-| `rung` | 8, a Min/Max by rung | `Max(a, 1.5b, 2c + 0.25)`, all values distinct | ranks don't shrink it: one table of 8,640 |
-| `lin_min` | 10, a Min kept linear | `Min` of two sums over 15 residency literals | one table of 32,768, and no operand fits in a table |
+| `linear_sum` | 5, linear sums | four terms on a buffer each, menus of 10 | one table of 10^4 |
+| `switch` | 6, the switch | `k * (a**0.5 + log b + c**-0.25)`, `k` in {1, 2, 3} | one table of 12,288; `k` is never 0, so it is no gate |
+| `gate` | 7, the gate | `x * log(a + 1 + x·a/2)`, cap 40 | the switch's rest reads `x`: 80 entries; read with `x` fixed, 40 |
+| `ranks` | 8, ranks and pairs | `(floor(a/16) * floor(b/32))**0.5`, menus of 128 | one table of 16,384 under the power; 45 as a pair of ranks |
+| `rung` | 9, a Min/Max by rung | `Max(a, 1.5b, 2c + 0.25)`, all values distinct | ranks don't shrink it: one table of 8,640 |
+| `lin_min` | 11, a Min kept linear | `Min` of two sums over 15 residency literals | one table of 32,768, and no operand fits in a table |
 
-- **Not covered.** Stage 3's numpy steps change no lowering, so they have no example.
-  The fold (Stage 9) gets one with that stage, if any: the switch lowers products of
+- **Not covered.** Stage 3's caching and Stage 4's numpy steps change no lowering, so
+  they have no example.
+  The fold (Stage 10) gets one with that stage, if any: the switch lowers products of
   coupled Min/Max factors under a linear reader (on `Max(f(a), g(b)) * Max(h(b), k(c))`
   with menus of 32, about 181 entries against the fold's 13,395 and crossed ladders'
   2,809), so the fold's own case is a product that needs one index under a nonlinear
-  reader. Whether any replayed objective has one is to be measured before Stage 9 is
+  reader. Whether any replayed objective has one is to be measured before Stage 10 is
   built (`~/gap-probe/torch-spyre-pr6501/fold/`).
 - **The marks.** Each param's id is the example's name and its mark is
   `pytest.mark.xfail(raises=TableLoweringError, strict=True, reason=...)`, naming the
@@ -1515,46 +1538,105 @@ Built: torch-spyre/torch-spyre#6501 at 1fe04ab6, the owner's squash of the examp
 (477f042d) and the random assignment dropped: the file gives 34 passed and 6 xfailed in
 0.8 s, with no device.
 
-### Stage 3: numpy steps from a dict
+### Stage 3: caching, each node from its children's lists
 
-The first optimization is lowering time. A node's values are computed from its
-children's lists by a numpy function, found in a dict keyed by the node's sympy class,
-instead of lambdifying each node over its inputs. lambdify stays for any class the dict
-does not hold. Nothing else changes: the same lists, the same tables, the same model.
+The first optimization is lowering time. Stage 1 realizes each node once and keeps its
+table, but a parent never reads that table: it lambdifies its whole expression and
+evaluates it from the inputs. So each operation runs again in every ancestor, up to the
+root, and each node pays for a lambdify of its own. Here a node's list is its own
+operation on its operands' lists, and the lambdified functions are kept by class.
+Nothing else changes: the same lists, the same tables, the same model.
 
-**numpy values (`cost_expr_numpy.py`).** `NUMPY_STEPS`, a dict from a sympy class to its
+- **One function per class.** A node's function is its sympy class over one placeholder
+  per operand, lambdified with the numpy module once for each class and form of operands
+  (`_lambdified`, an `lru_cache`), and shared by every node of them in every lowering of
+  the process. 40 terms of one shape, 600 nodes, lambdify 10 functions.
+- **Each operand read at the node's entries.** An operand on the node's own position is
+  read as it is. One on fewer positions is read at its own position: `Index.on_grid`
+  computes, from each input position's coordinate at every entry of the node's table,
+  what `cp_expr` builds. An `InputIndex` reads its coordinate, a `UnitIndex` is 0, and a
+  `CombineIndex` is `left * right.size + right`. A constant is read at every entry, as
+  `numpy.amax`, which lambdify writes for a Max, takes operands of one length only.
+  `values_on_grid` goes: no node evaluates its expression from its inputs.
+- **The forms of an operand.** A Piecewise's function pairs its operands, value then
+  condition. A condition read from a table is 1.0 or 0.0, and the function compares it
+  with 0, as `numpy.select` takes booleans only. A RelayoutCharge's prices are
+  constants. A function that takes scalars only, RelayoutCharge's `_imp_` and the
+  delivery-price functions, is applied point by point, now at its own node only.
+- **A quotient is divided.** `98/a` is `Mul(98, Pow(a, -1))`. From its children's lists
+  it would be `98 * (1/a)`, which is 1.9999999999999998 at `a = 49`, so its floor is 1;
+  Stage 1's lambdify prints `98/a`, and its floor is 2. A Mul reads the base of a factor
+  with a negative rational exponent in that factor's place, and its function raises the
+  base to the exponent, so it divides as lambdify prints it: `x/y`, `x/y**2`,
+  `x/sqrt(y)`. A rational coefficient needs nothing: lambdify prints `b/3` as
+  `(1/3)*b`, as the node computes it. That base is the one node a node reads that is
+  not its child.
+
+Lowering a 600-node expression with a root table of 8,192 entries takes 0.198 s in
+Stage 1 and 0.060 s here in a fresh process, 0.023 s once its functions are kept. Every
+entry of its root is Stage 1's to 4e-15. What it saves on the decode blocks is reported
+by Stage 13's replay.
+
+Tests, in `tests/test_cpsat_table_lowering.py`:
+
+- `values_on_grid`'s tests become a node's list: row-major, the last position fastest,
+  each term read at its own position; two symbols of one position together; a constant
+  operand at every entry;
+- one function for each class and form: 40 terms of one shape, over 300 nodes, at most
+  12 functions lambdified, and the root's list is Stage 1's;
+- a quotient divided: `floor(x/y) + floor(x/y**2)` is exact at (98, 49), (98, 7) and
+  (49, 7), where a reciprocal floors one low;
+- every node's list is Stage 1's, its whole expression lambdified over its inputs, to
+  1e-12 relative, on 7 expressions, among them a base read on another position than its
+  Mul;
+- guard: on the objective `predict_ops` builds for a gate_up projection, at decode and
+  past it, its splits on one candidate variable and the weight's residency on another,
+  every entry of the root's table is `sympy.lambdify(modules="math")`, the annealer's
+  evaluator (`sa_cooptimizer.py:849`), at its candidate and residency, to 1e-9;
+- with the division turned off, the quotient test, the 40-term test and one of the
+  Stage 1 lists fail;
+- the synthetic examples keep their marks: caching changes no lowering.
+
+Built: torch-spyre/torch-spyre#6525 at 8810253a, stacked on #6501: the file gives 46
+passed and 6 xfailed in 1.4 s, with no device.
+
+### Stage 4: numpy steps from a dict
+
+Deferred behind the caching (owner, 2026-11-19). A node's function, Stage 3's lambdified
+class, is replaced by a numpy function found in a dict keyed by the node's sympy class.
+lambdify stays for any class the dict does not hold. Nothing else changes: the same
+lists, the same tables, the same model.
+
+**numpy steps (`cost_expr_numpy.py`).** `NUMPY_STEPS`, a dict from a sympy class to its
 numpy function, one entry per class the cost model builds: Add and Mul (`np.add` and
 `np.multiply`, folded pairwise), Pow, Abs, Min and Max (`np.minimum`, `np.maximum`),
 floor, ceiling, log, exp, the six relationals, And, Or, Not, ITE (`np.where`), Piecewise
 (`np.select` over its pairs, every arm computed, NaN when no arm holds) and
 `RelayoutCharge` (`is_lx * prices[division]`, 0 past the table). There is no lookup by
-name and no fallback to numpy's own functions: a class is in the dict, or it is
-lambdified.
+name and no fallback to numpy's own functions: a class is in the dict, or it keeps its
+lambdified function.
 
-`numpy_value(expr, env)` is a loop over `postorder_traversal(expr)`, each node once, with
-no recursion. Values are kept in a dict by node; no node is changed:
-
-1. a symbol is its array in `env`, a number is a float, `True` and `False` are
-   themselves;
-2. the arguments are evaluated first, which the post-order guarantees;
-3. the step is `NUMPY_STEPS[type(node)]`;
-4. a class not in the dict raises `NotImplementedError`, and the caller lambdifies that
-   node instead, as Stage 1 does, cached per node and counted.
-
-Steps 3 and 4 can be called for one node on arrays already computed: a node's `realize`
-applies its step to its children's lists when they share a position, and
-`values_on_grid` uses `numpy_value` on the grid. An n-ary node folds its arguments
-pairwise, because `np.add.reduce` over a list that mixes a constant with arrays raises.
+A node applies its class's step to its operands' lists, read as Stage 3 reads them
+(`Node.operands`), and takes their forms: a condition is a list of 1.0 and 0.0, read
+as true where it is not 0, and a Mul divides by the base of a factor with a negative
+rational exponent, so the lists stay Stage 3's. A class not in the dict raises
+`NotImplementedError`, and the node applies its lambdified function instead. An n-ary
+node folds its operands pairwise.
 
 The dict covers what the cost model builds today: Add, Mul, Pow (exponent -1 and
 floats), Min, Max, floor, log, Piecewise ending in `True`, Eq/Le/Ge/Lt/Gt, And, Or,
 numbers and `RelayoutCharge` (`plan_solver.py:487`). ITE and `False` are latent: they
 need auto tiling or cost parameters other than production's. The
 `decode_delivery_price_*` functions (`cost_model.py:1426-1449`) are implemented
-functions, a new class each, so no dict holds them, and they stay on lambdify.
+functions, a new class each, so no dict holds them, and they keep their lambdified
+function.
 
-What it lowers is what Stage 1 lowers. How much lowering time it saves is reported by
-Stage 12's replay.
+What it lowers is what Stage 3 lowers. Whether it saves lowering time over Stage 3 is to
+be measured before it is built. A first build, before Stage 3, lowered Stage 3's
+600-node expression in 0.036 s, against Stage 3's 0.060 s in a fresh process and 0.023 s
+with its functions kept; it evaluated a node whose children were on other positions from
+its inputs. That build and its tests are kept in
+`~/gap-probe/torch-spyre-pr6501/stage3-numpy-deferred/`.
 
 Tests, `tests/test_cost_expr_numpy.py`, added to the config Stage 2 moved:
 
@@ -1566,18 +1648,15 @@ Tests, `tests/test_cost_expr_numpy.py`, added to the config Stage 2 moved:
 - Piecewise: an arm with an infinite value raises, taken or not; no arm true raises;
 - `RelayoutCharge` agrees with its `_imp_`, with no lambdify;
 - a class not in the dict (`sympy.sec`, an implemented function) raises
-  `NotImplementedError` and is then evaluated through lambdify, once;
-- every list of Stage 1's tests is the same under the dict as under lambdify, to 1e-12
-  relative, and every exact test of Stage 1 still passes;
-- guard: on objectives built by the cost model (the builders `test_op_features.py` and
-  `test_cost_model_replication.py` already use), the only nodes lambdified are the
-  implemented delivery-price functions, and the values agree with
-  `sympy.lambdify(modules="math")`, the annealer's evaluator (`sa_cooptimizer.py:849`).
-  The builders are `cost_model`'s functions, which `test_op_features.py` calls with no
-  device, so the guard runs at `tests/` too;
+  `NotImplementedError` and keeps its lambdified function;
+- a quotient divided, as in Stage 3;
+- every list of Stage 3's tests is the same under the dict as under Stage 3's functions,
+  to 1e-12 relative, and every exact test still passes;
+- guard: on the objectives of Stage 3's guard, the only nodes left to lambdify are the
+  implemented delivery-price functions, and the values are the annealer's;
 - the synthetic examples keep their marks: the numpy steps change no lowering.
 
-### Stage 4: linear sums
+### Stage 5: linear sums
 
 The second optimization, the first that changes entries: "the sum stays linear" and "an
 affine list needs no table" of "How the tables are kept small", with the collapse of
@@ -1598,7 +1677,7 @@ affine list needs no table" of "How the tables are kept small", with the collaps
   as #32 did before its hooks were cut (92d7bd42). A node read by several parents is
   built once through it. It lives for one build: the swap back after a failure drops it
   with the copy, so nothing built into the discarded model is reused. Positions go
-  through it from Stage 5, when a step first writes the model.
+  through it from Stage 6, when a step first writes the model.
 - `TableRealization.cp_expr` reads a list that is affine in its position as a linear
   expression, with no table.
 - Open: whether terms of one sum that are tables on equal positions are added before
@@ -1620,13 +1699,13 @@ Tests:
 - a subexpression shared by two terms is built once;
 - terms on one position: one lookup or two, as the open question is settled.
 
-### Stage 5: rule 4, the switch
+### Stage 6: rule 4, the switch
 
 A Mul with two or more factors that are not constants gains its linear realization, a
-switch. Through Stage 4 such a product is one table over its inputs. From here a linear
+switch. Through Stage 5 such a product is one table over its inputs. From here a linear
 reader can read it as its rest, collapsed once, times its factor's value, with no table
 crossing the two. It comes right after the linear sums because it needs nothing else:
-its rest is a realization Stage 4 already makes. It brings two things later stages
+its rest is a realization Stage 5 already makes. It brings two things later stages
 reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
 
 - **The factor.** The factor with the fewest distinct values, among those with a table,
@@ -1646,7 +1725,7 @@ reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
   variable and the offset.
 - **The rest.** The product of the other factors, read as their realization: one child's
   realization when one is left, a further switch when more are. It may hold lists on
-  several buffers, a constant and other switches, and from Stage 10 a Min/Max kept
+  several buffers, a constant and other switches, and from Stage 11 a Min/Max kept
   linear. All of it collapses into one integer `w`.
 - **The cases.** `add_map_domain` on the factor's rank gives one true/false per value,
   on exactly where the factor takes it. One variable `g` takes, under each true/false:
@@ -1661,18 +1740,18 @@ reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
   true/falses and one `g`.
 - **Any sign.** The product is taken on the collapsed rest, so a factor of any sign
   multiplies whatever the rest holds as it multiplies a list, a `lin_max` or `lin_min`
-  too once Stage 10 keeps one. No operand is touched, and nothing is refused for its
+  too once Stage 11 keeps one. No operand is touched, and nothing is refused for its
   sign.
 - **Literals.** A 0/1 literal times a term is the two-value case: two true/falses, on at
   0 and at 1, over the rest collapsed once. From here a literal's term costs its rest's
-  entries, not twice them as Stage 4's one table held it. Stage 6 optimizes this case.
-  A relayout charge stays one table over its literal and its division until Stage 6.
+  entries, not twice them as Stage 5's one table held it. Stage 7 optimizes this case.
+  A relayout charge stays one table over its literal and its division until Stage 7.
 - **The choice (rule 3).** A node gains a second way to be realized, and the choice
-  between its ways by entries, which Stages 7 to 10 extend. The switch, its rest's
+  between its ways by entries, which Stages 8 to 11 extend. The switch, its rest's
   entries plus one per factor value and the factor's `CompactIndex`, is weighed against
   the product's one table over its inputs. A factor with a repeated value times a short
   list can keep its table: `[1, 1, 2]` times a list of 2 is 6 entries as a table and 7
-  as a switch. Under a nonlinear reader the product is its table, as in Stage 4.
+  as a switch. Under a nonlinear reader the product is its table, as in Stage 5.
 - **Entries.** `AbstractRealization` stays `cp_expr` alone; the realizations the choice
   weighs get an entry count here. The switch counts its rest's entries, one per factor
   value and the factor's `CompactIndex`. `LinearRealization` counts its terms', since a
@@ -1686,7 +1765,7 @@ plus `|w| / (2q)` ("Collapsing float lists into linear terms"). This is the form
 prototype settled on (Decisions). Pushing the factor into every list instead held 45k of
 the 80k entries on the 14B and 24B auto-tiling prefill objectives and took 26 to 27 s.
 The switch took 5.9 and 5.2 s, and the whole replay 144.6 s against 443.8 s, with the
-largest error 1.2e-7 of the cost. Stage 12's replay compares against the prototype's
+largest error 1.2e-7 of the cost. Stage 13's replay compares against the prototype's
 results.
 
 On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, the
@@ -1718,10 +1797,10 @@ Tests:
 - a factor with more values than the cap has no switch, and with no table either, the
   product raises, naming it.
 
-### Stage 6: rule 5, a 0/1 literal gates its term
+### Stage 7: rule 5, a 0/1 literal gates its term
 
-An optimization of Stage 5's switch for a factor of one 0/1 literal that is 0 at one of
-its values. From Stage 5 such a product is already its rest collapsed once, under two
+An optimization of Stage 6's switch for a factor of one 0/1 literal that is 0 at one of
+its values. From Stage 6 such a product is already its rest collapsed once, under two
 true/falses, with `g == v·w` for its nonzero value `v` and `g == 0` for the other.
 Three savings are left:
 - the literal is its own true/false, so it needs no rank and no `add_map_domain`;
@@ -1740,7 +1819,7 @@ one table over its literal and its division, twice the menu, its off half zeros.
 - **The rest reads no literal.** `lower`'s normalization reads a gated product's other
   factors with each gate's literal at its kept value, by `xreplace`, so
   `x * Max(x*a, b)` becomes `x * Max(a, b)`. A product with only constants beside its
-  gate is a constant times the gate's list on its literal, which is affine (Stage 4): no
+  gate is a constant times the gate's list on its literal, which is affine (Stage 5): no
   gate and no table. So `(1 - x) * (c - c*x + c*x/t)` becomes `c * (1 - x)`, with no
   table over the tile's division.
 - **The linear realization.** A gate is a switch realization on the literal's position,
@@ -1755,28 +1834,28 @@ one table over its literal and its division, twice the menu, its off half zeros.
   negation, as the kept case's true/false: `g == w` under it and `g == 0` under the
   other. `g` is the linear term. The gate adds no error to its rest's: within the rest's
   bound where it keeps the term, exactly 0 elsewhere.
-- **The choice.** A gate replaces Stage 5's two-value switch whenever the factor is a
+- **The choice.** A gate replaces Stage 6's two-value switch whenever the factor is a
   gate: it never has more entries, since its rest reads the literal no more. A gate is
   read only linearly: under a power, a log or any other nonlinear node, the product is
-  its table, as in Stage 4.
+  its table, as in Stage 5.
 - **Inside other realizations.** A product of a gate and other non-constant factors is
-  the gate's switch, its rest the product of the others, switched by Stage 5 when more
+  the gate's switch, its rest the product of the others, switched by Stage 6 when more
   than one is left. A gate inside the rest of another switch is one more term there, and
-  so, from Stage 10, is a gate inside an operand of a Min/Max kept linear.
+  so, from Stage 11, is a gate inside an operand of a Min/Max kept linear.
 
 The prototype measured this form against tabling the literal (Decisions). Small
 default-config kernels went from 2 to 2.5 times the printer's solve time to the
 printer's own. Once a gate in any form was recognised, the GQA test went from 306,811
-entries to 115,667. Stage 12's replay reports entries with this stage on and off.
+entries to 115,667. Stage 13's replay reports entries with this stage on and off.
 
 After this stage no table reads a gating literal, and a gate's fractional coefficient
 is exact. A term on one menu whose k literals all gate it is one list under k gates.
-Stage 4 made it one table of 2^k times the menu, and Stage 5 one list under k two-value
+Stage 5 made it one table of 2^k times the menu, and Stage 6 one list under k two-value
 switches, each with its own `add_map_domain`.
 
 Tests:
 
-- every gated case below gives Stage 5's two-value switch's cost, within its bound, at
+- every gated case below gives Stage 6's two-value switch's cost, within its bound, at
   every assignment, with the literal in no table and no more entries;
 - `x * f(split)` on a literal `x` is exact, with one list of the menu's length on the
   division and no table over `x`. So are `(1 - x) * f(split)`, `3*x * f(split)` and
@@ -1790,20 +1869,20 @@ Tests:
 - the rest reads no literal: `x * Max(x * a, b)` reads `x` only through its gate;
 - `(1 - x) * (c - c*x + c*x/t)` is `c * (1 - x)`: affine, with no gate and no table over
   the tile's division;
-- `(1 + x)` times a list is not gated: it stays Stage 5's switch, with values 1 and 2;
-- `(0.5 - 0.5*x) * f(split)` is exact within half a unit, where Stage 5's switch is
+- `(1 + x)` times a list is not gated: it stays Stage 6's switch, with values 1 and 2;
+- `(0.5 - 0.5*x) * f(split)` is exact within half a unit, where Stage 6's switch is
   within one unit more;
 - a relayout charge is exact as a gate of its prices on its division, with as many
   entries as the menu; under a power it is its table over the literal and the division;
-- a gated product under a power or a log is its one table, as in Stage 4.
+- a gated product under a power or a log is its one table, as in Stage 5.
 
-### Stage 7: ranks and pairs
+### Stage 8: ranks and pairs
 
 A node gains one more way to be realized, the table from its parts: "equal values share
-a rank". Stage 5's choice by entries (rule 3) picks among its ways.
+a rank". Stage 6's choice by entries (rule 3) picks among its ways.
 
-- Each child's list is compacted to its distinct values, a `CompactIndex` (Stage 5) on
-  its position; the positions are combined, and the node's numpy step is applied across
+- Each child's list is compacted to its distinct values, a `CompactIndex` (Stage 6) on
+  its position; the positions are combined, and the node's function is applied across
   them. A product of two short lists over two buffers is one table over the pair of
   their ranks.
 - A node takes the cheapest, in entries, of its ways: one table over its inputs, the
@@ -1819,7 +1898,7 @@ rest's positions, `d` and `d_f` the rest's and the factor's distinct values, the
 is `n + d_f` against `d * d_f`, plus `n` when the rest repeats a value, both with the
 factor's `CompactIndex`. On the step-by-step graph's product that is 38 against 68. So
 the pairs of this stage pay where a table is read: under a power, a log or a Piecewise,
-and at nodes that are not products, such as a Max over several buffers before Stage 8.
+and at nodes that are not products, such as a Max over several buffers before Stage 9.
 
 Tests:
 
@@ -1832,7 +1911,7 @@ Tests:
 - the smallest way in entries wins: the table from parts over one table, one table over
   the table from parts, and a switch over a pair.
 
-### Stage 8: rule 1, a Min/Max by rung
+### Stage 9: rule 1, a Min/Max by rung
 
 A Max and a Min get a node class of their own, `ExtremeNode`, with one more way to be
 realized from their parts: by rung (rule 1), with clamping. "The Max is read by rung"
@@ -1852,9 +1931,9 @@ Tests:
   each operand lands on the rung of its clamped value;
 - the graph of "The process, step by step" at the real menus is exact at all 4620
   assignments in 122 entries, with the two terms on `division_a` added (open in
-  Stage 4), where ranks alone need 327.
+  Stage 5), where ranks alone need 327.
 
-### Stage 9: rule 2, the fold
+### Stage 10: rule 2, the fold
 
 Min/Max factors of one product, over shared inputs, become one indexed value over the
 reachable tuples of their rungs, when crossing their lists would pass the cap. It is one
@@ -1871,7 +1950,7 @@ Tests:
 - a product of four Max factors over three shared buffers is exact under a cap their
   crossed ladders pass; no fold when the crossed lists fit.
 
-### Stage 10: rule 3 in the objective, a Min/Max kept linear
+### Stage 11: rule 3 in the objective, a Min/Max kept linear
 
 A Max and a Min gain their linear realization, and a reader picks between it and the
 table.
@@ -1879,7 +1958,7 @@ table.
 - A Min/Max too wide to index, or whose table is over twice its linear realization,
   stays a `lin_min`/`lin_max` over linear operands. It does so only under nodes linear
   in it: sums, constant factors, other Min/Max nodes, and any product, whose switch
-  (Stage 5) multiplies the collapsed Min/Max by its factor's values. Its operands are
+  (Stage 6) multiplies the collapsed Min/Max by its factor's values. Its operands are
   linear realizations, so a switch or a gate inside one is one more term there.
 - A coefficient on the Min/Max is applied to its operands' lists before they are
   collapsed. A negative one turns Min into Max.
@@ -1898,15 +1977,15 @@ operand is a single variable; a factor of mixed sign, and a negative one, times 
 kept linear is exact; a Max too wide to index under a power, a log or a division raises,
 and the same Max under a sum, a constant, a product and a Min stays linear.
 
-### Stage 11: the table constraint, an experiment off the stack
+### Stage 12: the table constraint, an experiment off the stack
 
 With no emitter to swap (Architecture), the table constraint is built by changing the
 `cp_expr` of the classes it replaces (`TableRealization`, `CompactIndex`,
 `ExtremeIndex`) to `add_allowed_assignments` ("One constraint for both moves"), on a
-branch beside the stack. Its rows are read off `Index.positions`, and a cost read on a
+branch beside the stack. Its rows are read off `Index.on_grid`, and a cost read on a
 rolled-up position goes into the rows. A table constraint over independent columns has
 their product as rows, so it takes in a link only where its rows are no more than the
-entries of the `add_element`s it replaces. Stage 12's replay runs the stack and the
+entries of the `add_element`s it replaces. Stage 13's replay runs the stack and the
 branch. The branch merges only if it wins, as a change to those `cp_expr` methods.
 
 Checks on the branch: a three-buffer roll-up, a Max by rung times a ranked factor, is
@@ -1914,7 +1993,7 @@ exact on both, with the same cost at every assignment, and its last lookup names
 division; on the branch the model has one solution per assignment, so no row that can
 occur is missing.
 
-### Stage 12: integration with the printer's maps
+### Stage 13: integration with the printer's maps
 
 - `inputs_from_maps` maps the inputs from the printer's two maps: each symbol's variable
   and its values. A buffer's symbols share its division, so their input nodes make equal
@@ -1944,7 +2023,7 @@ Tests:
   `TableLoweringError`, with the original as its cause, and the error carries its `node`
   and `reason`.
 
-### Stage 13: integration with the solver, the flag
+### Stage 14: integration with the solver, the flag
 
 - `config.py`, beside `cpsat_time_limit_seconds` (`:407`), in the style of `ktir_emitter`
   (`:137`):
@@ -2021,22 +2100,22 @@ printer's is in cost units. Only the uniqueness probe reads it
 
 Each PR, from Stage 2 on:
 
-- `python3 -m pytest tests/test_cpsat_table_lowering.py`, and from Stage 3
+- `python3 -m pytest tests/test_cpsat_table_lowering.py`, and from Stage 4
   `tests/test_cost_expr_numpy.py`, on a machine with no Spyre device and without
   `--noconftest`.
 - The same with ortools hidden from the interpreter (a `sys.modules["ortools"] = None`
   in a `sitecustomize` on `PYTHONPATH` will do): the table lowering files are reported as
-  skipped, not as collection errors, and from Stage 3 `test_cost_expr_numpy.py` runs.
+  skipped, not as collection errors, and from Stage 4 `test_cost_expr_numpy.py` runs.
 - The PR description lists each synthetic example: whether it lowers, and if so its
   entries, lowering time and solve time, and which `xfail` marks the PR removes.
 - `make precommit`, `mypy torch_spyre tests` and `make check-all-configs`. Every test
   file of the stack is listed in
   `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`.
 - `git commit -s`, the Apache header on new files, `feat(scratchpad): ...` subjects.
-- Stages 2 to 12 change no file but the table lowering's own: its two modules, their
+- Stages 2 to 13 change no file but the table lowering's own: its two modules, their
   tests and their config. Stage 1 added only new files, and Stage 2 changes no module.
 
-After Stage 12, posted on that PR, with the replay calling `lower_cost_with_tables`:
+After Stage 13, posted on that PR, with the replay calling `lower_cost_with_tables`:
 
 1. **Same results as the prototype.** Replay the 50 captured objectives
    (`~/pr6301-review/replay.py`, the prototype's results in
@@ -2050,17 +2129,17 @@ After Stage 12, posted on that PR, with the replay calling `lower_cost_with_tabl
    to the same: `OPTIMAL` at the prototype's cost, with no refusal. Their objectives are
    small, so the test is their rounding bound, half a unit per table, not 1.2e-7.
 2. **Size and time, reported.** Entries, largest table, lowering time and solve time per
-   capture, beside the table in Estimates, for the stack and for Stage 11's branch.
+   capture, beside the table in Estimates, for the stack and for Stage 12's branch.
    Entries also with each stage's optimization turned off alone. A capture with more
    entries or a slower solve than the prototype is explained in the PR.
 3. **The switch and the gate against the prototype.** Lowering and solve time of the 14B
    and 24B auto-tiling prefill objectives (847607 captures): 3.28 and 3.12 s on the
    prototype, 5.94 and 5.24 s when it first switched. Entries and solve time of the
-   default-config objectives with Stage 6's gate on and off: the prototype's gate
+   default-config objectives with Stage 7's gate on and off: the prototype's gate
    brought the small kernels whose terms it gates to the printer's solve time (softmax
    4096x2048 0.15 s, add_mul 0.055 s, rmsnorm 0.065 s).
 
-After Stage 13, posted on that PR:
+After Stage 14, posted on that PR:
 
 4. **Flag on.** The planner suites with `CPSAT_TABLE_LOWERING=1`, once as they are and
    once with `AUTO_COARSE_TILING=1`, which now gives CP-SAT the cost expression:
@@ -2077,5 +2156,6 @@ After Stage 13, posted on that PR:
 Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
 (2026-11-19), 33 device-free tests, with the design of Architecture. Stage 2 is built:
 torch-spyre/torch-spyre#6501, synthetic examples of the later optimizations as strict
-xfails, with the two changes the review of Stage 1 asked for its tests. Stage 3, the
-numpy steps, is next.
+xfails, with the two changes the review of Stage 1 asked for its tests. Stage 3 is
+built: torch-spyre/torch-spyre#6525, caching, stacked on #6501. Stage 4, the numpy
+steps, is next.
