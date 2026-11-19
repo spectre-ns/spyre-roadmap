@@ -1138,11 +1138,18 @@ exceptions:
 **Refusals.** A node raises `TableLoweringError`, naming itself, when a reader reads it
 and it has no realization:
 - a symbol with no input, raised by name when a parent reads its columns;
-- values that are not one per value of the symbol's variable, raised the same way;
+- an input the symbol's node cannot make a position on, raised the same way: a variable
+  that is not an `IntVar` (a negated literal), a variable whose domain has gaps (until
+  `LocateIndex` in Stage 11), or values that are not one number per value of the
+  variable;
 - one table past the cap, which is never evaluated;
 - a value that is not finite (`Node._finite`, wherever a table is realized), at the node
   that makes it, since a node reads its children before it makes its own table;
-- a function with no numeric value.
+- a function with no numeric value, and anything else evaluating a node raises;
+- an entry past 2^50, found when the table is built; `Node.cp_expr` names the node.
+
+Every refusal is a `TableLoweringError`, so none can reach an `except` around the
+objective as a `RuntimeError`, `TypeError` or `ValueError`.
 
 The read comes before anything is added to the model for the node. In Stage 1 the
 root's read comes before any write, so a refusal leaves the model as it was. From Stage
@@ -1308,9 +1315,10 @@ over its free symbols with the `numpy` module and evaluates it at every joint as
 of `positions`, row-major, the last position fastest. Each symbol is read from its
 column at its own position, so two symbols of one buffer move together. A node calls it
 once, when it is realized. A function that takes scalars only is evaluated point by
-point: `RelayoutCharge`'s `_imp_` rounds its division with `round`, which an array does
-not take (checked on sympy 1.14). lambdify maps each sympy function to sympy's own
-meaning: `sinc(1)` is 0.84, as in sympy.
+point, retried when it raises `TypeError` or `ValueError` on arrays: `RelayoutCharge`'s
+`_imp_` rounds its division with `round`, which an array does not take (checked on sympy
+1.14), and a function that tests its value with `if` raises `ValueError`. lambdify maps
+each sympy function to sympy's own meaning: `sinc(1)` is 0.84, as in sympy.
 
 **Values that are not finite.** A NaN, `inf` or `-inf` raises `TableLoweringError` at
 the node whose list holds it (Decisions). A node reads its children's realizations as it
@@ -1344,13 +1352,14 @@ the root's value depends on it:
   `add_element`, and refuses an entry past 2^50. The objective is the root's one lookup.
 
 `LocateIndex`, the position of a variable whose domain has gaps, waits for Stage 11 and
-the printer's maps: no replayed objective reads such a variable.
+the printer's maps: no replayed objective reads such a variable. Until then an input
+node refuses one, naming its symbol.
 
 After this stage an expression whose inputs fit the cap together is lowered exactly.
 Anything wider raises, and on a real objective the root is always wider. Nothing
 imports the module until Stage 12, so the raise reaches no compile.
 
-Tests, `tests/inductor/test_cpsat_table_lowering.py`, 32, device-free (run with
+Tests, `tests/inductor/test_cpsat_table_lowering.py`, 33, device-free (run with
 `--noconftest` off a Spyre host):
 
 - the factory makes children first, shares a subexpression as one node, and leaves the
@@ -1377,12 +1386,15 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`, 32, device-free (run with
 - exact (one solution per assignment, within half a unit): one table over two inputs of
   different sizes, not symmetric in them; variables above and below 0; `sympy.sec` and
   `sympy.sinc` at sympy's values; a relayout charge, one table over its literal and its
-  division;
+  division; a function that takes scalars only, evaluated point by point; a node at the
+  cap exactly;
 - refused: a value that is not finite, at the root, and under a finite root at the
   operation, constant or input that makes it; an infinite Piecewise arm at the arm,
-  taken or not; a Piecewise with no arm true; an undefined function; an entry too large
-  for int64 sums; a symbol with no input, by name; the naive lowering past the cap,
-  naming the sum, which Stage 3 lowers;
+  taken or not; a Piecewise with no arm true; an undefined function, and a function that
+  fails at a point; an entry too large for int64 sums, naming its node; a symbol with no
+  input, by name; an input node's variable that is not an `IntVar` or has gaps, and
+  values that are too few or not numbers; the naive lowering past the cap, naming the
+  sum, which Stage 3 lowers;
 - a coefficient is applied before the rounding (10137 at split 2, not 7 * 1448); a
   constant objective is an int and adds no variable.
 
@@ -1913,5 +1925,5 @@ After Stage 12, posted on that PR:
 ## Next step
 
 Stage 1 is built: spectre-ns/torch-spyre#32, branch
-`table-lowering-1-base-experimental`, 32 device-free tests, with the design of
+`table-lowering-1-base-experimental`, 33 device-free tests, with the design of
 Architecture. Stage 2 stacks on it in the fork.
