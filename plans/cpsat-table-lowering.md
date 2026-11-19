@@ -53,6 +53,8 @@ layers, each with its own tests.
   SDPA, simple attention, GQA decode and RMSNorm. Each test is marked `xfail` with
   `strict=True` until a stage lowers its block, and that stage removes the mark. So the
   stack shows, stage by stage, which real blocks lower, long before Stage 11's replay.
+  All five lower on the prototype's rules, and the plan's stricter rules hold on them,
+  so every mark is off by Stage 9 (Stage 2).
 - **Off by default.** Stages 1 to 11 add files nothing imports. Stage 12 adds the flag.
 - **Base mechanics first, then one optimization per stage, integration last
   (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
@@ -1261,7 +1263,7 @@ mechanics that lower an expression from its inputs, naively, by lambdify. Stages
 each add one optimization, and Stage 10 is an experiment off the stack. Stages 11 and 12
 integrate: first with the printer's maps, then with the solver behind the flag. From
 Stage 2 on, a stage that lowers one of the common blocks removes that block's `xfail`
-mark (Stage 2).
+mark, and none is left after Stage 9 (Stage 2).
 
 | # | PR adds | What it lowers |
 |---|---|---|
@@ -1521,9 +1523,11 @@ The tests are `test_flash_attention`, `test_causal_sdpa_unpadded_kv_no_inf`,
   wrapped to record the expression and the two maps it is handed (`:865`). It maps each
   symbol to its input as Stage 11's `inputs_from_maps` will: a buffer's symbol to its
   division and its menu's values, any other symbol to its own variable and its domain.
-  From Stage 11 it calls `inputs_from_maps` instead. It captures under the default
-  config, because with auto tiling on, `main` hands CP-SAT no cost expression
-  (Stage 12). It is rerun when a block's objective changes shape, not on every change to
+  From Stage 11 it calls `inputs_from_maps` instead. It also writes each block in the
+  replay's capture format, the expression with the model and the two maps, so the
+  prototype's results on the fixture's own objectives are measured when it is made, and
+  Stage 11's replay reads the same objectives. It captures under the default config,
+  because with auto tiling on, `main` hands CP-SAT no cost expression (Stage 12). It is rerun when a block's objective changes shape, not on every change to
   the cost model: the tests check that a block lowers, not what it costs.
 - **The marks.** `pytest.mark.xfail(raises=TableLoweringError, strict=True,
   reason=...)`, the reason naming the terms that stop the block. With `raises`, only a
@@ -1538,8 +1542,34 @@ The tests are `test_flash_attention`, `test_causal_sdpa_unpadded_kv_no_inf`,
   past the cap, and only ranks (Stage 6, if they apply to a Min/Max: review M2), a
   Min/Max by rung (Stage 7) or `lin_min` (Stage 9) lower that. Each also has a wide
   product, which needs the switch (Stage 4) with a rest that one of those stages lowers,
-  or the fold (Stage 8). Which stage takes each mark off is for the stack to show. The
-  prototype lowered flash attention with 149,439 entries and solved it in 47 s.
+  or the fold (Stage 8). Which of Stages 6 to 9 takes each mark off is for the stack to
+  show, but every mark is off by Stage 9, the last stage that adds a rule. A mark still
+  on after Stage 9 is a gap between the stack and the prototype, explained in that PR.
+- **They lower on the rules the stack rebuilds.** The prototype at its last commit has
+  the switch, the gate, rungs, the fold and `lin_max`, the rules Stages 4, 5, 7, 8 and 9
+  rebuild. Stage 6's ranks and pairs come on top, and a node takes them only when they
+  have fewer entries. The prototype lowers all five probe captures at the cap of 8192,
+  with no fallback, and solves each `OPTIMAL`. Each solution is off from sympy's value of the expression by less than half
+  a unit per element table, 0.5/1024 of a cost unit each:
+
+  | Block | Entries | Largest table | Element tables | Lowering | Solve | Off from exact |
+  |---|---|---|---|---|---|---|
+  | flash attention | 49,227 | 338 | 308 | 2.0 s | 9.4 s | 0.0026 of 22,353.6 |
+  | causal SDPA | 974 | 44 | 50 | 0.7 s | 0.1 s | 0.016 of 8,383.4 |
+  | simple attention | 6,115 | 175 | 63 | 0.6 s | 0.8 s | 0.0043 of 3,939.3 |
+  | GQA decode | 3,299 | 59 | 155 | 1.2 s | 1.0 s | 0.028 of 2,105.5 |
+  | RMSNorm | 7,022 | 106 | 101 | 1.0 s | 2.0 s | 0.0030 of 16,189.1 |
+
+- **The plan's rules that are stricter than the prototype's hold on them too.**
+  - Every node whose inputs fit the cap, 882 to 4,432 per block, realizes with finite
+    values under Stage 1's code as merged. That covers every list the stack can make.
+  - The 14 to 20 nodes per block past the cap, which the switch and the gate read in
+    parts, are finite at 20,000 seeded random assignments each.
+  - The largest entry is 1.5e-5 of the 2^50 limit, and the largest domain is 338.
+  - Every free symbol has an input, so none of them needs Stage 11's normalization or
+    `LocateIndex`.
+
+  Scripts and output: `~/gap-probe/spyre-roadmap-pr23/2026-11-19/blocks/`.
 
 Tests, `tests/test_cost_expr_numpy.py`:
 
@@ -2035,7 +2065,11 @@ After Stage 11, posted on that PR, with the replay calling `lower_cost_with_tabl
    (`~/pr6301-review/replay.py`, the prototype's results in
    `~/pr6301-review/tableonly/`). Every capture is `OPTIMAL` at the exact cost the
    prototype reaches, and no objective is further from exact than 1.2e-7. A different
-   plan at that cost is a tie. None may raise `TableLoweringError`.
+   plan at that cost is a tie. None may raise `TableLoweringError`. The replay also
+   reads the five common blocks of Stage 2, in the capture format their script writes.
+   They are held to the same: `OPTIMAL` at the prototype's cost, with no refusal. Their
+   objectives are small, so the test is their rounding bound, half a unit per table,
+   not 1.2e-7.
 2. **Size and time, reported.** Entries, largest table, lowering time and solve time per
    capture, beside the table in Estimates, for the stack and for Stage 10's branch.
    Entries also with each stage's optimization turned off alone. A capture with more
