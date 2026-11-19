@@ -1527,8 +1527,9 @@ The tests are `test_flash_attention`, `test_causal_sdpa_unpadded_kv_no_inf`,
   replay's capture format, the expression with the model and the two maps, so the
   prototype's results on the fixture's own objectives are measured when it is made, and
   Stage 11's replay reads the same objectives. It captures under the default config,
-  because with auto tiling on, `main` hands CP-SAT no cost expression (Stage 12). It is rerun when a block's objective changes shape, not on every change to
-  the cost model: the tests check that a block lowers, not what it costs.
+  because with auto tiling on, `main` hands CP-SAT no cost expression (Stage 12). It is
+  rerun when a block's objective changes shape, not on every change to the cost model:
+  the tests check that a block lowers, not what it costs.
 - **The marks.** `pytest.mark.xfail(raises=TableLoweringError, strict=True,
   reason=...)`, the reason naming the terms that stop the block. With `raises`, only a
   refusal is an expected failure, and any other exception fails the run. With `strict`,
@@ -1549,8 +1550,9 @@ The tests are `test_flash_attention`, `test_causal_sdpa_unpadded_kv_no_inf`,
   the switch, the gate, rungs, the fold and `lin_max`, the rules Stages 4, 5, 7, 8 and 9
   rebuild. Stage 6's ranks and pairs come on top, and a node takes them only when they
   have fewer entries. The prototype lowers all five probe captures at the cap of 8192,
-  with no fallback, and solves each `OPTIMAL`. Each solution is off from sympy's value of the expression by less than half
-  a unit per element table, 0.5/1024 of a cost unit each:
+  with no fallback, and solves each `OPTIMAL`. Each solution is off from sympy's value
+  of the expression by less than half a unit per element table, 0.5/1024 of a cost unit
+  each:
 
   | Block | Entries | Largest table | Element tables | Lowering | Solve | Off from exact |
   |---|---|---|---|---|---|---|
