@@ -137,13 +137,13 @@ computed with numpy functions, and the code arrives in layers, each with its own
   | `CpIndex`, `Input`, `Unit`, `Combine` | `Index`, `InputIndex`, `UnitIndex`, `CombineIndex` |
   | a node's `form` | its `realization` |
 
-  An `InputNode` is a symbol's node: it holds the symbol's column, input data the caller
-  makes. `CpExpr` and the `cp_expr` methods keep their names, since they are CP-SAT
-  expressions. The owner gave the first seven names and asked for the rest to follow,
-  then said "I think that is cleaner naming." #32 is renamed (8367e1a1). The classes of
-  later stages follow the same pattern in this plan, though the owner has not named them
-  one by one: `LinearRealization`, `AddNode`, `MulNode`, `ExtremeNode`, `CompactIndex`,
-  `ExtremeIndex` and `LocateIndex`.
+  An `InputNode` is a symbol's node: it holds the symbol's input, the variable and
+  values the caller hands over. `CpExpr` and the `cp_expr` methods keep their names,
+  since they are CP-SAT expressions. The owner gave the first seven names and asked for
+  the rest to follow, then said "I think that is cleaner naming." #32 is renamed
+  (8367e1a1). The classes of later stages follow the same pattern in this plan, though
+  the owner has not named them one by one: `LinearRealization`, `AddNode`, `MulNode`,
+  `ExtremeNode`, `CompactIndex`, `ExtremeIndex` and `LocateIndex`.
 - **The switch and the gate right after the linear sums (2026-11-18).** The order is
   1 base, 2 numpy, 3 linear sums, 4 the switch, 5 the gate, 6 ranks and pairs, 7 rungs,
   8 the fold, 9 `lin_max`. It was 4 ranks, 5 rungs, 6 the fold, 7 `lin_max`, 8 the
@@ -154,16 +154,27 @@ computed with numpy functions, and the code arrives in layers, each with its own
   - It serves both kinds of term: it takes the literals out of the narrow terms' tables
     and splits the wide products. On the step-by-step graph's product it is 38 entries
     against 68 as a pair at the real menus.
-  - Each `Index` step lands with the stage that first uses it: `UnitIndex` and
-    `CombineIndex` in Stage 1, `CompactIndex` in 4, `ExtremeIndex` in 7, `InputIndex`
-    and `LocateIndex` in 11. `LocateIndex` left #32 because no replayed objective needs
-    it: none of the 4,159 non-buffer variables the 50 replayed objectives read has a
-    domain with gaps (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/locate/`).
-  - `InputIndex`, the step over an input's variable, left #32 on 2026-11-19 (d856eee7).
-    Stage 1 is handed its inputs already made, so nothing in the module constructs one;
-    Stage 11's `inputs_from_maps` is the first code that does. Until then the tests
-    define their own, on `Index` alone. The owner's words: "Don't add stuff that is not
-    in stage one" and "We can add this in stage 11".
+  - Each `Index` step lands with the stage that first uses it: `InputIndex`, `UnitIndex`
+    and `CombineIndex` in Stage 1, `CompactIndex` in 4, `ExtremeIndex` in 7,
+    `LocateIndex` in 11. `LocateIndex` left #32 because no replayed objective needs it:
+    none of the 4,159 non-buffer variables the 50 replayed objectives read has a domain
+    with gaps (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/locate/`).
+  - An `InputNode` makes its own `InputIndex` (2026-11-19, 9a5f45ab). The caller hands
+    each symbol its variable and its values, and no position. The node makes the
+    position on the variable, its offset and size read from the variable's domain, and
+    refuses values that are not one per value of the variable. So Stage 1 is the basic
+    conversion from sympy to CP-SAT by itself, and nothing in it is constructed only by
+    its tests. Before that the caller built each position, and only the tests did. The
+    owner's words: "Don't add stuff that is not in stage one", then "We should be able
+    to do basic sympy -> cp_sat in table format" and "The input index should be created
+    inside the conversion from nodes to cp_sat. Probably input node should create it."
+  - By that rule, the same day, `Index` lost what Stage 1 never calls (ff12b042): its
+    entry count (`entries`, with `parts` and `under()` to walk an index),
+    `TableRealization.entries`, and `positions`, the numpy side of a position. Stage 1
+    asks an index for its size and its `cp_expr`, and the cap bounds the length of one
+    table's list. The entry counts come back in Stage 4, with the first step that has a
+    lookup of its own. `positions` comes back with the first stage whose code reads a
+    position in numpy. Asked whether to move them out as well, the owner said "Yes".
 
   The owner asked "Do we need all the IndexMap specializations before we implement the
   optimizations?" and, given this order and `LocateIndex`'s move, said "Do that". The
@@ -828,15 +839,16 @@ assignment of the inputs, so an entry read from the wrong position fails.
 Three layers, each a small interface with thin subclasses, so that adding an operation,
 a realization or a position step changes nothing else:
 
-- **Values.** A *position* is an `Index`: one step that holds its parts (`UnitIndex` and
-  `CombineIndex`; later `CompactIndex` and `ExtremeIndex`, and with the inputs in Stage
-  11 `InputIndex` and `LocateIndex`). A *realization* is what a node is realized as, an
-  `AbstractRealization`: a `TableRealization` (a float list on a position) and, from
-  Stage 3, a `LinearRealization`. Values hold no model.
+- **Values.** A *position* is an `Index`: one step that holds its parts (`InputIndex`,
+  `UnitIndex`, `CombineIndex`; later `CompactIndex`, `ExtremeIndex` and `LocateIndex`).
+  A *realization* is what a node is realized as, an `AbstractRealization`: a
+  `TableRealization` (a float list on a position) and, from Stage 3, a
+  `LinearRealization`. Values hold no model.
 - **Nodes.** `TableLowering` is a factory. It makes one `Node` per distinct sympy node,
-  of the class the node's sympy class calls for, and hands it what it reads. Each node
-  realizes itself the first time its realization is read, and reads its children's
-  realizations as it does.
+  of the class the node's sympy class calls for, and hands it what it reads. An
+  `InputNode` is handed its symbol's variable and values, and makes its own position on
+  the variable. Each node realizes itself the first time its realization is read, and
+  reads its children's realizations as it does.
 - **The build.** Each value builds its own CP-SAT side with `cp_expr(model)`: a step,
   a position, a table, a node. There is no emitter. The objective is
   `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
@@ -860,8 +872,6 @@ from ortools.sat.python import cp_model
 
 # What CP-SAT takes as a linear expression: a LinearExpr, an IntVar or an int.
 CpExpr: TypeAlias = cp_model.LinearExprT
-# Each variable's values at a set of assignments, one array entry per assignment.
-Values: TypeAlias = Mapping[cp_model.IntVar, np.ndarray]
 
 
 class TableLoweringError(Exception):
@@ -880,35 +890,32 @@ class TableLoweringError(Exception):
 
 
 class Index(ABC):
-    """A position: from the inputs' values to 0 .. size - 1, in numpy and in CP-SAT.
+    """A position: from the inputs' values to 0 .. size - 1, as a CP-SAT expression.
     Each kind of step is a subclass that holds its parts as its own fields, so a step
-    depends on Index alone. UnitIndex and CombineIndex are its subclasses in Stage 1;
-    CompactIndex (Stage 4), ExtremeIndex (Stage 7), and InputIndex and LocateIndex
-    (Stage 11) join them. Steps are frozen dataclasses: equal positions compare equal
-    and hash alike."""
+    depends on Index alone. InputIndex, UnitIndex and CombineIndex are its subclasses
+    in Stage 1; CompactIndex (Stage 4), ExtremeIndex (Stage 7) and LocateIndex (Stage
+    11) join them. Steps are frozen dataclasses: equal positions compare equal and hash
+    alike."""
 
     size: int  # a field of each step, given or computed from its parts
 
-    @property
-    @abstractmethod
-    def parts(self) -> tuple[Index, ...]:
-        """The positions it is made from, () for a leaf."""
-
-    @property
-    @abstractmethod
-    def entries(self) -> int:
-        """The table entries the step itself puts in the model, 0 for arithmetic."""
-
-    @abstractmethod
-    def positions(self, values: Values) -> np.ndarray:
-        """The numpy side, from its parts' positions."""
-
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The CP-SAT side, from its parts' cp_expr."""
+        """The position in model, from its parts' cp_expr."""
 
-    def under(self) -> list[Index]:
-        """This position and every position it is made from, each once, parts first."""
+
+@dataclass(frozen=True)
+class InputIndex(Index):
+    """A leaf, and the thinnest step: a variable's own position, v - lo, for a variable
+    whose values run from lo to lo + size - 1. An InputNode makes one on its
+    variable."""
+
+    var: cp_model.IntVar
+    size: int
+    lo: int = 0
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """var - lo: no variable, no constraint."""
 
 
 @dataclass(frozen=True)
@@ -919,17 +926,6 @@ class CombineIndex(Index):
     left: Index
     right: Index
     size: int = field(init=False, repr=False, compare=False)  # left.size * right.size
-
-    @property
-    def parts(self) -> tuple[Index, ...]:
-        """(left, right)."""
-
-    @property
-    def entries(self) -> int:
-        """0."""
-
-    def positions(self, values: Values) -> np.ndarray:
-        """left's positions * right.size + right's."""
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """left.cp_expr(model) * right.size + right.cp_expr(model)."""
@@ -957,10 +953,6 @@ class TableRealization(AbstractRealization):
     index: Index
 
     @property
-    def entries(self) -> int:
-        """Its list and the remaps under its index: what the cap bounds."""
-
-    @property
     def finite(self) -> bool:
         """Whether every value in its list is a finite number."""
 
@@ -970,8 +962,10 @@ class TableRealization(AbstractRealization):
         TableLoweringError for an entry past 2^50."""
 
 
-# Each symbol's column, its value at each row of its input, on that input.
-Inputs: TypeAlias = Mapping[sympy.Symbol, TableRealization]
+# Each symbol's input: the variable that picks its value, and the symbol's value at
+# each of that variable's values, from its lowest to its highest.
+Input: TypeAlias = tuple[cp_model.IntVar, Sequence[float]]
+Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 
 # ----------------------------------------------------------------------------- nodes
@@ -1010,10 +1004,12 @@ class Node:
 
 @dataclass(eq=False)
 class InputNode(Node):
-    """A symbol, its column injected by the factory; None raises "a symbol with no
-    input", naming it, when a reader reads its columns."""
+    """A symbol: input data. Its variable and its values are injected by the factory;
+    None raises "a symbol with no input", naming it, when a reader reads its columns.
+    It makes its own position, an InputIndex on its variable, and refuses values that
+    are not one per value of the variable."""
 
-    column: TableRealization | None = None
+    input: Input | None = None
 
     def realize(self) -> TableRealization:
         """Its column."""
@@ -1031,7 +1027,7 @@ class TableLowering:
     """A factory for Nodes. It holds the inputs and the cap, no model."""
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
-        """inputs gives each symbol's column; cap bounds one table."""
+        """inputs gives each symbol's variable and values; cap bounds one table."""
 
     def lower(self, root: sympy.Basic) -> Node:
         """root's node, over the graph of nodes under it. Nothing is realized here."""
@@ -1067,34 +1063,10 @@ class AddNode(Node):
 # ------------------------------------------------------------------ from Stage 11 on
 
 
-@dataclass(frozen=True)
-class InputIndex(Index):
-    """A leaf, and the thinnest step: a variable's own position, v - lo, for a domain
-    lo .. lo + size - 1. inputs_from_maps is the first code to make one."""
-
-    var: cp_model.IntVar
-    size: int
-    lo: int = 0
-
-    @property
-    def parts(self) -> tuple[Index, ...]:
-        """(), a leaf."""
-
-    @property
-    def entries(self) -> int:
-        """0."""
-
-    def positions(self, values: Values) -> np.ndarray:
-        """values[var] - lo."""
-
-    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """var - lo: no variable, no constraint."""
-
-
 def inputs_from_maps(
     sym_map: Mapping[str, Any], buffer_map: Mapping[str, Any], *, cap: int
 ) -> Inputs:
-    """Each symbol of the printer's two maps as its column on its input."""
+    """Each symbol of the printer's two maps as its variable and its values."""
 
 
 def lower_cost_with_tables(
@@ -1119,7 +1091,8 @@ disabled.
 the distinct nodes, each after its arguments. It makes each node from its children,
 which it made earlier, so a subexpression two terms share is one node that both
 parents hold:
-- A `Symbol` becomes an `InputNode`, handed its column from the inputs.
+- A `Symbol` becomes an `InputNode`, handed its variable and its values from the inputs.
+  It makes its own position, an `InputIndex` on the variable.
 - A node with no free symbol becomes a `ConstantNode`: a number, `true`/`false`, or an
   operation on numbers such as `sqrt(2)`.
 - Any other node becomes a `Node`. From Stage 3, `Add` becomes `AddNode`, and each later
@@ -1142,20 +1115,15 @@ On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, 
 realizes the root as one table of 6 entries on `2*division_a + division_b` and builds it
 as one `add_element`. Its three children and the four nodes under them are realized too,
 each checking its own list, and the two powers are lambdified. Only the root is built,
-so they add nothing to the model. `InputIndex` here is the tests' own step over a
-variable, since the module has none until Stage 11:
+so they add nothing to the model. The inputs are each symbol's variable and its values,
+and the input nodes make the positions:
 
 ```python
 model = cp_model.CpModel()
 division_a = model.new_int_var(0, 2, "division_a")   # split_a's menu: 1, 2, 4
 division_b = model.new_int_var(0, 1, "division_b")   # split_b's menu: 1, 3
 split_a, split_b = sympy.symbols("split_a split_b", positive=True)
-pos_a = InputIndex(division_a, size=3)
-pos_b = InputIndex(division_b, size=2)
-inputs = {
-    split_a: TableRealization(values=np.array([1.0, 2.0, 4.0]), index=pos_a),
-    split_b: TableRealization(values=np.array([1.0, 3.0]), index=pos_b),
-}
+inputs = {split_a: (division_a, [1.0, 2.0, 4.0]), split_b: (division_b, [1.0, 3.0])}
 root = TableLowering(inputs, cap=8192).lower(9 * split_a ** -2 * split_b ** 0.5)
 model.minimize(root.cp_expr(model))   # 3 variables, 1 constraint
 ```
@@ -1170,6 +1138,7 @@ exceptions:
 **Refusals.** A node raises `TableLoweringError`, naming itself, when a reader reads it
 and it has no realization:
 - a symbol with no input, raised by name when a parent reads its columns;
+- values that are not one per value of the symbol's variable, raised the same way;
 - one table past the cap, which is never evaluated;
 - a value that is not finite (`Node._finite`, wherever a table is realized), at the node
   that makes it, since a node reads its children before it makes its own table;
@@ -1220,13 +1189,16 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 |---|---|
 | 2 | a node's numpy step on its children's lists, where they share a position |
 | 3 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
-| 4 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization` |
+| 4 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
 | 5 | the gate, and `RelayoutCharge` as its own node |
 | 6 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 6 decides whether a node keeps its two best tables for its reader |
 | 7 | the `ExtremeIndex` step; a Min/Max node with its ladder |
 | 8 | the fold, one more way to realize a product |
 | 9 | the `lin_max`/`lin_min` realization, with its entry count for margin 2 |
-| 11 | the `InputIndex` and `LocateIndex` steps, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
+| 11 | the `LocateIndex` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
+
+Not placed in a stage: `Index.positions`, the numpy side of a position. Stage 10's rows
+read it, and it comes with the first stage whose code calls it.
 
 Open in Stage 3: whether terms of one sum that are tables on equal positions are added
 before the rounding, one lookup and one rounding (`split ** 0.5 + split ** 0.7` is 3112
@@ -1236,17 +1208,17 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 
 | Stage | Adds to the architecture |
 |---|---|
-| 1 | the values (`Index` with its steps `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
+| 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists |
 | 3 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
-| 4 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3) |
+| 4 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
 | 5 | the gate, and `RelayoutCharge` as its own node |
 | 6 | a node realized from its parts: ranks and pairs |
 | 7 | Min/Max nodes realized by rung: `ExtremeIndex`, ladders, rungs, clamping |
 | 8 | a product realized by fold |
 | 9 | the linear realization of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
 | 10 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
-| 11 | `InputIndex`, `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
+| 11 | `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
 | 12 | nothing in the module: the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
@@ -1269,7 +1241,7 @@ then with the solver behind the flag.
 | 8 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
 | 9 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes, products included |
 | 10 | not in the stack: the table constraint, a branch that changes the `cp_expr` methods, measured by Stage 11's replay | the same plans, as table constraints |
-| 11 | integration with the printer's maps: `inputs_from_maps` and the steps over a variable, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
+| 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
 | 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
 
 **At the start, real objectives do not lower.** Stage 1 makes one table per node, so the
@@ -1326,9 +1298,10 @@ determined, total and correct.
 ### Stage 1: the base mechanics
 
 Built: spectre-ns/torch-spyre#32. Inputs and an expression in, a CP-SAT objective out,
-with no optimization: `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
-Tests build the inputs by hand, as in Architecture. Every value is computed by
-`sympy.lambdify`; numpy steps come in Stage 2.
+with no optimization: `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The
+inputs are each symbol's variable and its value at each of the variable's values; tests
+make them by hand, as in Architecture. Every value is computed by `sympy.lambdify`;
+numpy steps come in Stage 2.
 
 **Values by lambdify.** `values_on_grid(expr, columns, positions)` lambdifies `expr`
 over its free symbols with the `numpy` module and evaluates it at every joint assignment
@@ -1353,11 +1326,14 @@ the root's value depends on it:
 
 **The lowering (`cpsat_table_lowering.py`).**
 
-- The values: `Index`, a position, with its steps `UnitIndex` and `CombineIndex`, each
-  holding its parts as fields (`CombineIndex(left, right)`, its size computed from
-  them); `AbstractRealization` and `TableRealization`, with `entries` and `finite`; each
-  with `cp_expr`; and `TableLoweringError`.
-- The nodes: `Node`, which realizes one table over its inputs; `InputNode`, its column;
+- The values: `Index`, a position, with its steps `InputIndex`, `UnitIndex` and
+  `CombineIndex`, each holding its parts as fields (`CombineIndex(left, right)`, its
+  size computed from them); `AbstractRealization` and `TableRealization`, with `finite`;
+  each with `cp_expr`; and `TableLoweringError`. An index is asked only for its size and
+  its `cp_expr`: the entry counts and the numpy side of a position come with the stages
+  that call them (Architecture).
+- The nodes: `Node`, which realizes one table over its inputs; `InputNode`, handed its
+  symbol's variable and values, which makes its column on an `InputIndex` of its own;
   `ConstantNode`, its value on `UnitIndex`. `columns` and `realization` are kept from
   their first read. A table past the cap is never evaluated and raises, naming the node.
   Under the cap a node reads its children's realizations before it makes its table.
@@ -1367,23 +1343,23 @@ the root's value depends on it:
   constant one a number without building its position, reads any other with one
   `add_element`, and refuses an entry past 2^50. The objective is the root's one lookup.
 
-The steps over a variable wait for Stage 11 and the printer's maps. `InputIndex`, a
-variable's own position, is first constructed there, by `inputs_from_maps`: Stage 1 is
-handed its inputs already made, so its tests define their own step, on `Index` alone.
-`LocateIndex`, the position of a variable whose domain has gaps, waits too: no replayed
-objective reads such a variable.
+`LocateIndex`, the position of a variable whose domain has gaps, waits for Stage 11 and
+the printer's maps: no replayed objective reads such a variable.
 
 After this stage an expression whose inputs fit the cap together is lowered exactly.
 Anything wider raises, and on a real objective the root is always wider. Nothing
 imports the module until Stage 12, so the raise reaches no compile.
 
-Tests, `tests/inductor/test_cpsat_table_lowering.py`, 31, device-free (run with
+Tests, `tests/inductor/test_cpsat_table_lowering.py`, 32, device-free (run with
 `--noconftest` off a Spyre host):
 
 - the factory makes children first, shares a subexpression as one node, and leaves the
   expression unchanged; a Piecewise arm gets no node; each node is an `InputNode`, a
   `ConstantNode` or a `Node` by its expression; a node gathers its columns from its
   children;
+- an input node makes its position on its variable, with the variable's offset; two
+  symbols of one variable share it; values that are not one per value of the variable
+  are refused, naming the symbol;
 - a node realizes itself when its realization is read, with only its children and its
   cap, and reads its children's realizations as it does; a table past the cap is never
   evaluated, nor any node under it; `lower` realizes nothing, and a refusal leaves the
@@ -1394,8 +1370,8 @@ Tests, `tests/inductor/test_cpsat_table_lowering.py`, 31, device-free (run with
   nothing to the model;
 - a list must have its index's size; a step takes the parts it names, and equal steps
   are one position, hashing alike; a `TableRealization` takes `values` and `index` only,
-  and its list cannot be written to or replaced; every position takes, at every
-  assignment, the value `Index.positions` gives;
+  and its list cannot be written to or replaced; a combined position is row-major in
+  CP-SAT at every assignment;
 - `values_on_grid`: row-major over three sizes, two symbols on one position, a constant
   broadcast;
 - exact (one solution per assignment, within half a unit): one table over two inputs of
@@ -1807,11 +1783,11 @@ occur is missing.
 
 ### Stage 11: integration with the printer's maps
 
-- `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
-  share its division as their position. Any other variable is indexed by its domain.
-  This stage adds the two `Index` steps over a variable: `InputIndex`, the variable's
-  own position less its offset, which a division uses too, and `LocateIndex`, a position
-  lookup for a domain with gaps. None of the 4,159 non-buffer variables the 50 replayed
+- `inputs_from_maps` maps the inputs from the printer's two maps: each symbol's variable
+  and its values. A buffer's symbols share its division, so their input nodes make equal
+  positions on it. Any other variable is indexed by its domain, by the same
+  `InputIndex`, or, when the domain has gaps, by `LocateIndex`, the `Index` step this
+  stage adds: a position lookup. None of the 4,159 non-buffer variables the 50 replayed
   objectives read has gaps, so `LocateIndex` is for objectives the replay does not hold.
   A domain past the cap is not an input. Mapping the inputs adds nothing to the model: a
   `LocateIndex`'s lookup is built by its `cp_expr`, when a table on it is built.
@@ -1937,5 +1913,5 @@ After Stage 12, posted on that PR:
 ## Next step
 
 Stage 1 is built: spectre-ns/torch-spyre#32, branch
-`table-lowering-1-base-experimental`, 31 device-free tests, with the design of
+`table-lowering-1-base-experimental`, 32 device-free tests, with the design of
 Architecture. Stage 2 stacks on it in the fork.
