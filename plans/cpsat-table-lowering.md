@@ -78,42 +78,46 @@ computed with numpy functions, and the code arrives in layers, each with its own
     GQA test from 306,811 entries to 115,667, and the Mistral 24B prefill from 59,152 to
     21,696.
 - **A value that is not a finite number raises (2026-11-18).** A NaN, `inf` or `-inf` in
-  any list a node makes raises `TableLoweringError` at the node that made it, naming
-  it. That covers one table over the inputs, a table from its parts (including
-  combinations of positions that cannot occur), a Piecewise arm whether it is taken or
-  not, a rank, a ladder, a bound and a switch's values. Nothing is computed from such a
-  value, so a NaN cannot reach a Min/Max's bound, a sign or a comparison and turn into a
-  silent wrong cost. On the 50 replayed objectives, none of the 59,492 arms of their
-  15,975 Piecewise nodes is ever non-finite, and every Piecewise has an arm true at
-  every assignment (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/nonfinite/`). #32
-  refuses it this way (`CpNode._finite`). Only the lists a reader asks for are made, so
-  in Stage 1 an arm that is never read makes no list.
+  any list a node makes raises `TableLoweringError` at the node that made it, naming it.
+  That covers one table over the inputs, a table from its parts (including combinations
+  of positions that cannot occur), a Piecewise arm whether it is taken or not, a rank, a
+  ladder, a bound and a switch's values. Nothing is computed from such a value, so a NaN
+  cannot reach a Min/Max's bound, a sign or a comparison and turn into a silent wrong
+  cost. On the 50 replayed objectives, none of the 59,492 arms of their 15,975 Piecewise
+  nodes is ever non-finite, and every Piecewise has an arm true at every assignment
+  (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/nonfinite/`). #32 refuses it this way. The
+  check is in the node that makes the list (`Node._finite`), and a node reads its
+  children's realizations as it is realized. So every node under the root is realized
+  and checks its own list, whether or not the root's value depends on it: an arm that is
+  not taken raises in Stage 1 too. The owner's words (2026-11-19): "The non-finite
+  should just be a check in the child node".
 - **Behaviour, not code.** The stages below say what each layer does. #6315 is cited for
   its results only.
 - **Free to deviate.** The forms need not be #6315's. Every roll-up is built from two
   moves, combine and compact, and the table constraint is measured against them.
 - **A factory of nodes that realize themselves (2026-11-18).** This replaces the
   2026-11-17 design of two passes, a visitor and an emitter.
-  - `TableLowering` is a factory: it makes one `CpNode` per distinct sympy node,
-    children first, of the class the node's sympy class calls for. It hands each node
-    what it reads and does nothing else.
-  - A node realizes its own form the first time it is read (`realize`, kept as
-    `form`), so a node nobody reads is never realized.
-  - A form builds its own CP-SAT side (`cp_expr`), as a position already does
-    (`CpIndex.cp_expr`), and there is no emitter. The objective is
-    `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
-  - A position is one class, `CpIndex`, whose steps hold their parts as fields:
-    `Combine(left, right)`, as a node holds its children. It replaces `IndexMap` and
-    `CpIndex`, which referred to each other: the step took the `CpIndex` it sat in.
-    `Compact`, `Extreme` and `Locate`, written on it, type-check and are exact in CP-SAT
-    on the step-by-step graph at the real menus: the ranked product in 68 entries, the
-    Max by rung in 63 (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/merged/`). One thing
-    is given up: a part reached twice in one build is built twice, where `IndexMap`'s
-    walk built it once. That is free while no step writes the model, and Stage 4 builds
-    positions once.
-  - Each kind of node, form and position step is a thin subclass of a small interface,
-    so an operation, a form or a step is added without changing the others. Changing
-    how something is emitted means changing its class's `cp_expr`.
+  - `TableLowering` is a factory: it makes one `Node` per distinct sympy node, children
+    first, of the class the node's sympy class calls for. It hands each node what it
+    reads and does nothing else.
+  - A node realizes itself the first time its realization is read (`realize`, kept as
+    `realization`). It reads its children's realizations as it does, so reading the root
+    realizes every node under it, each once. A node nobody reads is never realized.
+  - A realization builds its own CP-SAT side (`cp_expr`), as a position already does
+    (`Index.cp_expr`), and there is no emitter. The objective is `TableLowering(inputs,
+    cap=cap).lower(expr).cp_expr(model)`.
+  - A position is one class, `Index`, whose steps hold their parts as fields:
+    `CombineIndex(left, right)`, as a node holds its children. It replaces `IndexMap`
+    and the earlier `CpIndex`, which referred to each other: the step took the `CpIndex`
+    it sat in. `CompactIndex`, `ExtremeIndex` and `LocateIndex`, written on it,
+    type-check and are exact in CP-SAT on the step-by-step graph at the real menus: the
+    ranked product in 68 entries, the Max by rung in 63
+    (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/merged/`). One thing is given up: a part
+    reached twice in one build is built twice, where `IndexMap`'s walk built it once.
+    That is free while no step writes the model, and Stage 4 builds positions once.
+  - Each kind of node, realization and position step is a thin subclass of a small
+    interface, so an operation, a realization or a step is added without changing the
+    others. Changing how something is emitted means changing its class's `cp_expr`.
   - Each hook a later stage needs is built in that stage, not before.
 
   The owner's words: "Can we redesign this so the tabulation should be on the node base
@@ -122,25 +126,44 @@ computed with numpy functions, and the code arrives in layers, each with its own
   class", and on positions "IndexMap's interface should take IndexMap rather than
   CpIndex", "The relationship is circular right now", "Yeah merge them together".
   Spectre-ns/torch-spyre#32 is built this way. See Architecture.
+- **Names say what a class is (2026-11-19).** The lowering's classes drop the `Cp`
+  prefix. A node ends in `Node`, what a node is realized as ends in `Realization`, and a
+  position step ends in `Index`:
+
+  | Was | Is |
+  |---|---|
+  | `CpNode`, `CpSymbol`, `CpConstant` | `Node`, `InputNode`, `ConstantNode` |
+  | `CpForm`, `CpTable` | `AbstractRealization`, `TableRealization` |
+  | `CpIndex`, `Input`, `Unit`, `Combine` | `Index`, `InputIndex`, `UnitIndex`, `CombineIndex` |
+  | a node's `form` | its `realization` |
+
+  An `InputNode` is a symbol's node: it holds the symbol's column, input data the caller
+  makes. `CpExpr` and the `cp_expr` methods keep their names, since they are CP-SAT
+  expressions. The owner gave the first seven names and asked for the rest to follow,
+  then said "I think that is cleaner naming." #32 is renamed (8367e1a1). The classes of
+  later stages follow the same pattern in this plan, though the owner has not named them
+  one by one: `LinearRealization`, `AddNode`, `MulNode`, `ExtremeNode`, `CompactIndex`,
+  `ExtremeIndex` and `LocateIndex`.
 - **The switch and the gate right after the linear sums (2026-11-18).** The order is
   1 base, 2 numpy, 3 linear sums, 4 the switch, 5 the gate, 6 ranks and pairs, 7 rungs,
   8 the fold, 9 `lin_max`. It was 4 ranks, 5 rungs, 6 the fold, 7 `lin_max`, 8 the
   switch, 9 the gate.
-  - The switch needs only Stage 3: its rest is a form Stage 3 makes, a table or a
-    `CpLinear`. It brings `Compact` and the choice between ways by entries (rule 3),
-    which Stage 6 extends.
+  - The switch needs only Stage 3: its rest is a realization Stage 3 makes, a table or a
+    `LinearRealization`. It brings `CompactIndex` and the choice between ways by entries
+    (rule 3), which Stage 6 extends.
   - It serves both kinds of term: it takes the literals out of the narrow terms' tables
     and splits the wide products. On the step-by-step graph's product it is 38 entries
     against 68 as a pair at the real menus.
-  - Each `CpIndex` step lands with the stage that first uses it: `Input`, `Unit` and
-    `Combine` in Stage 1, `Compact` in 4, `Extreme` in 7, `Locate` in 11. `Locate` left
+  - Each `Index` step lands with the stage that first uses it: `InputIndex`, `UnitIndex`
+    and `CombineIndex` in Stage 1, `CompactIndex` in 4, `ExtremeIndex` in 7,
+    `LocateIndex` in 11. `LocateIndex` left
     #32 because no replayed objective needs it: none of the 4,159 non-buffer variables
     the 50 replayed objectives read has a domain with gaps
     (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/locate/`).
 
   The owner asked "Do we need all the IndexMap specializations before we implement the
-  optimizations?" and, given this order and `Locate`'s move, said "Do that". The end
-  state is the same, so Stage 11's replay against #6315 does not change.
+  optimizations?" and, given this order and `LocateIndex`'s move, said "Do that". The
+  end state is the same, so Stage 11's replay against #6315 does not change.
 - **Margin 2 (2026-11-17).** A Min/Max with only linear nodes above it stays a
   `lin_min`/`lin_max` only when that needs under half the entries of its table, as in
   #6315. Replayed at #6315's tip on the 46 objectives where the choice changes the model,
@@ -249,7 +272,8 @@ its off half zeros. The estimate ignores lists that turn out affine and cost not
 - A node is *indexed* when its value is `values[index]`: `values` is a float list
   computed in numpy before the solve, and `index` is a CP-SAT expression that the inputs
   determine. The solver never chooses an index.
-- *Entries* are the table entries a form puts in the model. The cap bounds one table.
+- *Entries* are the table entries a realization puts in the model. The cap bounds one
+  table.
 - `Min` and `Max` are nodes of the cost expression. `lin_max` is CP-SAT's constraint
   `target == max(e_1, ..., e_n)` over linear expressions, which `add_max_equality` adds.
   CP-SAT has no min constraint: `add_min_equality` adds a `lin_max` over the negated
@@ -274,9 +298,9 @@ The five rules that keep lists short:
    the Min/Max.
 2. A product of Min/Max factors over shared inputs is indexed by the tuples of rungs that
    can occur together, found by a chain of small tables, one per group of shared inputs.
-3. A node takes the cheaper, in entries, of one table over its inputs and the form built
-   from its parts. A Min/Max with only linear nodes above it stays linear when that needs
-   under half the entries of its table.
+3. A node takes the cheaper, in entries, of one table over its inputs and the one built
+   from its parts. A Min/Max with only linear nodes above it stays linear when that
+   needs under half the entries of its table.
 4. A product is linear in its children only when its other factors are constants. Any
    other product is a *switch*. The factor with the fewest distinct values stays
    constants, and its inputs pick one through a true/false per value. The rest is
@@ -448,11 +472,11 @@ menus. Each reduction below cuts it at one node of the walk:
 | Values past the bound are clamped | a Min/Max | the ladder drops the values the Min/Max can never return |
 
 **How the walk chooses.** A node over several indexes has two candidates, one table over
-its inputs and the form from its parts, and `realize` keeps the one with fewer entries
+its inputs and the table from its parts, and `realize` keeps the one with fewer entries
 (rule 3). Both sizes are known before any list is computed: one table is the product of
-its inputs' sizes, and the form from its parts is its list (the product of the parts'
-distinct values, or the ladder) plus the remaps under its index. A candidate past the cap
-is never evaluated. A Min/Max with only linear nodes above it stays a
+its inputs' sizes, and the table from its parts is its list (the product of the parts'
+distinct values, or the ladder) plus the remaps under its index. A candidate past the
+cap is never evaluated. A Min/Max with only linear nodes above it stays a
 `lin_min`/`lin_max` when that needs under half the entries of its table.
 
 **On the graph above.** Its menus are 3, 2 and 4 long, and one table over all three is 24
@@ -484,7 +508,7 @@ each turned off alone with the others on:
   only residency literals (Estimates).
 - *Ranks* take the product from 21 * 11 = 231 entries to 6 * 6 = 36, plus the two remaps
   of 21 and 11. A division menu is longer than the values one split takes.
-- *Rungs* cost 12 entries here: the rung form is 64 entries against a 52-entry
+- *Rungs* cost 12 entries here: the table by rung is 64 entries against a 52-entry
   `lin_max`. Rule 3 keeps the table, because 52 is not under half of 64. This is the one
   step where the walk does not take the fewest entries.
 - *Clamping* drops one value from the ladder: `split_a / 2` at split 1 is 0.5, below 1,
@@ -552,7 +576,7 @@ flowchart LR
 ```
 
 - **Offset.** A variable in `lo..hi` has the position `var - lo`. A domain with gaps
-  gets its position from a lookup, `Locate` (Stage 11).
+  gets its position from a lookup, `LocateIndex` (Stage 11).
 - **Stride.** A position is multiplied by the product of the sizes of the variables
   after it: 2 * 3 = 6 for `x`, 3 for `y`, 1 for `z`.
 - **Linear.** The strides are constants, so the index is a linear expression: no two
@@ -575,28 +599,28 @@ numpy fills the table in the same order, last variable fastest:
 The table has 4 * 2 * 3 = 24 entries. The sizes multiply, so this form is only for a term
 whose variables fit the cap together.
 
-### Which form a node takes
+### Which realization a node takes
 
-Every node is tabulated, linear, or both. There is no third form, no partial lowering
-and no fallback: when the objective cannot be read from tables and linear forms alone,
-the lowering raises.
+Every node is tabulated, linear, or both. There is no third realization, no partial
+lowering and no fallback: when the objective cannot be read from tables and linear
+realizations alone, the lowering raises.
 
 | A table of it fits the cap | It is linear, under linear nodes only | The node |
 |---|---|---|
 | yes | no | tabulated: a float list on an index |
 | no | yes | linear |
-| yes | yes | both forms; its reader picks one (rule 3) |
-| no | no | no form: its `realize` raises `TableLoweringError` when a reader reads it, naming the node |
+| yes | yes | both realizations; its reader picks one (rule 3) |
+| no | no | no realization: its `realize` raises `TableLoweringError` when a reader reads it, naming the node |
 
-- *A table* is one table over the node's inputs, or the form from its parts: a rank, a
-  pair, a Min/Max by rung, a fold (rules 1 to 3).
+- *A table* is one table over the node's inputs, or the one built from its parts: a
+  rank, a pair, a Min/Max by rung, a fold (rules 1 to 3).
 - *Linear* nodes are a sum, a constant times one child, any other product as a switch
   (rule 4), a product with a gate or a relayout charge as a gated switch (rule 5), and a
   Min/Max kept as a `lin_min`/`lin_max`. A switch is one variable that only a linear
-  reader reads. A linear form is built only when a linear reader reads the node, so
-  nothing has to mark ahead which nodes only linear nodes sit above.
-- The objective reads the root's linear form. A root with only a table is one linear
-  term, a single lookup.
+  reader reads. A linear realization is built only when a linear reader reads the node,
+  so nothing has to mark ahead which nodes only linear nodes sit above.
+- The objective reads the root's linear realization. A root with only a table is one
+  linear term, a single lookup.
 
 ## How a table maps onto CP-SAT
 
@@ -615,9 +639,9 @@ The only lookup is `add_element(index, table, target)`, which enforces
   division itself.
 - A residency literal has the list `[0, 1]` and is its own index.
 - Any other integer variable has its domain's values, ascending. Its index is `var - lo`
-  when the domain has no gaps. With gaps it is a position `pos` under
-  `add_element(pos, domain_values, var)`; the values are distinct, so one position fits.
-  That lookup is `Locate`, from Stage 11: no replayed objective reads such a variable.
+  when the domain has no gaps. With gaps it is a position `pos` under `add_element(pos,
+  domain_values, var)`; the values are distinct, so one position fits. That lookup is
+  `LocateIndex`, from Stage 11: no replayed objective reads such a variable.
 
 **Each way a list is made.** Lists are built from the leaves of the expression upward: a
 node's list is made from its arguments' lists.
@@ -676,9 +700,9 @@ Both forms were run on the roll-up and agree at all 24 assignments. Which solves
 on real objectives is not measured. There is no emitter to swap (Architecture), so the
 table constraint is built by changing the `cp_expr` of the classes it replaces, on a
 branch that Stage 11's replay runs beside the stack (Stage 10). The plan is the same.
-Where the stack builds a position from two others by compacts and a combine, that
-branch lists the rows, read off `CpIndex.positions`, and where a cost is read on such a
-position it puts the rounded cost in the rows as `out`.
+Where the stack builds a position from two others by compacts and a combine, that branch
+lists the rows, read off `Index.positions`, and where a cost is read on such a position
+it puts the rounded cost in the rows as `out`.
 
 Its rows are not the entries of the links they replace. A table constraint lists every
 combination of its columns that can occur, and independent columns occur in every
@@ -756,8 +780,8 @@ cost.
 - A gate is within its rest's bound where it keeps the term, and exact where it does not.
 
 **Rule 4 multiplies after the collapse, by constants.**
-- A switch's rest is collapsed into `w` as any linear form is, every list in it rounded
-  once.
+- A switch's rest is collapsed into `w` as any linear realization is, every list in it
+  rounded once.
 - Its factor's distinct values `v_1 .. v_K` stay numbers. One true/false per value is
   on exactly where the factor takes that value: `add_map_domain` on the factor's rank,
   or a literal is its own.
@@ -798,15 +822,17 @@ assignment of the inputs, so an entry read from the wrong position fails.
 ## Architecture
 
 Three layers, each a small interface with thin subclasses, so that adding an operation,
-a form or a position step changes nothing else:
+a realization or a position step changes nothing else:
 
-- **Values.** A *position* is a `CpIndex`: one step that holds its parts (`Input`,
-  `Unit`, `Combine`; later `Compact`, `Extreme` and `Locate`). A *form* is
-  what a node is realized as, a `CpForm`: a `CpTable` (a float list on a position) and,
-  from Stage 3, a `CpLinear`. Values hold no model.
-- **Nodes.** `TableLowering` is a factory. It makes one `CpNode` per distinct sympy
-  node, of the class the node's sympy class calls for, and hands it what it reads.
-  Each node realizes its own form from its children the first time it is read.
+- **Values.** A *position* is an `Index`: one step that holds its parts (`InputIndex`,
+  `UnitIndex`, `CombineIndex`; later `CompactIndex`, `ExtremeIndex` and `LocateIndex`).
+  A *realization* is what a node is realized as, an `AbstractRealization`: a
+  `TableRealization` (a float list on a position) and, from Stage 3, a
+  `LinearRealization`. Values hold no model.
+- **Nodes.** `TableLowering` is a factory. It makes one `Node` per distinct sympy node,
+  of the class the node's sympy class calls for, and hands it what it reads. Each node
+  realizes itself the first time its realization is read, and reads its children's
+  realizations as it does.
 - **The build.** Each value builds its own CP-SAT side with `cp_expr(model)`: a step,
   a position, a table, a node. There is no emitter. The objective is
   `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
@@ -849,18 +875,19 @@ class TableLoweringError(Exception):
 # ------------------------------------------------------------------------- positions
 
 
-class CpIndex(ABC):
+class Index(ABC):
     """A position: from the inputs' values to 0 .. size - 1, in numpy and in CP-SAT.
     Each kind of step is a subclass that holds its parts as its own fields, so a step
-    depends on CpIndex alone. Input, Unit and Combine are its subclasses in Stage 1;
-    Compact (Stage 4), Extreme (Stage 7) and Locate (Stage 11) join them. Steps are
-    frozen dataclasses: equal positions compare equal and hash alike."""
+    depends on Index alone. InputIndex, UnitIndex and CombineIndex are its subclasses
+    in Stage 1; CompactIndex (Stage 4), ExtremeIndex (Stage 7) and LocateIndex (Stage
+    11) join them. Steps are frozen dataclasses: equal positions compare equal and hash
+    alike."""
 
     size: int  # a field of each step, given or computed from its parts
 
     @property
     @abstractmethod
-    def parts(self) -> tuple[CpIndex, ...]:
+    def parts(self) -> tuple[Index, ...]:
         """The positions it is made from, () for a leaf."""
 
     @property
@@ -876,21 +903,21 @@ class CpIndex(ABC):
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The CP-SAT side, from its parts' cp_expr."""
 
-    def under(self) -> list[CpIndex]:
+    def under(self) -> list[Index]:
         """This position and every position it is made from, each once, parts first."""
 
 
 @dataclass(frozen=True)
-class Input(CpIndex):
+class InputIndex(Index):
     """A leaf, and the thinnest step: a variable's own position, v - lo, for a domain
-    lo .. lo + size - 1. Unit is as thin."""
+    lo .. lo + size - 1. UnitIndex is as thin."""
 
     var: cp_model.IntVar
     size: int
     lo: int = 0
 
     @property
-    def parts(self) -> tuple[CpIndex, ...]:
+    def parts(self) -> tuple[Index, ...]:
         """(), a leaf."""
 
     @property
@@ -905,16 +932,16 @@ class Input(CpIndex):
 
 
 @dataclass(frozen=True)
-class Combine(CpIndex):
+class CombineIndex(Index):
     """(left, right) -> left * right.size + right: linear, as right.size is a
     constant."""
 
-    left: CpIndex
-    right: CpIndex
+    left: Index
+    right: Index
     size: int = field(init=False, repr=False, compare=False)  # left.size * right.size
 
     @property
-    def parts(self) -> tuple[CpIndex, ...]:
+    def parts(self) -> tuple[Index, ...]:
         """(left, right)."""
 
     @property
@@ -928,26 +955,26 @@ class Combine(CpIndex):
         """left.cp_expr(model) * right.size + right.cp_expr(model)."""
 
 
-# ----------------------------------------------------------------------------- forms
+# ---------------------------------------------------------------------- realizations
 
 
-class CpForm(ABC):
+class AbstractRealization(ABC):
     """What a node is realized as: the one thing a reader and the objective take of
-    it. A value that builds its own CP-SAT side: a CpTable, and from Stage 3 a
-    CpLinear, the form a sum is realized as."""
+    it. A value that builds its own CP-SAT side: a TableRealization, and from Stage 3
+    a LinearRealization, what a sum is realized as."""
 
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The form in model, in COST_SCALE units."""
+        """The realization in model, in COST_SCALE units."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
-class CpTable(CpForm):
+class TableRealization(AbstractRealization):
     """values[index], made together and never apart: a read-only float list, refused
     when its length is not the index's size."""
 
     values: np.ndarray
-    index: CpIndex
+    index: Index
 
     @property
     def entries(self) -> int:
@@ -964,70 +991,72 @@ class CpTable(CpForm):
 
 
 # Each symbol's column, its value at each row of its input, on that input.
-Inputs: TypeAlias = Mapping[sympy.Symbol, CpTable]
+Inputs: TypeAlias = Mapping[sympy.Symbol, TableRealization]
 
 
 # ----------------------------------------------------------------------------- nodes
 
 
 @dataclass(eq=False)
-class CpNode:
+class Node:
     """The CP-SAT counterpart of one sympy node: an operation over free symbols,
     realized as one table over its inputs. expr, children and cap are injected by
     the factory; children are made first, and a subexpression two parents share is
     one node. Nothing here touches a model until cp_expr."""
 
     expr: sympy.Basic
-    children: tuple[CpNode, ...]
+    children: tuple[Node, ...]
     cap: int
 
     @cached_property
-    def columns(self) -> Mapping[sympy.Symbol, CpTable]:
+    def columns(self) -> Mapping[sympy.Symbol, TableRealization]:
         """Each free symbol's column, gathered from the children."""
 
     @cached_property
-    def form(self) -> CpForm:
+    def realization(self) -> AbstractRealization:
         """realize(), the first time it is read, and kept."""
 
-    def realize(self) -> CpForm:
+    def realize(self) -> AbstractRealization:
         """One table over its inputs, positions combined in symbol order, the last
         fastest. Raises TableLoweringError naming the node past the cap (never
-        evaluated) and for a value that is not finite."""
+        evaluated) and for a value that is not finite. Under the cap it reads its
+        children's realizations first, so each child refuses its own value that is
+        not finite."""
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """form.cp_expr(model): reading the form realizes the node, so a refusal comes
-        before anything is added to the model."""
+        """realization.cp_expr(model): reading the realization realizes the node, so
+        a refusal comes before anything is added to the model."""
 
 
 @dataclass(eq=False)
-class CpSymbol(CpNode):
+class InputNode(Node):
     """A symbol, its column injected by the factory; None raises "a symbol with no
     input", naming it, when a reader reads its columns."""
 
-    column: CpTable | None = None
+    column: TableRealization | None = None
 
-    def realize(self) -> CpTable:
+    def realize(self) -> TableRealization:
         """Its column."""
 
 
 @dataclass(eq=False)
-class CpConstant(CpNode):
-    """A node with no free symbol: its value on the Unit position."""
+class ConstantNode(Node):
+    """A node with no free symbol: its value on the UnitIndex position."""
 
-    def realize(self) -> CpTable:
-        """Its value, one entry on Unit."""
+    def realize(self) -> TableRealization:
+        """Its value, one entry on UnitIndex."""
 
 
 class TableLowering:
-    """A factory for CpNodes. It holds the inputs and the cap, no model."""
+    """A factory for Nodes. It holds the inputs and the cap, no model."""
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
         """inputs gives each symbol's column; cap bounds one table."""
 
-    def lower(self, root: sympy.Basic) -> CpNode:
+    def lower(self, root: sympy.Basic) -> Node:
         """root's node, over the graph of nodes under it. Nothing is realized here."""
 
-    def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:
+    def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, Node]:
         """Each distinct node under root, children first, in the order of
         sympy.postorder_traversal with its repeats dropped; no ExprCondPair."""
 
@@ -1036,23 +1065,23 @@ class TableLowering:
 
 
 @dataclass(frozen=True, eq=False)
-class CpLinear(CpForm):
+class LinearRealization(AbstractRealization):
     """A sum read linearly: its constant plus its terms, A + B + C, each a child's
-    form, kept whole."""
+    realization, kept whole."""
 
     constant: float
-    terms: tuple[CpForm, ...]
+    terms: tuple[AbstractRealization, ...]
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """Its rounded constant plus each term's cp_expr."""
 
 
 @dataclass(eq=False)
-class CpAdd(CpNode):
-    """A sum: always realized as a CpLinear."""
+class AddNode(Node):
+    """A sum: always realized as a LinearRealization."""
 
-    def realize(self) -> CpLinear:
-        """CpLinear of its children's forms."""
+    def realize(self) -> LinearRealization:
+        """LinearRealization of its children's realizations."""
 
 
 # ------------------------------------------------------------------ from Stage 11 on
@@ -1086,36 +1115,41 @@ disabled.
 the distinct nodes, each after its arguments. It makes each node from its children,
 which it made earlier, so a subexpression two terms share is one node that both
 parents hold:
-- A `Symbol` becomes a `CpSymbol`, handed its column from the inputs.
-- A node with no free symbol becomes a `CpConstant`: a number, `true`/`false`, or an
+- A `Symbol` becomes an `InputNode`, handed its column from the inputs.
+- A node with no free symbol becomes a `ConstantNode`: a number, `true`/`false`, or an
   operation on numbers such as `sqrt(2)`.
-- Any other node becomes a `CpNode`. From Stage 3, `Add` becomes `CpAdd`, and each
-  later operation gets its class the same way.
+- Any other node becomes a `Node`. From Stage 3, `Add` becomes `AddNode`, and each later
+  operation gets its class the same way.
 
 `lower` returns the root's node and realizes nothing. On the 50 replayed objectives
 the list holds 110 to 11,020 distinct nodes, from a traversal of 589 to 71,914.
 
 **Realized when read.** A node computes `columns` (its inputs' columns, gathered from
-its children) and `form` (`realize()`) the first time each is read, and keeps them. A
-node nobody reads is never realized. In Stage 1 only the root is: `lower(expr).cp_expr`
-lambdifies the root alone, where the visitor of the earlier plan lambdified every node.
-Reading the root reads down the tree, each node once, as deep as the expression (6 to
-17 on the replay).
+its children) and `realization` (`realize()`) the first time each is read, and keeps
+them. A node nobody reads is never realized, and `lower` reads none. Realizing a node
+reads its children's realizations first, so reading the root realizes every node under
+it, each once, as deep as the expression (6 to 17 on the replay). Each node checks its
+own list as it is realized, which is how a value that is not finite is refused at the
+node that makes it (Decisions). In Stage 1 that lambdifies every node, as the visitor of
+the earlier plan did, and Stage 2 replaces most of those calls with numpy steps. A node
+past the cap raises before it reads a child, so nothing under it is evaluated.
 
 On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, Stage 1
-realizes the root as one table of 6 entries on `2*division_a + division_b`, builds it
-as one `add_element`, and realizes none of the root's three children:
+realizes the root as one table of 6 entries on `2*division_a + division_b` and builds it
+as one `add_element`. Its three children and the four nodes under them are realized too,
+each checking its own list, and the two powers are lambdified. Only the root is built,
+so they add nothing to the model:
 
 ```python
 model = cp_model.CpModel()
 division_a = model.new_int_var(0, 2, "division_a")   # split_a's menu: 1, 2, 4
 division_b = model.new_int_var(0, 1, "division_b")   # split_b's menu: 1, 3
 split_a, split_b = sympy.symbols("split_a split_b", positive=True)
-pos_a = Input(division_a, size=3)
-pos_b = Input(division_b, size=2)
+pos_a = InputIndex(division_a, size=3)
+pos_b = InputIndex(division_b, size=2)
 inputs = {
-    split_a: CpTable(values=np.array([1.0, 2.0, 4.0]), index=pos_a),
-    split_b: CpTable(values=np.array([1.0, 3.0]), index=pos_b),
+    split_a: TableRealization(values=np.array([1.0, 2.0, 4.0]), index=pos_a),
+    split_b: TableRealization(values=np.array([1.0, 3.0]), index=pos_b),
 }
 root = TableLowering(inputs, cap=8192).lower(9 * split_a ** -2 * split_b ** 0.5)
 model.minimize(root.cp_expr(model))   # 3 variables, 1 constraint
@@ -1129,10 +1163,11 @@ exceptions:
   its node reads from `expr`.
 
 **Refusals.** A node raises `TableLoweringError`, naming itself, when a reader reads it
-and it has no form:
+and it has no realization:
 - a symbol with no input, raised by name when a parent reads its columns;
 - one table past the cap, which is never evaluated;
-- a value that is not finite (`CpNode._finite`, wherever a table is realized);
+- a value that is not finite (`Node._finite`, wherever a table is realized), at the node
+  that makes it, since a node reads its children before it makes its own table;
 - a function with no numeric value.
 
 The read comes before anything is added to the model for the node. In Stage 1 the
@@ -1140,13 +1175,13 @@ root's read comes before any write, so a refusal leaves the model as it was. Fro
 3, when one sum's terms are built in turn, a later term can refuse after an earlier one
 was built, and the entry point's copy and swap back (Decisions) restores the model.
 
-**The build.** `CpIndex.cp_expr` builds a position, each step building its parts first,
-`CpTable.cp_expr` a table (rounded once; a number, adding nothing,
-when constant; otherwise one `add_element` on its position) and `CpNode.cp_expr` a
-node's form. Only `cp_expr` methods touch the model. In Stage 1 each call builds anew,
-and a part reached twice is built twice: enough while only the root is built and no
-step writes the model. Stage 3 builds a node once and Stage 4 a position once, through
-one memo per build.
+**The build.** `Index.cp_expr` builds a position, each step building its parts first,
+`TableRealization.cp_expr` a table (rounded once; a number, adding nothing, when
+constant; otherwise one `add_element` on its position) and `Node.cp_expr` a node's
+realization. Only `cp_expr` methods touch the model. In Stage 1 each call builds anew,
+and a part reached twice is built twice: enough while only the root is built and no step
+writes the model. Stage 3 builds a node once and Stage 4 a position once, through one
+memo per build.
 
 **The copy.** `lower_cost_with_tables` copies the model with `model.clone()` before it
 maps an input. A failure in the build can come after variables were made: an entry past
@@ -1179,14 +1214,14 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 | Stage | Hook |
 |---|---|
 | 2 | a node's numpy step on its children's lists, where they share a position |
-| 3 | `CpLinear` and `CpAdd`, with a sum always realized as a `CpLinear`; `CpMul` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's form is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
-| 4 | the switch form; the `Compact` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the forms it weighs: the switch and `CpLinear` |
+| 3 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
+| 4 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization` |
 | 5 | the gate, and `RelayoutCharge` as its own node |
 | 6 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 6 decides whether a node keeps its two best tables for its reader |
-| 7 | the `Extreme` step; a Min/Max node with its ladder |
+| 7 | the `ExtremeIndex` step; a Min/Max node with its ladder |
 | 8 | the fold, one more way to realize a product |
-| 9 | the `lin_max`/`lin_min` form, with its entry count for margin 2 |
-| 11 | the `Locate` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
+| 9 | the `lin_max`/`lin_min` realization, with its entry count for margin 2 |
+| 11 | the `LocateIndex` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
 
 Open in Stage 3: whether terms of one sum that are tables on equal positions are added
 before the rounding, one lookup and one rounding (`split ** 0.5 + split ** 0.7` is 3112
@@ -1196,17 +1231,17 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 
 | Stage | Adds to the architecture |
 |---|---|
-| 1 | the values (`CpIndex` with its steps `Input`, `Unit`, `Combine`; `CpForm`, `CpTable`), each with `cp_expr`; `values_on_grid` by lambdify; `CpNode`, `CpSymbol`, `CpConstant`; `TableLowering`, the factory; `TableLoweringError` |
+| 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists |
-| 3 | `CpLinear`, `CpAdd`, `CpMul` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `CpTable.cp_expr` |
-| 4 | the switch: a product's linear form, the rest collapsed once and multiplied per factor value; `Compact`; the choice between ways (rule 3) |
+| 3 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
+| 4 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3) |
 | 5 | the gate, and `RelayoutCharge` as its own node |
 | 6 | a node realized from its parts: ranks and pairs |
-| 7 | Min/Max nodes realized by rung: `Extreme`, ladders, rungs, clamping |
+| 7 | Min/Max nodes realized by rung: `ExtremeIndex`, ladders, rungs, clamping |
 | 8 | a product realized by fold |
-| 9 | the linear form of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
+| 9 | the linear realization of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
 | 10 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
-| 11 | `Locate`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
+| 11 | `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
 | 12 | nothing in the module: the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
@@ -1222,7 +1257,7 @@ then with the solver behind the flag.
 | 1 | the base mechanics: inputs and an expression to a CP-SAT objective, one table per node, every value by lambdify | an expression whose inputs fit the cap together; no real objective |
 | 2 | numpy steps from a dict, lambdify for any class it does not hold | the same as Stage 1, in less lowering time |
 | 3 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
-| 4 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `Compact` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
+| 4 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `CompactIndex` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
 | 5 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
 | 6 | ranks and pairs: a node's table from its parts | nodes over several buffers read as tables: products under a power, a log or a Piecewise, short lists over several buffers |
 | 7 | rule 1: a Min/Max by rung, clamped | a Min/Max over several buffers |
@@ -1257,9 +1292,9 @@ menus"; an empty cell is unchanged:
 | 6 | | 5 · 38, the switch; 6 · 68 as a pair | 22 · 268, from ranked parts | 30 · 327 |
 | 7 | | | 14 · 63, by rung | 22 · 122 |
 
-- From Stage 3 the sum is linear, so it holds each term's form: 33 entries where one
-  table over the root is 24. On menus this short the terms' tables together are larger
-  than the root's one table; at real sizes one table is never an option.
+- From Stage 3 the sum is linear, so it holds each term's realization: 33 entries where
+  one table over the root is 24. On menus this short the terms' tables together are
+  larger than the root's one table; at real sizes one table is never an option.
 - The two terms on `split_a` are one list if Stage 3 adds lists on one position before
   the rounding (open there); kept apart, each total is 3 · 21 more.
 - Stage 4's switch takes the product from 231 entries to 38. Stage 6 leaves it a switch,
@@ -1267,15 +1302,15 @@ menus"; an empty cell is unchanged:
 - The Max's ranked parts at Stage 6 assume ranks apply to a Min/Max before Stage 7
   (review M2, open). If they do not, the Max stays one table until Stage 7, and Stage 6
   changes nothing here.
-- Stage 9 changes nothing: the `lin_max`, 52 entries, is not under half of the rung
-  form's 63. Stages 2, 5 and 8 change no entry here: this graph reads no literal and
+- Stage 9 changes nothing: the `lin_max`, 52 entries, is not under half of the table by
+  rung's 63. Stages 2, 5 and 8 change no entry here: this graph reads no literal and
   multiplies no Min/Max.
 
-Each term's form was run through CP-SAT at every assignment, minimizing and maximizing
-agreeing at each, within its bound: the switch and the ranked Max on 2026-11-18
-(`~/gap-probe/spyre-roadmap-pr22/2026-11-18/`), the one tables and the rung form in the
-2026-11-17 runs. The totals are sums of the terms, not runs of the whole objective. The
-reductions compound, so a stage is measured with the ones before it on.
+Each term's realization was run through CP-SAT at every assignment, minimizing and
+maximizing agreeing at each, within its bound: the switch and the ranked Max on
+2026-11-18 (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/`), the one tables and the table
+by rung in the 2026-11-17 runs. The totals are sums of the terms, not runs of the whole
+objective. The reductions compound, so a stage is measured with the ones before it on.
 
 In the tests below, *exact* means: at every assignment of the inputs the lowered
 objective is solved by minimizing and by maximizing. Both are feasible, they agree, and
@@ -1291,70 +1326,79 @@ Tests build the inputs by hand, as in Architecture. Every value is computed by
 `sympy.lambdify`; numpy steps come in Stage 2.
 
 **Values by lambdify.** `values_on_grid(expr, columns, positions)` lambdifies `expr`
-over its free symbols with the `numpy` module and evaluates it at every joint
-assignment of `positions`, row-major, the last position fastest. Each symbol is read
-from its column at its own position, so two symbols of one buffer move together. A
-node calls it once, when its form is first read. A function that takes scalars only is
-evaluated point by point: `RelayoutCharge`'s `_imp_` rounds its division with `round`,
-which an array does not take (checked on sympy 1.14). lambdify maps each sympy function
-to sympy's own meaning: `sinc(1)` is 0.84, as in sympy.
+over its free symbols with the `numpy` module and evaluates it at every joint assignment
+of `positions`, row-major, the last position fastest. Each symbol is read from its
+column at its own position, so two symbols of one buffer move together. A node calls it
+once, when it is realized. A function that takes scalars only is evaluated point by
+point: `RelayoutCharge`'s `_imp_` rounds its division with `round`, which an array does
+not take (checked on sympy 1.14). lambdify maps each sympy function to sympy's own
+meaning: `sinc(1)` is 0.84, as in sympy.
 
 **Values that are not finite.** A NaN, `inf` or `-inf` raises `TableLoweringError` at
-the node whose list holds it (Decisions). In Stage 1 only the root's list is made, so a
-Piecewise with an arm that is infinite where it is not taken is exact, since its own
-list is finite. A Piecewise with no arm true is NaN, which lambdify writes as
-`select(..., default=nan)`, and raises. From Stage 2, where a Piecewise reads its arms'
-lists, such an arm raises.
+the node whose list holds it (Decisions). A node reads its children's realizations as it
+is realized, so every node under the root makes its list and checks it, whether or not
+the root's value depends on it:
+- a Piecewise with an arm that is infinite where it is not taken raises at the arm,
+  though the Piecewise's own list is finite;
+- `Min(1/(a - 2), 5)` raises at `1/(a - 2)`, though the Min drops the infinite value;
+- a condition on `sqrt(a - 3)` raises at the `sqrt`, where the comparison alone would
+  read a NaN as false;
+- a Piecewise with no arm true is NaN, which lambdify writes as `select(...,
+  default=nan)`, and raises at the Piecewise.
 
 **The lowering (`cpsat_table_lowering.py`).**
 
-- The values: `CpIndex`, a position, with its steps `Input`, `Unit` and `Combine`, each
-  holding its parts as fields (`Combine(left, right)`, its size computed from them);
-  `CpForm` and `CpTable`, with `entries` and `finite`; each with `cp_expr`; and
-  `TableLoweringError`.
-- The nodes: `CpNode`, which realizes one table over its inputs; `CpSymbol`, its
-  column; `CpConstant`, its value on `Unit`. `columns` and `form` are kept from their
-  first read. A table past the cap is never evaluated and raises, naming the node.
+- The values: `Index`, a position, with its steps `InputIndex`, `UnitIndex` and
+  `CombineIndex`, each holding its parts as fields (`CombineIndex(left, right)`, its
+  size computed from them); `AbstractRealization` and `TableRealization`, with `entries`
+  and `finite`; each with `cp_expr`; and `TableLoweringError`.
+- The nodes: `Node`, which realizes one table over its inputs; `InputNode`, its column;
+  `ConstantNode`, its value on `UnitIndex`. `columns` and `realization` are kept from
+  their first read. A table past the cap is never evaluated and raises, naming the node.
+  Under the cap a node reads its children's realizations before it makes its table.
 - The factory: `TableLowering.rewrite` makes one node per distinct sympy node, children
   first, and `lower` returns the root's node, realizing nothing.
-- The build: `CpTable.cp_expr` rounds a list once onto `COST_SCALE`, makes a constant
-  one a number without building its position, reads any other with one `add_element`,
-  and refuses an entry past 2^50. The objective is the root's one lookup.
+- The build: `TableRealization.cp_expr` rounds a list once onto `COST_SCALE`, makes a
+  constant one a number without building its position, reads any other with one
+  `add_element`, and refuses an entry past 2^50. The objective is the root's one lookup.
 
-`Locate`, the position of a variable whose domain has gaps, waits for Stage 11 and the
-printer's maps: no replayed objective reads such a variable.
+`LocateIndex`, the position of a variable whose domain has gaps, waits for Stage 11 and
+the printer's maps: no replayed objective reads such a variable.
 
 After this stage an expression whose inputs fit the cap together is lowered exactly.
 Anything wider raises, and on a real objective the root is always wider. Nothing
 imports the module until Stage 12, so the raise reaches no compile.
 
-Tests, `tests/inductor/test_cpsat_table_lowering.py`, 30, device-free (run with
+Tests, `tests/inductor/test_cpsat_table_lowering.py`, 31, device-free (run with
 `--noconftest` off a Spyre host):
 
 - the factory makes children first, shares a subexpression as one node, and leaves the
-  expression unchanged; a Piecewise arm gets no node; each node is a `CpSymbol`, a
-  `CpConstant` or a `CpNode` by its expression; a node gathers its columns from its
+  expression unchanged; a Piecewise arm gets no node; each node is an `InputNode`, a
+  `ConstantNode` or a `Node` by its expression; a node gathers its columns from its
   children;
-- a node realizes itself when its form is read, with only its children and its cap; a
-  table past the cap is never evaluated; `lower` realizes nothing, and a refusal leaves
-  the model as it was; a node is lambdified once, and only when its form is read;
-  `lower(...).cp_expr` lambdifies the root alone;
-- a `CpForm` cannot be made, nor a subclass without `cp_expr`, and a `CpTable` is one; a
-  table builds its own lookup, and a constant one adds nothing to the model;
+- a node realizes itself when its realization is read, with only its children and its
+  cap, and reads its children's realizations as it does; a table past the cap is never
+  evaluated, nor any node under it; `lower` realizes nothing, and a refusal leaves the
+  model as it was; a node is lambdified once, and only when its realization is read;
+  `lower(...).cp_expr` lambdifies every node under the root once, the root last;
+- an `AbstractRealization` cannot be made, nor a subclass without `cp_expr`, and a
+  `TableRealization` is one; a table builds its own lookup, and a constant one adds
+  nothing to the model;
 - a list must have its index's size; a step takes the parts it names, and equal steps
-  are one position, hashing alike;
-  a `CpTable` takes `values` and `index` only, and its list cannot be written to or
-  replaced; every position takes, at every assignment, the value `CpIndex.positions`
-  gives;
+  are one position, hashing alike; a `TableRealization` takes `values` and `index` only,
+  and its list cannot be written to or replaced; every position takes, at every
+  assignment, the value `Index.positions` gives;
 - `values_on_grid`: row-major over three sizes, two symbols on one position, a constant
   broadcast;
 - exact (one solution per assignment, within half a unit): one table over two inputs of
-  different sizes, not symmetric in them; variables above and below 0; a
-  Piecewise with an infinite arm not taken; `sympy.sec` and `sympy.sinc` at sympy's
-  values; a relayout charge, one table over its literal and its division;
-- refused: a value that is not finite; a Piecewise with no arm true; an undefined
-  function; an entry too large for int64 sums; a symbol with no input, by name; the
-  naive lowering past the cap, naming the sum, which Stage 3 lowers;
+  different sizes, not symmetric in them; variables above and below 0; `sympy.sec` and
+  `sympy.sinc` at sympy's values; a relayout charge, one table over its literal and its
+  division;
+- refused: a value that is not finite, at the root, and under a finite root at the
+  operation, constant or input that makes it; an infinite Piecewise arm at the arm,
+  taken or not; a Piecewise with no arm true; an undefined function; an entry too large
+  for int64 sums; a symbol with no input, by name; the naive lowering past the cap,
+  naming the sum, which Stage 3 lowers;
 - a coefficient is applied before the rounding (10137 at split 2, not 7 * 1448); a
   constant objective is an int and adds no variable.
 
@@ -1423,13 +1467,13 @@ The second optimization, the first that changes entries: "the sum stays linear" 
 affine list needs no table" of "How the tables are kept small", with the collapse of
 "Collapsing float lists into linear terms".
 
-- `CpLinear`, a `CpForm`: a constant and its terms, each a form. Its `cp_expr` is its
-  rounded constant plus each term's `cp_expr`.
-- `CpAdd`, made by the factory for an Add, is always realized as a `CpLinear` of its
-  children's forms, `A + B + C`, kept whole.
-- `CpMul`, for a Mul with constant factors and one other child: its form is the child's
-  form with the factor applied in float before the rounding. `7 * split ** 0.5` at split
-  2 is 10137, not 7 * 1448.
+- `LinearRealization`, an `AbstractRealization`: a constant and its terms, each a
+  realization. Its `cp_expr` is its rounded constant plus each term's `cp_expr`.
+- `AddNode`, made by the factory for an Add, is always realized as a `LinearRealization`
+  of its children's realizations, `A + B + C`, kept whole.
+- `MulNode`, for a Mul with constant factors and one other child: its realization is the
+  child's with the factor applied in float before the rounding. `7 * split ** 0.5` at
+  split 2 is 10137, not 7 * 1448.
 - A node's `table`, for a parent that computes its own values from a child's list (a
   power, a log, a Piecewise): one table over its inputs, as Stage 1 realizes it, read
   only when such a parent asks. A sum read that way is one table again, and raises past
@@ -1439,7 +1483,7 @@ affine list needs no table" of "How the tables are kept small", with the collaps
   built once through it. It lives for one build: the swap back after a failure drops it
   with the copy, so nothing built into the discarded model is reused. Positions go
   through it from Stage 4, when a step first writes the model.
-- `CpTable.cp_expr` reads a list that is affine in its position as a linear
+- `TableRealization.cp_expr` reads a list that is affine in its position as a linear
   expression, with no table.
 - Open: whether terms of one sum that are tables on equal positions are added before
   the rounding (one lookup, `split ** 0.5 + split ** 0.7` is 3112 at split 2) or kept
@@ -1451,8 +1495,8 @@ still no whole objective: each has a wide term past the cap.
 
 Tests:
 
-- the factory makes a `CpAdd` for an Add and a `CpMul` for a constant times one child;
-  a sum's form is a `CpLinear` of its children's forms;
+- the factory makes an `AddNode` for an Add and a `MulNode` for a constant times one
+  child; a sum's realization is a `LinearRealization` of its children's realizations;
 - the sum that raised in Stage 1 is exact, with no table across two buffers;
 - a coefficient on a term, and on a sum, is applied before the rounding;
 - an affine list adds no table;
@@ -1462,32 +1506,32 @@ Tests:
 
 ### Stage 4: rule 4, the switch
 
-A Mul with two or more factors that are not constants gains its linear form, a switch.
-Through Stage 3 such a product is one table over its inputs. From here a linear reader
-can read it as its rest, collapsed once, times its factor's value, with no table
+A Mul with two or more factors that are not constants gains its linear realization, a
+switch. Through Stage 3 such a product is one table over its inputs. From here a linear
+reader can read it as its rest, collapsed once, times its factor's value, with no table
 crossing the two. It comes right after the linear sums because it needs nothing else:
-its rest is a form Stage 3 already makes. It brings two things later stages reuse,
-`Compact` and the choice between a node's ways by entries (rule 3).
+its rest is a realization Stage 3 already makes. It brings two things later stages
+reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
 
 - **The factor.** The factor with the fewest distinct values, among those with a table,
   is the one switched on. Where its list repeats a value, it is ranked to its distinct
-  values by `Compact`, a new `CpIndex` step: one lookup from its position to the rank
+  values by `CompactIndex`, a new `Index` step: one lookup from its position to the rank
   of its value. Where it does not, its position is its rank. Its values stay numbers.
-  `Compact` is the first step that writes the model, so from here a position is built
-  once per build: `CpIndex.cp_expr` looks it up in the build memo by its value. Two
+  `CompactIndex` is the first step that writes the model, so from here a position is
+  built once per build: `Index.cp_expr` looks it up in the build memo by its value. Two
   tables on equal positions share one lookup even when two nodes made them, and a part
-  reached twice in one position is built once. Without it each is built twice: two
-  rank lookups where one is needed
-  (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/merged/future_steps.py`). A step's data
-  is a tuple, never an array, so that it hashes.
+  reached twice in one position is built once. Without it each is built twice: two rank
+  lookups where one is needed
+  (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/merged/future_steps.py`). A step's data is
+  a tuple, never an array, so that it hashes.
 - **The true/falses.** `add_map_domain` takes the factor's position as it is, any linear
   expression: ortools 9.15 writes it as enforced linear constraints, so the position
-  needs no variable of its own. An `Input` with `lo` passes its variable and `lo` as the
-  offset.
-- **The rest.** The product of the other factors, read as their form: one child's
-  form when one is left, a further switch when more are. It may hold lists on several
-  buffers, a constant and other switches, and from Stage 9 a Min/Max kept linear. All
-  of it collapses into one integer `w`.
+  needs no variable of its own. An `InputIndex` with `lo` passes its variable and `lo`
+  as the offset.
+- **The rest.** The product of the other factors, read as their realization: one child's
+  realization when one is left, a further switch when more are. It may hold lists on
+  several buffers, a constant and other switches, and from Stage 9 a Min/Max kept
+  linear. All of it collapses into one integer `w`.
 - **The cases.** `add_map_domain` on the factor's rank gives one true/false per value,
   on exactly where the factor takes it. One variable `g` takes, under each true/false:
   - for a whole value `v`, `g == v·w`;
@@ -1509,15 +1553,15 @@ its rest is a form Stage 3 already makes. It brings two things later stages reus
   A relayout charge stays one table over its literal and its division until Stage 5.
 - **The choice (rule 3).** A node gains a second way to be realized, and the choice
   between its ways by entries, which Stages 6 to 9 extend. The switch, its rest's
-  entries plus one per factor value and the factor's `Compact`, is weighed against the
-  product's one table over its inputs. A factor with a repeated value times a short
+  entries plus one per factor value and the factor's `CompactIndex`, is weighed against
+  the product's one table over its inputs. A factor with a repeated value times a short
   list can keep its table: `[1, 1, 2]` times a list of 2 is 6 entries as a table and 7
   as a switch. Under a nonlinear reader the product is its table, as in Stage 3.
-- **Entries.** `CpForm` stays `cp_expr` alone; the forms the choice weighs get an entry
-  count here. The switch counts its rest's entries, one per factor value and the
-  factor's `Compact`. `CpLinear` counts its terms', since a switch's rest can be a sum:
-  `derate * (A + B)` weighs its switch, over `A`'s and `B`'s tables, against one table
-  over every input of the product.
+- **Entries.** `AbstractRealization` stays `cp_expr` alone; the realizations the choice
+  weighs get an entry count here. The switch counts its rest's entries, one per factor
+  value and the factor's `CompactIndex`. `LinearRealization` counts its terms', since a
+  switch's rest can be a sum: `derate * (A + B)` weighs its switch, over `A`'s and `B`'s
+  tables, against one table over every input of the product.
 - **The cap.** A factor's values count as entries; a factor with more values than the
   cap has no switch.
 
@@ -1530,7 +1574,7 @@ error 1.2e-7 of the cost. Stage 11's replay compares against #6315's tip.
 
 On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, the
 switch is 5 entries against the table's 6 at its own menus, and 38 against 231 at the
-real menus: the rest's 21, the factor's 6 values and its `Compact` of 11. At every
+real menus: the rest's 21, the factor's 6 values and its `CompactIndex` of 11. At every
 assignment minimizing and maximizing agree, within 0.66 and 0.91 units
 (`~/gap-probe/spyre-roadmap-pr22/2026-11-18/switch_product.py`).
 
@@ -1543,11 +1587,11 @@ Tests:
 - a factor whose values are all whole is exact within its values times the rest's
   bound, with one constraint per value;
 - two products with one factor are one switch with one `w`;
-- two tables on equal `Compact` positions, made by two nodes, add one rank lookup, and
-  a `Compact` reached twice in one position adds one;
+- two tables on equal `CompactIndex` positions, made by two nodes, add one rank lookup,
+  and a `CompactIndex` reached twice in one position adds one;
 - a factor of mixed sign, and a negative one, times a sum of lists over two buffers is
   exact;
-- a factor with a repeated value is ranked by one `Compact`, and one with distinct
+- a factor with a repeated value is ranked by one `CompactIndex`, and one with distinct
   values adds none;
 - a product of three non-constant factors is a switch inside a switch, and is exact;
 - a literal times a sum over several buffers is the two-value switch, with the rest's
@@ -1568,8 +1612,8 @@ Three savings are left:
 - the nonzero value can go into the rest's lists in float, so the case is `g == w`, and
   a fractional coefficient such as `0.5 - 0.5*x` adds no rounding.
 
-A relayout charge, which is not a Mul, gets the same form here. Until now it was one
-table over its literal and its division, twice the menu, its off half zeros.
+A relayout charge, which is not a Mul, is realized the same way here. Until now it was
+one table over its literal and its division, twice the menu, its off half zeros.
 
 - **The gate.** A factor of a Mul is a gate when it reads one 0/1 literal and is 0 at
   one of the literal's values: `x`, `1 - x`, `3*x`, or `2 - 2*x`, which is how sympy
@@ -1582,13 +1626,14 @@ table over its literal and its division, twice the menu, its off half zeros.
   gate is a constant times the gate's list on its literal, which is affine (Stage 3): no
   gate and no table. So `(1 - x) * (c - c*x + c*x/t)` becomes `c * (1 - x)`, with no
   table over the tile's division.
-- **The linear form.** A gate is a switch form on the literal's `Input`, with values 0
-  and 1. Its kept case's rest is the rest's form times the gate's value, in float, and
-  the other case is empty. A product with gates on several literals is a
-  switch inside a switch. An Add merges gates on one literal into one, their rests added
-  case by case, so lists on one position inside them are one list and round once.
-- **A relayout charge** gets a node class of its own. Its form gates its prices, a
-  list on its division, by its literal kept at 1, so it costs the division's menu
+- **The linear realization.** A gate is a switch realization on the literal's
+  `InputIndex`, with values 0 and 1. Its kept case's rest is the rest's realization
+  times the gate's value, in float, and the other case is empty. A product with gates on
+  several literals is a switch inside a switch. An Add merges gates on one literal into
+  one, their rests added case by case, so lists on one position inside them are one list
+  and round once.
+- **A relayout charge** gets a node class of its own. Its realization gates its prices,
+  a list on its division, by its literal kept at 1, so it costs the division's menu
   once. Its table over the literal and the division stays for a nonlinear reader.
 - **The build.** A gate's `cp_expr` builds it as any switch, with the literal, or its
   negation, as the kept case's true/false: `g == w` under it and `g == 0` under the
@@ -1598,10 +1643,10 @@ table over its literal and its division, twice the menu, its off half zeros.
   gate: it never has more entries, since its rest reads the literal no more. A gate is
   read only linearly: under a power, a log or any other nonlinear node, the product is
   its table, as in Stage 3.
-- **Inside other forms.** A product of a gate and other non-constant factors is the
-  gate's switch, its rest the product of the others, switched by Stage 4 when more than
-  one is left. A gate inside the rest of another switch is one more term there, and so,
-  from Stage 9, is a gate inside an operand of a Min/Max kept linear.
+- **Inside other realizations.** A product of a gate and other non-constant factors is
+  the gate's switch, its rest the product of the others, switched by Stage 4 when more
+  than one is left. A gate inside the rest of another switch is one more term there, and
+  so, from Stage 9, is a gate inside an operand of a Min/Max kept linear.
 
 #6315 measured this form against tabling the literal (Decisions). Small default-config
 kernels went from 2 to 2.5 times the printer's solve time to the printer's own. Once a
@@ -1641,8 +1686,8 @@ Tests:
 A node gains one more way to be realized, the table from its parts: "equal values share
 a rank". Stage 4's choice by entries (rule 3) picks among its ways.
 
-- Each child's list is compacted to its distinct values, a `Compact` (Stage 4) on its
-  position; the positions are combined, and the node's numpy step is applied across
+- Each child's list is compacted to its distinct values, a `CompactIndex` (Stage 4) on
+  its position; the positions are combined, and the node's numpy step is applied across
   them. A product of two short lists over two buffers is one table over the pair of
   their ranks.
 - A node takes the cheapest, in entries, of its ways: one table over its inputs, the
@@ -1656,9 +1701,9 @@ With the switch before it, a product of two lists on one buffer each, under a li
 reader, stays its switch: the switch never has more entries than the pair. With `n` the
 rest's positions, `d` and `d_f` the rest's and the factor's distinct values, the switch
 is `n + d_f` against `d * d_f`, plus `n` when the rest repeats a value, both with the
-factor's `Compact`. On the step-by-step graph's product that is 38 against 68. So the
-pairs of this stage pay where a table is read: under a power, a log or a Piecewise, and
-at nodes that are not products, such as a Max over several buffers before Stage 7.
+factor's `CompactIndex`. On the step-by-step graph's product that is 38 against 68. So
+the pairs of this stage pay where a table is read: under a power, a log or a Piecewise,
+and at nodes that are not products, such as a Max over several buffers before Stage 7.
 
 Tests:
 
@@ -1673,14 +1718,14 @@ Tests:
 
 ### Stage 7: rule 1, a Min/Max by rung
 
-A Max and a Min get a node class of their own, `CpExtreme`, with one more way to be
+A Max and a Min get a node class of their own, `ExtremeNode`, with one more way to be
 realized from their parts: by rung (rule 1), with clamping. "The Max is read by rung"
 and "values past the bound are clamped" of "How the tables are kept small".
 
 - The ladder of a Min/Max: the values it can return, ascending, and the bound past which
   an operand's value is clamped.
-- Rungs: each of an operand's clamped values as its position on the ladder, a `Compact`;
-  then `Extreme`, the max or min of the rungs.
+- Rungs: each of an operand's clamped values as its position on the ladder, a
+  `CompactIndex`; then `ExtremeIndex`, the max or min of the rungs.
 
 Tests:
 
@@ -1712,16 +1757,17 @@ Tests:
 
 ### Stage 9: rule 3 in the objective, a Min/Max kept linear
 
-A Max and a Min gain their linear form, and a reader picks between it and the table.
+A Max and a Min gain their linear realization, and a reader picks between it and the
+table.
 
-- A Min/Max too wide to index, or whose table is over twice its linear form, stays a
-  `lin_min`/`lin_max` over linear operands. It does so only under nodes linear in it:
-  sums, constant factors, other Min/Max nodes, and any product, whose switch (Stage 4)
-  multiplies the collapsed Min/Max by its factor's values. Its operands are linear
-  forms, so a switch or a gate inside one is one more term there.
+- A Min/Max too wide to index, or whose table is over twice its linear realization,
+  stays a `lin_min`/`lin_max` over linear operands. It does so only under nodes linear
+  in it: sums, constant factors, other Min/Max nodes, and any product, whose switch
+  (Stage 4) multiplies the collapsed Min/Max by its factor's values. Its operands are
+  linear realizations, so a switch or a gate inside one is one more term there.
 - A coefficient on the Min/Max is applied to its operands' lists before they are
   collapsed. A negative one turns Min into Max.
-- The linear form counts its entries, its operands' lists, which margin 2 weighs
+- The linear realization counts its entries, its operands' lists, which margin 2 weighs
   against the table's.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
   `lin_max`, CP-SAT's presolve ran out of memory (`bad_alloc` past 40 GB on a Qwen3 0.6B
@@ -1739,11 +1785,11 @@ and the same Max under a sum, a constant, a product and a Min stays linear.
 ### Stage 10: the table constraint, an experiment off the stack
 
 With no emitter to swap (Architecture), the table constraint is built by changing the
-`cp_expr` of the classes it replaces (`CpTable`, `Compact`, `Extreme`) to
-`add_allowed_assignments` ("One constraint for both moves"), on a branch beside the
-stack. Its rows are read off `CpIndex.positions`, and a cost read on a rolled-up
-position goes into the rows. A table constraint over independent columns has their
-product as rows, so it takes in a link only where its rows are no more than the
+`cp_expr` of the classes it replaces (`TableRealization`, `CompactIndex`,
+`ExtremeIndex`) to `add_allowed_assignments` ("One constraint for both moves"), on a
+branch beside the stack. Its rows are read off `Index.positions`, and a cost read on a
+rolled-up position goes into the rows. A table constraint over independent columns has
+their product as rows, so it takes in a link only where its rows are no more than the
 entries of the `add_element`s it replaces. Stage 11's replay runs the stack and the
 branch. The branch merges only if it wins, as a change to those `cp_expr` methods.
 
@@ -1756,11 +1802,12 @@ occur is missing.
 
 - `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
   share its division as their position. Any other variable is indexed by its domain:
-  `Input` with its offset, or, when the domain has gaps, `Locate`, the `CpIndex` step
-  this stage adds: a position lookup. None of the 4,159 non-buffer variables the 50
-  replayed objectives read has gaps, so `Locate` is for objectives the replay does not
-  hold. A domain past the cap is not an input. Mapping the inputs adds nothing to the
-  model: a `Locate`'s lookup is built by its `cp_expr`, when a table on it is built.
+  `InputIndex` with its offset, or, when the domain has gaps, `LocateIndex`, the `Index`
+  step this stage adds: a position lookup. None of the 4,159 non-buffer variables the 50
+  replayed objectives read has gaps, so `LocateIndex` is for objectives the replay does
+  not hold. A domain past the cap is not an input. Mapping the inputs adds nothing to
+  the model: a `LocateIndex`'s lookup is built by its `cp_expr`, when a table on it is
+  built.
 - `lower`'s normalization: a relayout charge on a source this solve does not divide
   becomes 0.
 - `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=...)` copies the
@@ -1882,5 +1929,6 @@ After Stage 12, posted on that PR:
 
 ## Next step
 
-Stage 1 is built: spectre-ns/torch-spyre#32, branch `table-lowering-1-base-experimental`,
-30 device-free tests, with the design of Architecture. Stage 2 stacks on it in the fork.
+Stage 1 is built: spectre-ns/torch-spyre#32, branch
+`table-lowering-1-base-experimental`, 31 device-free tests, with the design of
+Architecture. Stage 2 stacks on it in the fork.
