@@ -29,10 +29,25 @@ layers, each with its own tests.
   functions by name. This replaces the 2026-11-16 decision, numpy first by name with
   lambdify as the backup.
 - **A stack of PRs**, one per stage, each on the one before, from branches in the fork.
-  Stage 1 is torch-spyre/torch-spyre#6475 (2026-11-19), from the fork's
+  Stage 1 is torch-spyre/torch-spyre#6475, from the fork's
   `table-lowering-1-base-experimental` on torch-spyre `main` of 2026-11-17 (92582da3).
-  It was first reviewed on the fork as spectre-ns/torch-spyre#32, which the plan cites
-  below for that review's decisions.
+  It merged into `main` on 2026-11-19 as one squashed commit, 290b5e0f, so Stage 2
+  branches from `main`. It was first reviewed on the fork as spectre-ns/torch-spyre#32,
+  which the plan cites below for that review's decisions.
+- **From the review of Stage 1 (2026-11-19).** #6475 was approved with a request for
+  the next PR of the stack, a note for the stage that wires the module in, and a
+  suggestion for the stack. Each lands in the stage that first needs it:
+  - Stage 2: the test module calls `pytest.importorskip("ortools.sat.python.cp_model")`
+    before it imports ortools or the table module. ortools is not installed on s390x or
+    ppc64le (`pyproject.toml:40`), and there an unguarded import is a collection error,
+    not a skip.
+  - Stage 2: the tests move from `tests/inductor/` to `tests/`.
+    `tests/inductor/conftest.py` allocates on a Spyre device for every session, so a
+    device-free test there cannot run without a device.
+  - Stage 12: the table module guards its ortools import as the printer does. The review
+    asks this of the stage that wires the module into the solver, which it numbers 11:
+    its count put the switch and the gate in one stage. Here that stage is 12; until
+    then nothing imports the module.
 - **Off by default.** Stages 1 to 11 add files nothing imports. Stage 12 adds the flag.
 - **Base mechanics first, then one optimization per stage, integration last
   (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
@@ -1221,7 +1236,7 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 | Stage | Adds to the architecture |
 |---|---|
 | 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
-| 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists |
+| 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists; Stage 1's tests moved to `tests/` and skipped without ortools |
 | 3 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
 | 4 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
 | 5 | the gate, and `RelayoutCharge` as its own node |
@@ -1231,20 +1246,20 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 | 9 | the linear realization of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
 | 10 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
 | 11 | `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
-| 12 | nothing in the module: the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
+| 12 | in the module, only its ortools import, guarded as the printer's is; outside it, the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
 
 Every stage is one PR with its tests. Branches: `table-lowering-N-<slug>-experimental`,
-each on the one before. Stage 1 builds the mechanics that lower an expression from its
-inputs, naively, by lambdify. Stages 2 to 9 each add one optimization, and Stage 10 is
-an experiment off the stack. Stages 11 and 12 integrate: first with the printer's maps,
-then with the solver behind the flag.
+each on the one before, or on `main` once the one before has merged. Stage 1 builds the
+mechanics that lower an expression from its inputs, naively, by lambdify. Stages 2 to 9
+each add one optimization, and Stage 10 is an experiment off the stack. Stages 11 and 12
+integrate: first with the printer's maps, then with the solver behind the flag.
 
 | # | PR adds | What it lowers |
 |---|---|---|
 | 1 | the base mechanics: inputs and an expression to a CP-SAT objective, one table per node, every value by lambdify | an expression whose inputs fit the cap together; no real objective |
-| 2 | numpy steps from a dict, lambdify for any class it does not hold | the same as Stage 1, in less lowering time |
+| 2 | numpy steps from a dict, lambdify for any class it does not hold; the tests out of `tests/inductor/`, skipped where ortools is not installed | the same as Stage 1, in less lowering time |
 | 3 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
 | 4 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `CompactIndex` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
 | 5 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
@@ -1254,7 +1269,7 @@ then with the solver behind the flag.
 | 9 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes, products included |
 | 10 | not in the stack: the table constraint, a branch that changes the `cp_expr` methods, measured by Stage 11's replay | the same plans, as table constraints |
 | 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against the prototype's results |
-| 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
+| 12 | integration with the solver: the module importable without ortools, `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
 
 **At the start, real objectives do not lower.** Stage 1 makes one table per node, so the
 root's table is over every input the objective reads. On the 50 replayed objectives that
@@ -1309,9 +1324,9 @@ determined, total and correct.
 
 ### Stage 1: the base mechanics
 
-Built: torch-spyre/torch-spyre#6475, first reviewed as spectre-ns/torch-spyre#32. Inputs
-and an expression in, a CP-SAT objective out, with no optimization:
-`TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The inputs are each
+Merged: torch-spyre/torch-spyre#6475 (290b5e0f, 2026-11-19), first reviewed as
+spectre-ns/torch-spyre#32. Inputs and an expression in, a CP-SAT objective out, with no
+optimization: `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`. The inputs are each
 symbol's variable and its value at each of the variable's values; tests make them by
 hand, as in Architecture. Every value is computed by `sympy.lambdify`; numpy steps come
 in Stage 2.
@@ -1365,8 +1380,8 @@ After this stage an expression whose inputs fit the cap together is lowered exac
 Anything wider raises, and on a real objective the root is always wider. Nothing
 imports the module until Stage 12, so the raise reaches no compile.
 
-Tests, `tests/inductor/test_cpsat_table_lowering.py`, 33, device-free (run with
-`--noconftest` off a Spyre host):
+Tests, `tests/inductor/test_cpsat_table_lowering.py` as merged, 33, device-free (run
+with `--noconftest` off a Spyre host until Stage 2 moves them to `tests/`):
 
 - the factory makes children first, shares a subexpression as one node, and leaves the
   expression unchanged; a Piecewise arm gets no node; each node is an `InputNode`, a
@@ -1445,7 +1460,31 @@ functions, a new class each, so no dict holds them, and they stay on lambdify.
 What it lowers is what Stage 1 lowers. How much lowering time it saves is reported by
 Stage 11's replay.
 
-Tests, `tests/inductor/test_cost_expr_numpy.py`:
+**Stage 1's tests, as its review asked (Decisions).** Two changes to files Stage 1
+merged, and none to its module:
+
+- **Skipped without ortools.** `pyproject.toml:40` installs ortools only when
+  `platform_machine` is not `s390x` or `ppc64le`. `test_cpsat_table_lowering.py` imports
+  `cp_model` and the table module, which imports ortools at its top, at module level, so
+  on those machines the file fails to collect. It now calls
+  `pytest.importorskip("ortools.sat.python.cp_model")` at module level before both
+  imports, as `test_solver_relayout_decision.py:46` does for `ortools`. So does every
+  later test file of the stack that imports ortools or the table module.
+  `cost_expr_numpy.py` imports neither, so a test of it alone needs no skip.
+- **Out of `tests/inductor/`.** `tests/inductor/conftest.py` has a session-scoped
+  autouse fixture, `_poison_device_hbm` (`:55`), that writes to a Spyre device before
+  any test runs, so on a machine with no device these tests run only with
+  `--noconftest`. `tests/conftest.py` touches no device. `git mv` puts the file at
+  `tests/test_cpsat_table_lowering.py`, beside `test_frontend_timing_summarize.py`, where
+  torch-spyre/torch-spyre#6457 puts its own device-free scratchpad test. Its config
+  moves with it, to
+  `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`, and lists
+  this stage's test file too. The move costs no recorded timing: a config with
+  fewer than 5 recorded runs runs as its own CI job until it has them
+  (`.github/test_layout_policy.json`), and the old path has none in
+  `.github/test_timings.json`.
+
+Tests, `tests/test_cost_expr_numpy.py`:
 
 - every dict entry against exact sympy (`float(expr.xreplace(point))`) at every grid
   point;
@@ -1462,6 +1501,8 @@ Tests, `tests/inductor/test_cost_expr_numpy.py`:
   `test_cost_model_replication.py` already use), the only nodes lambdified are the
   implemented delivery-price functions, and the values agree with
   `sympy.lambdify(modules="math")`, the annealer's evaluator (`sa_cooptimizer.py:849`).
+  The builders are `cost_model`'s functions, which `test_op_features.py` calls with no
+  device, so the guard runs at `tests/` too.
 
 ### Stage 3: linear sums
 
@@ -1837,6 +1878,19 @@ Tests:
   `cpsat_table_lowering: bool = os.environ.get("CPSAT_TABLE_LOWERING", "0") == "1"` and
   `cpsat_table_cap: int` from `CPSAT_TABLE_CAP`, default 8192. Both names are public, so
   both enter the FX graph cache key: plans can differ between lowerings.
+- **The table module imports without ortools** (Decisions, the review of Stage 1). Until
+  this stage nothing imports it, so its plain `from ortools.sat.python import cp_model`
+  at the top is safe. From here the solver imports it, and on s390x and ppc64le, where
+  `pyproject.toml:40` installs no ortools, that import must not fail. So the module
+  imports ortools as the printer does (`cpsat_expr_printer.py:40-46`): under
+  `TYPE_CHECKING` for mypy, and otherwise in a `try` whose `except ImportError` sets
+  `cp_model = None`. `ilp_solver_ortools.py` guards its own import the same way
+  (`:127-132`). The two aliases that read `cp_model` when the module is imported,
+  `CpExpr` (`cp_model.LinearExprT`) and `Input` (`tuple[cp_model.IntVar, ...]`), are
+  written as strings, so they stay importable names; every other use of `cp_model` is in
+  an annotation or inside a method. Without ortools nothing in the module is called:
+  `CpSatLayoutSolver.__init__` refuses to be made (`:663`), and the allocator picks the
+  greedy solver instead (`_cpsat_solver_class`, `allocator.py:5589`).
 - `ilp_solver_ortools.py`: the printer's import (`:134`) is unchanged.
   `_minimize_cost_expr` (`:830`) reads the flag where it calls the printer (`:865`).
   With the flag on it imports the table module there and calls
@@ -1881,7 +1935,10 @@ Tests, with `config.patch` as the suites do:
   cost is no higher than the printer's plan, within one `COST_SCALE` unit per table;
 - flag on with `auto_coarse_tiling`: the allocator hands the solver its cost
   expression, and the solve lowers it; flag off with `auto_coarse_tiling`: the
-  expression is still withheld, as on `main`.
+  expression is still withheld, as on `main`;
+- in a fresh interpreter where importing `ortools` fails, the table module imports,
+  its `cp_model` is `None`, and `ilp_solver_ortools` imports too. This test needs no
+  ortools, so it sits in a file without Stage 2's module-level skip.
 
 Known difference: the tables' objective is `COST_SCALE` (1024) times the cost, and the
 printer's is in cost units. Only the uniqueness probe reads it
@@ -1889,15 +1946,19 @@ printer's is in cost units. Only the uniqueness probe reads it
 
 ## Verification
 
-Each PR:
+Each PR, from Stage 2 on:
 
-- `python3 -m pytest tests/inductor/test_cost_expr_numpy.py
-  tests/inductor/test_cpsat_table_lowering.py`
+- `python3 -m pytest tests/test_cost_expr_numpy.py tests/test_cpsat_table_lowering.py`,
+  on a machine with no Spyre device and without `--noconftest`.
+- The same with ortools hidden from the interpreter (a `sys.modules["ortools"] = None`
+  in a `sitecustomize` on `PYTHONPATH` will do): `test_cpsat_table_lowering.py` is
+  reported as skipped, not as a collection error, and `test_cost_expr_numpy.py` runs.
 - `make precommit`, `mypy torch_spyre tests` and `make check-all-configs`. Both test
   files are listed in
-  `tests/configs/torch_spyre_tests/inductor/test_cpsat_table_lowering_config.yaml`.
+  `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`.
 - `git commit -s`, the Apache header on new files, `feat(scratchpad): ...` subjects.
-- Stages 1 to 11: `git diff main --stat` shows new files only.
+- Stages 2 to 11 change no file but the table lowering's own: its two modules, their
+  tests and their config. Stage 1 added only new files.
 
 After Stage 11, posted on that PR, with the replay calling `lower_cost_with_tables`:
 
@@ -1931,6 +1992,7 @@ After Stage 12, posted on that PR:
 
 ## Next step
 
-Stage 1 is built: torch-spyre/torch-spyre#6475, from the fork's branch
-`table-lowering-1-base-experimental`, 33 device-free tests, with the design of
-Architecture. Stage 2 stacks on that branch in the fork.
+Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
+(2026-11-19), 33 device-free tests, with the design of Architecture. Stage 2 branches
+from `main` in the fork. Besides the numpy steps, it carries the two changes the review
+of Stage 1 asked for its tests: the module-level ortools skip and the move to `tests/`.
