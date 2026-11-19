@@ -1490,24 +1490,25 @@ of up to 44 residency literals, and each wide `Max` is over four buffers' terms.
 probe captures, made with auto tiling on and derates, were larger: each also had a
 product past the cap.
 
-- **The models.** In `tests/test_cpsat_table_lowering.py`, each block is a `BlockShape`:
-  the menu length of each buffer that chooses a division, the number of residency
-  literals, and its wide terms, each argument of a `Min` or `Max` given by the buffers it
-  reads, by index, and its first n literals. `BlockShape.objective()` builds a `Case`
-  (one division input per buffer, one 0/1 integer per literal) and writes the objective
-  in sympy: one narrow term per buffer and per literal, as most of a real objective's
-  terms are, and the wide terms, which share buffers the way the real ones do, so each
-  one's single table has the size measured on `main`. The narrow terms stand in for the
-  rest of each objective. Nothing is compiled and no device is needed, and the blocks'
-  correctness tests are untouched. A change to the cost model's prices changes nothing
-  here; a block whose shape on `main` changes is updated by hand.
-- **The table.** `BLOCKS` maps each block's name to its shape and, while it is refused,
-  its reason, the wide terms that stop it.
-- **The marks.** `pytest.mark.xfail(raises=TableLoweringError, strict=True,
-  reason=...)`, from the block's reason. With `raises`, only a refusal is an expected
-  failure, and any other exception fails the run. With `strict`, a block that starts to
-  lower fails the run as an unexpected pass, so the stage that lowers it must drop its
-  reason (owner, in review).
+- **The models.** In `tests/test_cpsat_table_lowering.py`, `COMMON_BLOCKS` is a list of
+  `pytest.param`, one per block. Its value is a lambda that writes the block's objective
+  in sympy with its shape baked in: its buffers' menu lengths, its residency literals,
+  and its wide `Min` and `Max` terms, written with `sympy.Min` and `sympy.Max` over the
+  buffers' splits and literals the real ones read, so each one's single table has the
+  size measured on `main`. A small helper, `_model`, declares the inputs (one division
+  input per buffer, one 0/1 integer per literal) and adds one narrow term per buffer and
+  per literal, as most of a real objective's terms are; the narrow terms stand in for
+  the rest of each objective. Nothing is compiled and no device is needed, and the
+  blocks' correctness tests are untouched. A change to the cost model's prices changes
+  nothing here; a block whose shape on `main` changes is updated by hand. The owner, in
+  review: a shape class was too abstract, and mapping "Min" to `sympy.Min` by name
+  fragile.
+- **The marks.** Each param's id is the block's name and its mark is
+  `pytest.mark.xfail(raises=TableLoweringError, strict=True, reason=...)`, the reason
+  naming the wide terms that stop it. The test is parametrized over the lambdas, so it
+  looks nothing up by name. With `raises`, only a refusal is an expected failure, and
+  any other exception fails the run. With `strict`, a block that starts to lower fails
+  the run as an unexpected pass, so the stage that lowers it must drop its mark.
 - **When a block lowers**, its test checks it as Stage 1's exact tests do, at three
   assignments instead of every one: each variable at its lowest value, at its highest,
   and at a seeded random value, fixed by equality constraints under one assumption
@@ -1552,16 +1553,14 @@ product past the cap.
 
   Scripts and output: `~/gap-probe/spyre-roadmap-pr23/2026-11-19/blocks/`.
 
-Tests, in `tests/test_cpsat_table_lowering.py`:
+Tests, in `tests/test_cpsat_table_lowering.py`: each block lowers exactly, under its
+mark. At this stage each raises `TableLoweringError`. Each model's wide terms have the
+table sizes its reason quotes, and every other term reads one variable; that was checked
+once, outside the suite.
 
-- each block's model is its narrow terms and its wide ones: every term reads one buffer
-  or one literal but the wide ones, and their table sizes are the ones its reason quotes;
-- each block lowers exactly, under its mark. At this stage each raises
-  `TableLoweringError`.
-
-Built: torch-spyre/torch-spyre#6501 (draft), 25c70f66: the file gives 38 passed and 5
-xfailed in 1.1 s, with no device. A small `BlockShape` Stage 1 can lower passes the
-three-assignment check with no reason, and the check catches a value 3 units off.
+Built: torch-spyre/torch-spyre#6501, 5750aa63: the file gives 33 passed and 5 xfailed in
+1.1 s, with no device. A small block Stage 1 can lower passes the three-assignment check
+unmarked.
 
 ### Stage 3: numpy steps from a dict
 
