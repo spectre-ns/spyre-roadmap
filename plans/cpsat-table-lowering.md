@@ -1461,86 +1461,92 @@ merged, and none to its module:
   moves with it, to
   `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`, and lists
   this stage's block tests too; Stage 3 adds its numpy tests to it. The move costs no
-  recorded timing: a config with
-  fewer than 5 recorded runs runs as its own CI job until it has them
-  (`.github/test_layout_policy.json`), and the old path has none in
+  recorded timing: a config with fewer than 5 recorded runs runs as its own CI job
+  until it has them (`.github/test_layout_policy.json`), and the old path has none in
   `.github/test_timings.json`.
 
 **Common blocks, expected to fail (2026-11-19).** Five attention and norm blocks from
 torch-spyre's own suites, each lowered from its captured objective and marked `xfail`
 until a stage lowers it. No real objective lowers at Stage 2, so the marks record how
-far the stack has come. Measured on probe captures of these tests
-(`~/gap-probe/spyre-roadmap-pr23/2026-11-19/blocks/`):
+far the stack has come. The fixture was captured from `main` at 3e32bfd7 under the
+default config; causal SDPA's test solves three graphs, and the fixture keeps the one
+that reads the most symbols:
 
 | Block | Captured from | Variables | One table over the root | Terms past the cap of 8192 |
 |---|---|---|---|---|
-| flash attention | `test_building_blocks.py:319` | 248 | 10^135.8 | 4: a `Min` and a product of powers, 10^80.7 each; two `Max`, 10^9.3 and 10^5.1 |
-| causal SDPA | `test_building_blocks.py:400` | 36 | 10^19.5 | 2: a `Min`, 10^12.3; a product with a `Max` factor, 10^10.8 |
-| simple attention | `test_building_blocks.py:76` | 46 | 10^25.2 | 2: a `Min`, 10^14.5; a product with a `Max` factor, 10^12.1 |
-| GQA decode | `test_sliding_window_attention.py:345` | 132 | 10^59.2 | 3: a `Min`, 10^25.9; a product with a `Max` factor, 10^21.6; a `Max`, 10^4.3 |
-| RMSNorm | `test_building_blocks.py:242` | 87 | 10^50.7 | 2: a `Min`, 10^30.5; a product with a `Max` factor, 10^27.8 |
+| causal SDPA | `test_building_blocks.py:400` | 46 | 10^22.8 | 1: a top-level `Min`, 10^8.2 |
+| flash attention | `test_building_blocks.py:319` | 247 | 10^114.7 | 3: top-level `Min`s of 10^24.3 and 10^13.2, a `Max` of 10^6.5 |
+| GQA decode | `test_sliding_window_attention.py:345` | 130 | 10^54.9 | 3: top-level `Min`s of 10^15.1 and 10^8.1, a `Max` of 10^4.3 |
+| RMSNorm | `test_building_blocks.py:242` | 86 | 10^42.5 | 2: top-level `Min`s of 10^8.4 and 10^5.7 |
+| simple attention | `test_building_blocks.py:76` | 45 | 10^21.5 | 1: a top-level `Min`, 10^7.6 |
 
-The tests are `test_flash_attention`, `test_causal_sdpa_unpadded_kv_no_inf`,
-`test__simple_attn`, `test_decode_gqa` and `test_chained_rms_norm_fp32_upcast`.
+The tests are `test_causal_sdpa_unpadded_kv_no_inf`, `test_flash_attention`,
+`test_decode_gqa`, `test_chained_rms_norm_fp32_upcast` and `test__simple_attn`. Earlier
+probe captures of the same tests, made with auto tiling on and derates, were larger:
+each also had a product past the cap, and flash attention's root was 10^135.8.
 
-- **The objectives.** `tests/cpsat_table_lowering_blocks.json.gz` holds one entry per
-  block: the expression as `sympy.srepr`, each variable's domain, each symbol's input as
-  a variable name and its values, and where the entry came from (test id, torch-spyre
-  commit, config). The inputs are what Stage 1 takes, so the test makes one
+- **The objectives.** `tests/cpsat_table_lowering_blocks.json.gz`, 40 KB, holds one entry
+  per block: the expression as `sympy.srepr`, each variable's domain, each symbol's input
+  as a variable name and its values, and where the entry came from (test id, solve,
+  torch-spyre commit, config). The inputs are what Stage 1 takes, so the test makes one
   `new_int_var` per variable and calls
   `TableLowering(inputs, cap=8192).lower(expr).cp_expr(model)`. It needs no printer map
-  and no device. On the probe captures the file is 1.9 MB of JSON, 77 KB gzipped.
-  Flash attention's expression takes 8 s to parse, so the file is read once per module.
+  and no device. Parsing the five expressions takes about 3 s, so the file is read once
+  per module.
 - **How they are made.** `tests/scripts/capture_table_lowering_blocks.py`, run by hand
-  on a Spyre host, runs each block's test with `ilp_solver_ortools.cost_expr_to_cpsat`
-  wrapped to record the expression and the two maps it is handed (`:865`). It maps each
-  symbol to its input as Stage 12's `inputs_from_maps` will: a buffer's symbol to its
-  division and its menu's values, any other symbol to its own variable and its domain.
-  From Stage 12 it calls `inputs_from_maps` instead. It also writes each block in the
-  replay's capture format, the expression with the model and the two maps, so the
-  prototype's results on the fixture's own objectives are measured when it is made, and
-  Stage 12's replay reads the same objectives. It captures under the default config,
-  because with auto tiling on, `main` hands CP-SAT no cost expression (Stage 13). It is
-  rerun when a block's objective changes shape, not on every change to the cost model:
-  the tests check that a block lowers, not what it costs.
+  on a Spyre host, runs each block's test with the inductor caches off and
+  `ilp_solver_ortools.cost_expr_to_cpsat` wrapped to record the expression and the two
+  maps it is handed (`:865`). It maps each symbol to its input as Stage 12's
+  `inputs_from_maps` will: a buffer's symbol to its division and its menu's values, any
+  other symbol to its own variable and its domain, and a symbol mapped to a constant is
+  replaced by it. From Stage 12 it calls `inputs_from_maps` instead. With
+  `--replay-dir` it also writes each block in the replay's capture format, the
+  expression with the model and the two maps, so the prototype's results on the
+  fixture's own objectives are measured when it is made, and Stage 12's replay reads the
+  same objectives. It captures under the default config, because with auto tiling on,
+  `main` hands CP-SAT no cost expression (Stage 13). It is rerun when a block's
+  objective changes shape, not on every change to the cost model: the tests check that a
+  block lowers, not what it costs.
 - **The marks.** `pytest.mark.xfail(raises=TableLoweringError, strict=True,
   reason=...)`, the reason naming the terms that stop the block. With `raises`, only a
   refusal is an expected failure, and any other exception fails the run. With `strict`,
   a block that starts to lower fails the run as an unexpected pass, so the stage that
-  lowers it must remove its mark.
+  lowers it must remove its mark. The marks are a dict beside the list of blocks, so
+  removing one leaves the block's test in place.
 - **When a block lowers**, its test checks it as Stage 1's exact tests do, at three
   assignments instead of every one: each variable at its lowest value, at its highest,
-  and at a seeded random value, fixed by equality constraints. At each, minimizing and
-  maximizing agree and equal `COST_SCALE` times sympy's value, within the bound.
-- **What to expect.** Every block raises through Stage 6. Each has a top-level `Min`
-  past the cap, and only ranks (Stage 7, if they apply to a Min/Max: review M2), a
-  Min/Max by rung (Stage 8) or `lin_min` (Stage 10) lower that. Each also has a wide
-  product, which needs the switch (Stage 5) with a rest that one of those stages lowers,
-  or the fold (Stage 9). Which of Stages 7 to 10 takes each mark off is for the stack to
-  show, but every mark is off by Stage 10, the last stage that adds a rule. A mark still
-  on after Stage 10 is a gap between the stack and the prototype, explained in that PR.
+  and at a seeded random value, fixed by equality constraints under one assumption
+  literal each. At each, minimizing and maximizing agree and equal `COST_SCALE` times
+  sympy's value, within half a unit per constraint the lowering adds, plus half: at least
+  the (T + 1) / 2 units of a sum of T rounded lists.
+- **What to expect.** Every block raises through Stage 6. What stops each is only
+  top-level `Min` and `Max` terms past the cap, and only ranks (Stage 7, if they apply to
+  a Min/Max: review M2), a Min/Max by rung (Stage 8) or `lin_min`/`lin_max` (Stage 10)
+  lower those. Which of Stages 7 to 10 takes each mark off is for the stack to show, but
+  every mark is off by Stage 10, the last stage that adds a rule. A mark still on after
+  Stage 10 is a gap between the stack and the prototype, explained in that PR.
 - **They lower on the rules the stack rebuilds.** The prototype at its last commit has
   the switch, the gate, rungs, the fold and `lin_max`, the rules Stages 5, 6, 8, 9 and 10
   rebuild. Stage 7's ranks and pairs come on top, and a node takes them only when they
-  have fewer entries. The prototype lowers all five probe captures at the cap of 8192,
-  with no fallback, and solves each `OPTIMAL`. Each solution is off from sympy's value
-  of the expression by less than half a unit per element table, 0.5/1024 of a cost unit
-  each:
+  have fewer entries. On the replay copies the capture script wrote, the prototype lowers
+  all five at the cap of 8192, with no fallback, and solves each `OPTIMAL`. Each
+  solution is off from sympy's value of the expression by less than half a unit per
+  element table, 0.5/1024 of a cost unit each:
 
   | Block | Entries | Largest table | Element tables | Lowering | Solve | Off from exact |
   |---|---|---|---|---|---|---|
-  | flash attention | 49,227 | 338 | 308 | 2.0 s | 9.4 s | 0.0026 of 22,353.6 |
-  | causal SDPA | 974 | 44 | 50 | 0.7 s | 0.1 s | 0.016 of 8,383.4 |
-  | simple attention | 6,115 | 175 | 63 | 0.6 s | 0.8 s | 0.0043 of 3,939.3 |
-  | GQA decode | 3,299 | 59 | 155 | 1.2 s | 1.0 s | 0.028 of 2,105.5 |
-  | RMSNorm | 7,022 | 106 | 101 | 1.0 s | 2.0 s | 0.0030 of 16,189.1 |
+  | causal SDPA | 1,076 | 32 | 49 | 0.26 s | 0.29 s | 0.0014 of 5,000.1 |
+  | flash attention | 5,635 | 42 | 220 | 1.33 s | 5.02 s | 0.0032 of 22,353.6 |
+  | GQA decode | 1,375 | 23 | 107 | 0.41 s | 0.71 s | 0.0088 of 2,105.5 |
+  | RMSNorm | 943 | 21 | 62 | 0.29 s | 0.32 s | 0.0037 of 16,507.3 |
+  | simple attention | 714 | 27 | 40 | 0.23 s | 0.22 s | 0.0009 of 5,915.2 |
 
 - **The plan's rules that are stricter than the prototype's hold on them too.**
-  - Every node whose inputs fit the cap, 882 to 4,432 per block, realizes with finite
-    values under Stage 1's code as merged. That covers every list the stack can make.
-  - The 14 to 20 nodes per block past the cap, which the switch and the gate read in
+  - Every node whose inputs fit the cap, 804 to 3,215 per block, realizes with finite
+    values under Stage 1's code. That covers every list the stack can make.
+  - The 5 to 10 nodes per block past the cap, which the switch and the gate read in
     parts, are finite at 20,000 seeded random assignments each.
-  - The largest entry is 1.5e-5 of the 2^50 limit, and the largest domain is 338.
+  - The largest entry is 1.1e-5 of the 2^50 limit, and the largest domain is 42.
   - Every free symbol has an input, so none of them needs Stage 12's normalization or
     `LocateIndex`.
 
@@ -1548,11 +1554,15 @@ The tests are `test_flash_attention`, `test_causal_sdpa_unpadded_kv_no_inf`,
 
 Tests, `tests/test_cpsat_table_lowering_blocks.py`, behind the same ortools skip:
 
-- the fixture loads: each block's expression parses, every free symbol has an input,
-  and every input has one value per value of its variable;
-- each block lowers under its mark. At this stage each raises `TableLoweringError` at
-  the root, past the cap, and adds nothing to the model. On the probe captures, against
-  Stage 1 as merged, all five do, in 0.07 to 0.63 s each after parsing.
+- the fixture holds the five blocks, and in each, every free symbol has an input with
+  one value per value of its variable;
+- each block lowers under its mark. At this stage each raises `TableLoweringError`, and
+  all five do, in 0.05 to 0.38 s each after parsing.
+
+Built: torch-spyre/torch-spyre#6501 (draft), f5a55e65 on `main` at 3e32bfd7. Both table
+lowering files: 39 passed and 5 xfailed in 6.9 s, with no device. A small block Stage 1
+can lower, in a copy of the test, passes the three-assignment check unmarked and fails
+the run as `XPASS(strict)` marked.
 
 ### Stage 3: numpy steps from a dict
 
@@ -2115,7 +2125,6 @@ After Stage 13, posted on that PR:
 ## Next step
 
 Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
-(2026-11-19), 33 device-free tests, with the design of Architecture. Stage 2 is next,
-from `main` in the fork: the common blocks as strict xfails, captured on a Spyre host
-from `main`, with the two changes the review of Stage 1 asked for its tests, the
-module-level ortools skip and the move to `tests/`. The numpy steps follow in Stage 3.
+(2026-11-19), 33 device-free tests, with the design of Architecture. Stage 2 is built:
+torch-spyre/torch-spyre#6501, a draft, the common blocks as strict xfails with the two
+changes the review of Stage 1 asked for its tests. Stage 3, the numpy steps, is next.
