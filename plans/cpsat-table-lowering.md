@@ -1498,21 +1498,22 @@ stage's optimization can:
   failure. With `strict`, an example that starts to lower fails the run as an unexpected
   pass, so the stage that lowers it drops its mark. An example lowered earlier or later
   than its stage shows as that, and the PR of the stage that sees it moves the mark.
-- **The check, when an example lowers**, as Stage 1's exact tests check, at three
-  assignments instead of every one: each variable at its lowest value, at its highest,
-  and at a seeded random value, fixed by equality constraints under one assumption
-  literal each, so one lowered model serves all three. At each, minimizing and
-  maximizing agree and equal `COST_SCALE` times sympy's value, within half a unit per
-  constraint the lowering adds, plus half: at least the (T + 1) / 2 units of a sum of T
-  rounded lists.
+- **The check, when an example lowers**, as Stage 1's exact tests check, at two
+  assignments instead of every one: each variable at its lowest value and at its
+  highest, fixed by equality constraints under one assumption literal each, so one
+  lowered model serves both (the owner dropped a third, seeded random one, 2026-11-19).
+  At each, minimizing and maximizing agree and equal `COST_SCALE` times sympy's value,
+  within half a unit per constraint the lowering adds, plus half: at least the
+  (T + 1) / 2 units of a sum of T rounded lists.
 
 Tests, in `tests/test_cpsat_table_lowering.py`: each example lowers exactly, under its
 mark. At this stage each but `trivial` raises `TableLoweringError`, at exactly the size
 its reason states; with the cap raised to 10^6 each lowers as one table and passes the
 check.
 
-Built: torch-spyre/torch-spyre#6501, e02e1249: the file gives 34 passed and 6 xfailed in
-0.6 s, with no device.
+Built: torch-spyre/torch-spyre#6501 at 1fe04ab6, the owner's squash of the examples
+(477f042d) and the random assignment dropped: the file gives 34 passed and 6 xfailed in
+0.8 s, with no device.
 
 ### Stage 3: numpy steps from a dict
 
