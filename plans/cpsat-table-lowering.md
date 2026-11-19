@@ -1518,8 +1518,9 @@ larger: each also had a product past the cap, and flash attention's root was 10^
   reason=...)`, the reason naming the terms that stop the block. With `raises`, only a
   refusal is an expected failure, and any other exception fails the run. With `strict`,
   a block that starts to lower fails the run as an unexpected pass, so the stage that
-  lowers it must remove its mark. The marks are a dict beside the list of blocks, so
-  removing one leaves the block's test in place.
+  lowers it must remove its mark. Each block's entry in the test's table holds its
+  transform, its inputs and its reason, and a block is marked when it has a reason, so
+  a stage that lowers it sets its reason to `None` (owner, in review).
 - **When a block lowers**, its test checks it as Stage 1's exact tests do, at three
   assignments instead of every one: each variable at its lowest value, at its highest,
   and at a seeded random value, fixed by equality constraints under one assumption
