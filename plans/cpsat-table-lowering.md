@@ -36,7 +36,9 @@ layers, each with its own tests.
   in place of those functions. The owner asked why the numpy steps were "so much more
   complex than lambdify", and on the measurements (Stage 3) said "Lets defer conversion
   to numpy", then "Ok let move this caching to a new stage. The caching comes first."
-  Every later stage is one later.
+  Every later stage is one later. Measured the same day, Stage 4's numpy steps save
+  nothing per lowering and about 1.1 s of lambdify per process over the 50 replayed
+  objectives (Stage 4); whether to build Stage 4 is open.
 - **A stack of PRs**, one per stage, each on the one before, from branches in the fork.
   Stage 1 is torch-spyre/torch-spyre#6475, from the fork's
   `table-lowering-1-base-experimental` on torch-spyre `main` of 2026-11-17 (92582da3).
@@ -318,9 +320,10 @@ its off half zeros. The estimate ignores lists that turn out affine and cost not
   Stage 13's replay.
 - Lowering time matters most where the model is smallest. At the default config a decode
   block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. Stage 3's caching
-  lowers a 600-node expression in 0.060 s, 0.023 s once its functions are kept, against
-  0.198 s for Stage 1. What it and the numpy steps of Stage 4 save on the decode blocks
-  is reported by Stage 13's replay.
+  lowers a 600-node expression in 0.030 s, 0.022 s once its functions are kept, against
+  0.18 s for Stage 1. Stage 4's numpy steps would save only lambdify's one-time cost,
+  about 1.1 s per process over the 50 replayed objectives. What the caching saves on the
+  decode blocks is reported by Stage 13's replay.
 
 ## How a table is read
 
@@ -1550,7 +1553,12 @@ Nothing else changes: the same lists, the same tables, the same model.
 - **One function per class.** A node's function is its sympy class over one placeholder
   per operand, lambdified with the numpy module once for each class and form of operands
   (`_lambdified`, an `lru_cache`), and shared by every node of them in every lowering of
-  the process. 40 terms of one shape, 600 nodes, lambdify 10 functions.
+  the process. 40 terms of one shape, 600 nodes, lambdify 10 functions. The placeholders
+  are plain symbols, `operand0`, `operand1`, ..., whose names are Python identifiers.
+  When any argument is a `Dummy`, lambdify renames every argument, rebuilding the
+  expression through its class once per argument: a Min of 35 operands took 10.5 s, and
+  the 142 functions of the 50 replayed objectives 30.1 s, against 0.28 s and 1.1 s over
+  plain symbols. The expression holds nothing but placeholders, so no name clashes.
 - **Each operand read at the node's entries.** An operand on the node's own position is
   read as it is. One on fewer positions is read at its own position: `Index.on_grid`
   computes, from each input position's coordinate at every entry of the node's table,
@@ -1572,8 +1580,8 @@ Nothing else changes: the same lists, the same tables, the same model.
   `(1/3)*b`, as the node computes it. That base is the one node a node reads that is
   not its child.
 
-Lowering a 600-node expression with a root table of 8,192 entries takes 0.198 s in
-Stage 1 and 0.060 s here in a fresh process, 0.023 s once its functions are kept. Every
+Lowering a 600-node expression with a root table of 8,192 entries takes 0.18 s in
+Stage 1 and 0.030 s here in a fresh process, 0.022 s once its functions are kept. Every
 entry of its root is Stage 1's to 4e-15. What it saves on the decode blocks is reported
 by Stage 13's replay.
 
@@ -1584,6 +1592,8 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
   operand at every entry;
 - one function for each class and form: 40 terms of one shape, over 300 nodes, at most
   12 functions lambdified, and the root's list is Stage 1's;
+- names kept: a Min of 35 operands is lambdified with its parameters named `operand0` to
+  `operand34`, nothing renamed; over `Dummy` placeholders the test fails, in 10 s;
 - a quotient divided: `floor(x/y) + floor(x/y**2)` is exact at (98, 49), (98, 7) and
   (49, 7), where a reciprocal floors one low;
 - every node's list is Stage 1's, its whole expression lambdified over its inputs, to
@@ -1597,8 +1607,8 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
   Stage 1 lists fail;
 - the synthetic examples keep their marks: caching changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at 8810253a, stacked on #6501: the file gives 46
-passed and 6 xfailed in 1.4 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at 02a87839, stacked on #6501: the file gives 47
+passed and 6 xfailed in 1.6 s, with no device.
 
 ### Stage 4: numpy steps from a dict
 
@@ -1631,11 +1641,26 @@ need auto tiling or cost parameters other than production's. The
 functions, a new class each, so no dict holds them, and they keep their lambdified
 function.
 
-What it lowers is what Stage 3 lowers. Whether it saves lowering time over Stage 3 is to
-be measured before it is built. A first build, before Stage 3, lowered Stage 3's
-600-node expression in 0.036 s, against Stage 3's 0.060 s in a fresh process and 0.023 s
-with its functions kept; it evaluated a node whose children were on other positions from
-its inputs. That build and its tests are kept in
+What it lowers is what Stage 3 lowers. What it saves over Stage 3 was measured before it
+is built (2026-11-19, `~/gap-probe/torch-spyre-pr6501/stage4-measure/`), with the first
+build's steps dropped in for Stage 3's functions:
+
+- **Per lowering, nothing.** On Stage 3's 600-node expression, numpy steps take 23 ms,
+  whether the functions are fresh or kept, against Stage 3's 30 ms in a fresh process
+  and 22 ms once its functions are kept, with every root entry equal. A kept function
+  calls the same numpy functions a step does.
+- **Once per process, lambdify.** The 50 replayed objectives hold 99,210 operation
+  nodes, and they need 142 functions, one per class and form, 7 to 61 for one objective.
+  Lambdifying all 142 takes 1.1 s, 0.82 s of it for the four widest Min/Max (35, 33, 32
+  and 16 operands). Nodes past the cap are never evaluated, and from Stage 5 a sum is
+  linear, with no function, so a process lambdifies fewer.
+- **Every class is in the dict.** Add, And, Eq, Ge, ITE, Le, Max, Min, Mul, Or,
+  Piecewise, Pow, RelayoutCharge, Gt, Lt, floor and log, so no node of the replayed
+  objectives would keep a lambdified function. None of them holds a delivery-price
+  function, which would.
+
+So Stage 4 would save at most about a second per process, and nothing on a lowering
+after the first. Whether to build it is open. The first build and its tests are kept in
 `~/gap-probe/torch-spyre-pr6501/stage3-numpy-deferred/`.
 
 Tests, `tests/test_cost_expr_numpy.py`, added to the config Stage 2 moved:
