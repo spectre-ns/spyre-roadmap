@@ -1519,8 +1519,8 @@ larger: each also had a product past the cap, and flash attention's root was 10^
   refusal is an expected failure, and any other exception fails the run. With `strict`,
   a block that starts to lower fails the run as an unexpected pass, so the stage that
   lowers it must remove its mark. Each block's entry in the test's table holds its
-  transform, its inputs and its reason, and a block is marked when it has a reason, so
-  a stage that lowers it sets its reason to `None` (owner, in review).
+  transform, its inputs and, while it is refused, its reason; a block is marked when it
+  has a reason, so a stage that lowers it drops the reason (owner, in review).
 - **When a block lowers**, its test checks it as Stage 1's exact tests do, at three
   assignments instead of every one: each variable at its lowest value, at its highest,
   and at a seeded random value, fixed by equality constraints under one assumption
