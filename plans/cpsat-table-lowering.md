@@ -154,12 +154,16 @@ computed with numpy functions, and the code arrives in layers, each with its own
   - It serves both kinds of term: it takes the literals out of the narrow terms' tables
     and splits the wide products. On the step-by-step graph's product it is 38 entries
     against 68 as a pair at the real menus.
-  - Each `Index` step lands with the stage that first uses it: `InputIndex`, `UnitIndex`
-    and `CombineIndex` in Stage 1, `CompactIndex` in 4, `ExtremeIndex` in 7,
-    `LocateIndex` in 11. `LocateIndex` left
-    #32 because no replayed objective needs it: none of the 4,159 non-buffer variables
-    the 50 replayed objectives read has a domain with gaps
-    (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/locate/`).
+  - Each `Index` step lands with the stage that first uses it: `UnitIndex` and
+    `CombineIndex` in Stage 1, `CompactIndex` in 4, `ExtremeIndex` in 7, `InputIndex`
+    and `LocateIndex` in 11. `LocateIndex` left #32 because no replayed objective needs
+    it: none of the 4,159 non-buffer variables the 50 replayed objectives read has a
+    domain with gaps (`~/gap-probe/spyre-roadmap-pr21/2026-11-18/locate/`).
+  - `InputIndex`, the step over an input's variable, left #32 on 2026-11-19 (d856eee7).
+    Stage 1 is handed its inputs already made, so nothing in the module constructs one;
+    Stage 11's `inputs_from_maps` is the first code that does. Until then the tests
+    define their own, on `Index` alone. The owner's words: "Don't add stuff that is not
+    in stage one" and "We can add this in stage 11".
 
   The owner asked "Do we need all the IndexMap specializations before we implement the
   optimizations?" and, given this order and `LocateIndex`'s move, said "Do that". The
@@ -824,11 +828,11 @@ assignment of the inputs, so an entry read from the wrong position fails.
 Three layers, each a small interface with thin subclasses, so that adding an operation,
 a realization or a position step changes nothing else:
 
-- **Values.** A *position* is an `Index`: one step that holds its parts (`InputIndex`,
-  `UnitIndex`, `CombineIndex`; later `CompactIndex`, `ExtremeIndex` and `LocateIndex`).
-  A *realization* is what a node is realized as, an `AbstractRealization`: a
-  `TableRealization` (a float list on a position) and, from Stage 3, a
-  `LinearRealization`. Values hold no model.
+- **Values.** A *position* is an `Index`: one step that holds its parts (`UnitIndex` and
+  `CombineIndex`; later `CompactIndex` and `ExtremeIndex`, and with the inputs in Stage
+  11 `InputIndex` and `LocateIndex`). A *realization* is what a node is realized as, an
+  `AbstractRealization`: a `TableRealization` (a float list on a position) and, from
+  Stage 3, a `LinearRealization`. Values hold no model.
 - **Nodes.** `TableLowering` is a factory. It makes one `Node` per distinct sympy node,
   of the class the node's sympy class calls for, and hands it what it reads. Each node
   realizes itself the first time its realization is read, and reads its children's
@@ -878,10 +882,10 @@ class TableLoweringError(Exception):
 class Index(ABC):
     """A position: from the inputs' values to 0 .. size - 1, in numpy and in CP-SAT.
     Each kind of step is a subclass that holds its parts as its own fields, so a step
-    depends on Index alone. InputIndex, UnitIndex and CombineIndex are its subclasses
-    in Stage 1; CompactIndex (Stage 4), ExtremeIndex (Stage 7) and LocateIndex (Stage
-    11) join them. Steps are frozen dataclasses: equal positions compare equal and hash
-    alike."""
+    depends on Index alone. UnitIndex and CombineIndex are its subclasses in Stage 1;
+    CompactIndex (Stage 4), ExtremeIndex (Stage 7), and InputIndex and LocateIndex
+    (Stage 11) join them. Steps are frozen dataclasses: equal positions compare equal
+    and hash alike."""
 
     size: int  # a field of each step, given or computed from its parts
 
@@ -905,30 +909,6 @@ class Index(ABC):
 
     def under(self) -> list[Index]:
         """This position and every position it is made from, each once, parts first."""
-
-
-@dataclass(frozen=True)
-class InputIndex(Index):
-    """A leaf, and the thinnest step: a variable's own position, v - lo, for a domain
-    lo .. lo + size - 1. UnitIndex is as thin."""
-
-    var: cp_model.IntVar
-    size: int
-    lo: int = 0
-
-    @property
-    def parts(self) -> tuple[Index, ...]:
-        """(), a leaf."""
-
-    @property
-    def entries(self) -> int:
-        """0."""
-
-    def positions(self, values: Values) -> np.ndarray:
-        """values[var] - lo."""
-
-    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """var - lo: no variable, no constraint."""
 
 
 @dataclass(frozen=True)
@@ -1087,6 +1067,30 @@ class AddNode(Node):
 # ------------------------------------------------------------------ from Stage 11 on
 
 
+@dataclass(frozen=True)
+class InputIndex(Index):
+    """A leaf, and the thinnest step: a variable's own position, v - lo, for a domain
+    lo .. lo + size - 1. inputs_from_maps is the first code to make one."""
+
+    var: cp_model.IntVar
+    size: int
+    lo: int = 0
+
+    @property
+    def parts(self) -> tuple[Index, ...]:
+        """(), a leaf."""
+
+    @property
+    def entries(self) -> int:
+        """0."""
+
+    def positions(self, values: Values) -> np.ndarray:
+        """values[var] - lo."""
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """var - lo: no variable, no constraint."""
+
+
 def inputs_from_maps(
     sym_map: Mapping[str, Any], buffer_map: Mapping[str, Any], *, cap: int
 ) -> Inputs:
@@ -1138,7 +1142,8 @@ On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, 
 realizes the root as one table of 6 entries on `2*division_a + division_b` and builds it
 as one `add_element`. Its three children and the four nodes under them are realized too,
 each checking its own list, and the two powers are lambdified. Only the root is built,
-so they add nothing to the model:
+so they add nothing to the model. `InputIndex` here is the tests' own step over a
+variable, since the module has none until Stage 11:
 
 ```python
 model = cp_model.CpModel()
@@ -1221,7 +1226,7 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 | 7 | the `ExtremeIndex` step; a Min/Max node with its ladder |
 | 8 | the fold, one more way to realize a product |
 | 9 | the `lin_max`/`lin_min` realization, with its entry count for margin 2 |
-| 11 | the `LocateIndex` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
+| 11 | the `InputIndex` and `LocateIndex` steps, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
 
 Open in Stage 3: whether terms of one sum that are tables on equal positions are added
 before the rounding, one lookup and one rounding (`split ** 0.5 + split ** 0.7` is 3112
@@ -1231,7 +1236,7 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 
 | Stage | Adds to the architecture |
 |---|---|
-| 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
+| 1 | the values (`Index` with its steps `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists |
 | 3 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
 | 4 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3) |
@@ -1241,7 +1246,7 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 | 8 | a product realized by fold |
 | 9 | the linear realization of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
 | 10 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
-| 11 | `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
+| 11 | `InputIndex`, `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
 | 12 | nothing in the module: the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
@@ -1264,7 +1269,7 @@ then with the solver behind the flag.
 | 8 | rule 2: a fold of Min/Max factors over shared inputs | products of Min/Max factors |
 | 9 | rule 3 in the objective: a Min/Max kept as `lin_max` or `lin_min` | a Min/Max too wide for any table, under linear nodes, products included |
 | 10 | not in the stack: the table constraint, a branch that changes the `cp_expr` methods, measured by Stage 11's replay | the same plans, as table constraints |
-| 11 | integration with the printer's maps: `inputs_from_maps`, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
+| 11 | integration with the printer's maps: `inputs_from_maps` and the steps over a variable, normalization, the entry point | the 50 replayed objectives, checked against #6315 |
 | 12 | integration with the solver: `config.cpsat_table_lowering`, the solver's call, auto tiling's cost expression, docs | every compile, with the flag on, auto tiling included |
 
 **At the start, real objectives do not lower.** Stage 1 makes one table per node, so the
@@ -1348,10 +1353,10 @@ the root's value depends on it:
 
 **The lowering (`cpsat_table_lowering.py`).**
 
-- The values: `Index`, a position, with its steps `InputIndex`, `UnitIndex` and
-  `CombineIndex`, each holding its parts as fields (`CombineIndex(left, right)`, its
-  size computed from them); `AbstractRealization` and `TableRealization`, with `entries`
-  and `finite`; each with `cp_expr`; and `TableLoweringError`.
+- The values: `Index`, a position, with its steps `UnitIndex` and `CombineIndex`, each
+  holding its parts as fields (`CombineIndex(left, right)`, its size computed from
+  them); `AbstractRealization` and `TableRealization`, with `entries` and `finite`; each
+  with `cp_expr`; and `TableLoweringError`.
 - The nodes: `Node`, which realizes one table over its inputs; `InputNode`, its column;
   `ConstantNode`, its value on `UnitIndex`. `columns` and `realization` are kept from
   their first read. A table past the cap is never evaluated and raises, naming the node.
@@ -1362,8 +1367,11 @@ the root's value depends on it:
   constant one a number without building its position, reads any other with one
   `add_element`, and refuses an entry past 2^50. The objective is the root's one lookup.
 
-`LocateIndex`, the position of a variable whose domain has gaps, waits for Stage 11 and
-the printer's maps: no replayed objective reads such a variable.
+The steps over a variable wait for Stage 11 and the printer's maps. `InputIndex`, a
+variable's own position, is first constructed there, by `inputs_from_maps`: Stage 1 is
+handed its inputs already made, so its tests define their own step, on `Index` alone.
+`LocateIndex`, the position of a variable whose domain has gaps, waits too: no replayed
+objective reads such a variable.
 
 After this stage an expression whose inputs fit the cap together is lowered exactly.
 Anything wider raises, and on a real objective the root is always wider. Nothing
@@ -1526,8 +1534,8 @@ reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
   a tuple, never an array, so that it hashes.
 - **The true/falses.** `add_map_domain` takes the factor's position as it is, any linear
   expression: ortools 9.15 writes it as enforced linear constraints, so the position
-  needs no variable of its own. An `InputIndex` with `lo` passes its variable and `lo`
-  as the offset.
+  needs no variable of its own. A step over a variable with an offset passes the
+  variable and the offset.
 - **The rest.** The product of the other factors, read as their realization: one child's
   realization when one is left, a further switch when more are. It may hold lists on
   several buffers, a constant and other switches, and from Stage 9 a Min/Max kept
@@ -1626,12 +1634,11 @@ one table over its literal and its division, twice the menu, its off half zeros.
   gate is a constant times the gate's list on its literal, which is affine (Stage 3): no
   gate and no table. So `(1 - x) * (c - c*x + c*x/t)` becomes `c * (1 - x)`, with no
   table over the tile's division.
-- **The linear realization.** A gate is a switch realization on the literal's
-  `InputIndex`, with values 0 and 1. Its kept case's rest is the rest's realization
-  times the gate's value, in float, and the other case is empty. A product with gates on
-  several literals is a switch inside a switch. An Add merges gates on one literal into
-  one, their rests added case by case, so lists on one position inside them are one list
-  and round once.
+- **The linear realization.** A gate is a switch realization on the literal's position,
+  with values 0 and 1. Its kept case's rest is the rest's realization times the gate's
+  value, in float, and the other case is empty. A product with gates on several literals
+  is a switch inside a switch. An Add merges gates on one literal into one, their rests
+  added case by case, so lists on one position inside them are one list and round once.
 - **A relayout charge** gets a node class of its own. Its realization gates its prices,
   a list on its division, by its literal kept at 1, so it costs the division's menu
   once. Its table over the literal and the division stays for a nonlinear reader.
@@ -1801,13 +1808,13 @@ occur is missing.
 ### Stage 11: integration with the printer's maps
 
 - `inputs_from_maps` maps the inputs from the printer's two maps. A buffer's symbols
-  share its division as their position. Any other variable is indexed by its domain:
-  `InputIndex` with its offset, or, when the domain has gaps, `LocateIndex`, the `Index`
-  step this stage adds: a position lookup. None of the 4,159 non-buffer variables the 50
-  replayed objectives read has gaps, so `LocateIndex` is for objectives the replay does
-  not hold. A domain past the cap is not an input. Mapping the inputs adds nothing to
-  the model: a `LocateIndex`'s lookup is built by its `cp_expr`, when a table on it is
-  built.
+  share its division as their position. Any other variable is indexed by its domain.
+  This stage adds the two `Index` steps over a variable: `InputIndex`, the variable's
+  own position less its offset, which a division uses too, and `LocateIndex`, a position
+  lookup for a domain with gaps. None of the 4,159 non-buffer variables the 50 replayed
+  objectives read has gaps, so `LocateIndex` is for objectives the replay does not hold.
+  A domain past the cap is not an input. Mapping the inputs adds nothing to the model: a
+  `LocateIndex`'s lookup is built by its `cp_expr`, when a table on it is built.
 - `lower`'s normalization: a relayout charge on a source this solve does not divide
   becomes 0.
 - `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=...)` copies the
