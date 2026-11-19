@@ -48,6 +48,11 @@ layers, each with its own tests.
     asks this of the stage that wires the module into the solver, which it numbers 11:
     its count put the switch and the gate in one stage. Here that stage is 12; until
     then nothing imports the module.
+- **Common blocks as strict xfails (2026-11-19).** Stage 2 adds tests that lower the
+  captured objectives of five blocks from torch-spyre's suites: flash attention, causal
+  SDPA, simple attention, GQA decode and RMSNorm. Each test is marked `xfail` with
+  `strict=True` until a stage lowers its block, and that stage removes the mark. So the
+  stack shows, stage by stage, which real blocks lower, long before Stage 11's replay.
 - **Off by default.** Stages 1 to 11 add files nothing imports. Stage 12 adds the flag.
 - **Base mechanics first, then one optimization per stage, integration last
   (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
@@ -1236,7 +1241,7 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 | Stage | Adds to the architecture |
 |---|---|
 | 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
-| 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists; Stage 1's tests moved to `tests/` and skipped without ortools |
+| 2 | `numpy_value` and the dict of numpy steps, applied to a node's children's lists; Stage 1's tests moved to `tests/` and skipped without ortools; the block tests, each a strict xfail |
 | 3 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
 | 4 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
 | 5 | the gate, and `RelayoutCharge` as its own node |
@@ -1254,12 +1259,14 @@ Every stage is one PR with its tests. Branches: `table-lowering-N-<slug>-experim
 each on the one before, or on `main` once the one before has merged. Stage 1 builds the
 mechanics that lower an expression from its inputs, naively, by lambdify. Stages 2 to 9
 each add one optimization, and Stage 10 is an experiment off the stack. Stages 11 and 12
-integrate: first with the printer's maps, then with the solver behind the flag.
+integrate: first with the printer's maps, then with the solver behind the flag. From
+Stage 2 on, a stage that lowers one of the common blocks removes that block's `xfail`
+mark (Stage 2).
 
 | # | PR adds | What it lowers |
 |---|---|---|
 | 1 | the base mechanics: inputs and an expression to a CP-SAT objective, one table per node, every value by lambdify | an expression whose inputs fit the cap together; no real objective |
-| 2 | numpy steps from a dict, lambdify for any class it does not hold; the tests out of `tests/inductor/`, skipped where ortools is not installed | the same as Stage 1, in less lowering time |
+| 2 | numpy steps from a dict, lambdify for any class it does not hold; the tests out of `tests/inductor/`, skipped where ortools is not installed; five common blocks as strict xfails | the same as Stage 1, in less lowering time |
 | 3 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
 | 4 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `CompactIndex` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
 | 5 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
@@ -1479,10 +1486,60 @@ merged, and none to its module:
   torch-spyre/torch-spyre#6457 puts its own device-free scratchpad test. Its config
   moves with it, to
   `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`, and lists
-  this stage's test file too. The move costs no recorded timing: a config with
+  this stage's two test files too. The move costs no recorded timing: a config with
   fewer than 5 recorded runs runs as its own CI job until it has them
   (`.github/test_layout_policy.json`), and the old path has none in
   `.github/test_timings.json`.
+
+**Common blocks, expected to fail (2026-11-19).** Five attention and norm blocks from
+torch-spyre's own suites, each lowered from its captured objective and marked `xfail`
+until a stage lowers it. No real objective lowers at Stage 2, so the marks record how
+far the stack has come. Measured on probe captures of these tests
+(`~/gap-probe/spyre-roadmap-pr23/2026-11-19/blocks/`):
+
+| Block | Captured from | Variables | One table over the root | Terms past the cap of 8192 |
+|---|---|---|---|---|
+| flash attention | `test_building_blocks.py:319` | 248 | 10^135.8 | 4: a `Min` and a product of powers, 10^80.7 each; two `Max`, 10^9.3 and 10^5.1 |
+| causal SDPA | `test_building_blocks.py:400` | 36 | 10^19.5 | 2: a `Min`, 10^12.3; a product with a `Max` factor, 10^10.8 |
+| simple attention | `test_building_blocks.py:76` | 46 | 10^25.2 | 2: a `Min`, 10^14.5; a product with a `Max` factor, 10^12.1 |
+| GQA decode | `test_sliding_window_attention.py:345` | 132 | 10^59.2 | 3: a `Min`, 10^25.9; a product with a `Max` factor, 10^21.6; a `Max`, 10^4.3 |
+| RMSNorm | `test_building_blocks.py:242` | 87 | 10^50.7 | 2: a `Min`, 10^30.5; a product with a `Max` factor, 10^27.8 |
+
+The tests are `test_flash_attention`, `test_causal_sdpa_unpadded_kv_no_inf`,
+`test__simple_attn`, `test_decode_gqa` and `test_chained_rms_norm_fp32_upcast`.
+
+- **The objectives.** `tests/cpsat_table_lowering_blocks.json.gz` holds one entry per
+  block: the expression as `sympy.srepr`, each variable's domain, each symbol's input as
+  a variable name and its values, and where the entry came from (test id, torch-spyre
+  commit, config). The inputs are what Stage 1 takes, so the test makes one
+  `new_int_var` per variable and calls
+  `TableLowering(inputs, cap=8192).lower(expr).cp_expr(model)`. It needs no printer map
+  and no device. On the probe captures the file is 1.9 MB of JSON, 77 KB gzipped.
+  Flash attention's expression takes 8 s to parse, so the file is read once per module.
+- **How they are made.** `tests/scripts/capture_table_lowering_blocks.py`, run by hand
+  on a Spyre host, runs each block's test with `ilp_solver_ortools.cost_expr_to_cpsat`
+  wrapped to record the expression and the two maps it is handed (`:865`). It maps each
+  symbol to its input as Stage 11's `inputs_from_maps` will: a buffer's symbol to its
+  division and its menu's values, any other symbol to its own variable and its domain.
+  From Stage 11 it calls `inputs_from_maps` instead. It captures under the default
+  config, because with auto tiling on, `main` hands CP-SAT no cost expression
+  (Stage 12). It is rerun when a block's objective changes shape, not on every change to
+  the cost model: the tests check that a block lowers, not what it costs.
+- **The marks.** `pytest.mark.xfail(raises=TableLoweringError, strict=True,
+  reason=...)`, the reason naming the terms that stop the block. With `raises`, only a
+  refusal is an expected failure, and any other exception fails the run. With `strict`,
+  a block that starts to lower fails the run as an unexpected pass, so the stage that
+  lowers it must remove its mark.
+- **When a block lowers**, its test checks it as Stage 1's exact tests do, at three
+  assignments instead of every one: each variable at its lowest value, at its highest,
+  and at a seeded random value, fixed by equality constraints. At each, minimizing and
+  maximizing agree and equal `COST_SCALE` times sympy's value, within the bound.
+- **What to expect.** Every block raises through Stage 5. Each has a top-level `Min`
+  past the cap, and only ranks (Stage 6, if they apply to a Min/Max: review M2), a
+  Min/Max by rung (Stage 7) or `lin_min` (Stage 9) lower that. Each also has a wide
+  product, which needs the switch (Stage 4) with a rest that one of those stages lowers,
+  or the fold (Stage 8). Which stage takes each mark off is for the stack to show. The
+  prototype lowered flash attention with 149,439 entries and solved it in 47 s.
 
 Tests, `tests/test_cost_expr_numpy.py`:
 
@@ -1503,6 +1560,14 @@ Tests, `tests/test_cost_expr_numpy.py`:
   `sympy.lambdify(modules="math")`, the annealer's evaluator (`sa_cooptimizer.py:849`).
   The builders are `cost_model`'s functions, which `test_op_features.py` calls with no
   device, so the guard runs at `tests/` too.
+
+Tests, `tests/test_cpsat_table_lowering_blocks.py`, behind the same ortools skip:
+
+- the fixture loads: each block's expression parses, every free symbol has an input,
+  and every input has one value per value of its variable;
+- each block lowers under its mark. At this stage each raises `TableLoweringError` at
+  the root, past the cap, and adds nothing to the model. On the probe captures, against
+  Stage 1 as merged, all five do, in 0.07 to 0.63 s each after parsing.
 
 ### Stage 3: linear sums
 
@@ -1948,17 +2013,21 @@ printer's is in cost units. Only the uniqueness probe reads it
 
 Each PR, from Stage 2 on:
 
-- `python3 -m pytest tests/test_cost_expr_numpy.py tests/test_cpsat_table_lowering.py`,
-  on a machine with no Spyre device and without `--noconftest`.
+- `python3 -m pytest tests/test_cost_expr_numpy.py tests/test_cpsat_table_lowering.py
+  tests/test_cpsat_table_lowering_blocks.py`, on a machine with no Spyre device and
+  without `--noconftest`.
 - The same with ortools hidden from the interpreter (a `sys.modules["ortools"] = None`
-  in a `sitecustomize` on `PYTHONPATH` will do): `test_cpsat_table_lowering.py` is
-  reported as skipped, not as a collection error, and `test_cost_expr_numpy.py` runs.
-- `make precommit`, `mypy torch_spyre tests` and `make check-all-configs`. Both test
-  files are listed in
+  in a `sitecustomize` on `PYTHONPATH` will do): the two table lowering files are
+  reported as skipped, not as collection errors, and `test_cost_expr_numpy.py` runs.
+- The PR description lists each common block: whether it lowers, and if so its entries,
+  lowering time and solve time, and which `xfail` marks the PR removes.
+- `make precommit`, `mypy torch_spyre tests` and `make check-all-configs`. The three
+  test files are listed in
   `tests/configs/torch_spyre_tests/test_cpsat_table_lowering_config.yaml`.
 - `git commit -s`, the Apache header on new files, `feat(scratchpad): ...` subjects.
 - Stages 2 to 11 change no file but the table lowering's own: its two modules, their
-  tests and their config. Stage 1 added only new files.
+  tests, the block fixture and its script, and their config. Stage 1 added only new
+  files.
 
 After Stage 11, posted on that PR, with the replay calling `lower_cost_with_tables`:
 
@@ -1995,4 +2064,5 @@ After Stage 12, posted on that PR:
 Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
 (2026-11-19), 33 device-free tests, with the design of Architecture. Stage 2 branches
 from `main` in the fork. Besides the numpy steps, it carries the two changes the review
-of Stage 1 asked for its tests: the module-level ortools skip and the move to `tests/`.
+of Stage 1 asked for its tests, the module-level ortools skip and the move to `tests/`,
+and the common blocks as strict xfails, captured on a Spyre host from `main`.
