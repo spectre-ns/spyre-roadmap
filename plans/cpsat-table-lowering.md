@@ -239,6 +239,19 @@ layers, each with its own tests.
   through the core on the 55 captures of the replay. Inside the table path the core
   takes lambdify's place: 70 s to 23 s on the nodes of those captures that fit the cap
   (Stage 4).
+- **The two lowerings share arithmetic, not `_evaluate_candidates` (2026-11-20).** The
+  review asked for `_evaluate_candidates` as something both lowerings call. The owner's
+  words: "I don't think evaluate candidates can be used directly in the table approach
+  because it's making approximations that aren't present in the table approach such as
+  logs and inverses." It evaluates the printer's rewritten expression: `inv_` symbols as
+  the integer `scale // value`, `log2_` symbols as `round(32 * log2(value))`, floors
+  dropped and floats truncated, over one buffer's candidates. The table path evaluates
+  the expression as written, in floating point, over several inputs. So what is shared
+  is the arithmetic of each class, the numpy core. And on the printer's list of classes:
+  "_CANDIDATE_CLASSES will remain and expand as the printer is expanded to handle more
+  cases. The table approach seeks to avoid this limitation by numerical evaluation." The
+  list is the printer's own, not derived from the core's map, and a test holds each
+  class on it to a function in the core.
 - **Names say what a class is (2026-11-19).** The lowering's classes drop the `Cp`
   prefix. A node ends in `Node`, what a node is realized as ends in `Realization`, and a
   position step ends in `Index`:
@@ -1776,7 +1789,11 @@ candidates and their scales, the owner of a value, and the required default arm.
 arithmetic it calls `numpy_eval`, on the classes it evaluated before
 (`_CANDIDATE_CLASSES`: Add, Mul, Pow, Min, Max, the relationals, And, Or, Piecewise and
 KroneckerDelta). A node of any other class still goes to its print method, though the
-core has a function for it, so the printer lowers what it lowered.
+core has a function for it, so the printer lowers what it lowered. The list is the
+printer's own and grows as the printer is taught more cases; the table path has no such
+list, since it evaluates any class numerically (Decisions). The table path does not call
+`_evaluate_candidates`, which evaluates the printer's approximations of logs and
+inverses.
 
 **The tables.** A node applies the core's function of its class to its operands' lists,
 read as Stage 3 reads them (`Node.operands`), in their forms (`_evaluate`). A condition,
@@ -1828,6 +1845,8 @@ Tests, `tests/test_cost_expr_numpy.py`, with its config beside the one Stage 2 m
   numbers and as lists;
 - a subclass is evaluated as its class, and a class with no function (`sympy.sinc`)
   raises `NotImplementedError`, naming it;
+- every class on the printer's list, and each relational, has a function in the core;
+  with Pow taken out of the dict the test fails;
 - the printer: its candidate values of each expression come through `numpy_eval` and are
   sympy's at every candidate; a class outside its own list (Abs) has no candidate
   values; each expression it lowers has sympy's value at every candidate;
@@ -1842,8 +1861,8 @@ and in `tests/test_cpsat_table_lowering.py`:
   test and one of the Stage 1 lists fail;
 - the synthetic examples keep their marks: the core changes no lowering.
 
-Built: torch-spyre/torch-spyre#6547 at cc1f82de, stacked on #6525: the two files give 80
-passed and 6 xfailed in 3.5 s, with no device.
+Built: torch-spyre/torch-spyre#6547 at f474a5b9, stacked on #6525: the two files give 81
+passed and 6 xfailed in 3.3 s, with no device.
 
 An earlier build of the dict alone, from before Stage 3, is kept in
 `~/gap-probe/torch-spyre-pr6501/stage3-numpy-deferred/`.
