@@ -1168,6 +1168,17 @@ class AbstractRealization(ABC):
         """The realization as one table, for a parent that computes its own list from
         it. cap bounds the entries of a table that has to be made."""
 
+    @property
+    @abstractmethod
+    def finite(self) -> bool:
+        """From Stage 5, on every realization: whether every value it holds is a
+        finite number."""
+
+    @abstractmethod
+    def scaled(self, factor: float) -> AbstractRealization:
+        """From Stage 5: factor times the realization, applied in float before any
+        rounding."""
+
 
 @dataclass(frozen=True, eq=False, kw_only=True)
 class TableRealization(AbstractRealization):
@@ -1183,11 +1194,15 @@ class TableRealization(AbstractRealization):
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """Rounded once onto COST_SCALE; a number when constant, its position never
-        built; otherwise one add_element on its index's position. Raises
+        built; from Stage 5, its first entry plus a step times its position when
+        affine; otherwise one add_element on its index's position. Raises
         TableLoweringError for an entry past 2^50."""
 
     def table(self, cap: int) -> TableRealization:
         """Itself: none is made, and cap is not read."""
+
+    def scaled(self, factor: float) -> TableRealization:
+        """Its list times factor, on its index."""
 
 
 # Each symbol's input: the variable that picks its value, and the symbol's value at
@@ -1240,22 +1255,40 @@ class TableLowering(Printer):
 
 @dataclass(frozen=True, eq=False)
 class LinearRealization(AbstractRealization):
-    """A sum read linearly: its constant plus its terms, A + B + C, each a child's
-    realization, kept whole."""
+    """A sum kept linear: its constant plus its terms, each a list on a position of
+    its own. positions are the sum's input positions, in the order its table has
+    them. In Stage 5 every term is a table."""
 
     constant: float
-    terms: tuple[AbstractRealization, ...]
+    terms: tuple[TableRealization, ...]
+    positions: tuple[Index, ...]
+
+    @classmethod
+    def of(
+        cls, operands: Sequence[AbstractRealization], positions: Sequence[Index]
+    ) -> LinearRealization:
+        """The sum of operands, over positions: a sum among them taken term by term,
+        a constant into the constant, lists on one position added, all in float."""
+
+    @property
+    def finite(self) -> bool:
+        """Whether its constant and every term are finite."""
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """Its rounded constant plus each term's cp_expr."""
 
     def table(self, cap: int) -> TableRealization:
-        """Its terms' tables added on one position over their inputs, refused when
-        that would pass cap."""
+        """Its constant plus its terms' lists on one table over its positions, refused
+        when that would pass cap or holds a value that is not finite."""
+
+    def scaled(self, factor: float) -> LinearRealization:
+        """Its constant and each term times factor."""
 
 
-# TableLowering._print_Add(self, expr) -> LinearRealization: a sum is always realized
-# as a LinearRealization of its operands' realizations.
+# TableLowering._print_Add(self, expr) -> AbstractRealization: a sum is always a
+# LinearRealization of its operands' realizations.
+# TableLowering._print_Mul(self, expr) -> AbstractRealization: a constant times one
+# operand is the operand's realization scaled; any other product is one table.
 
 
 # ------------------------------------------------------------------ from Stage 13 on
@@ -1282,9 +1315,9 @@ def lower_cost_with_tables(
 ```
 
 The sketch is the interface: signatures and docstrings. The bodies down to the printer
-are in torch-spyre/torch-spyre#6525, and the parts marked from Stage 5 and from Stage 13
-are not built. The sketch passes mypy 2.1.0 with torch-spyre's settings and `empty-body`
-disabled.
+are in torch-spyre/torch-spyre#6525, and those marked from Stage 5 in
+torch-spyre/torch-spyre#6561. The part marked from Stage 13 is not built. The sketch
+passes mypy 2.1.0 with torch-spyre's settings and `empty-body` disabled.
 
 **The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. Its entry point
 is `print`: `print(expr)` returns the node's realization. It dispatches on the node's
@@ -1370,8 +1403,8 @@ was built, and the entry point's copy and swap back (Decisions) restores the mod
 constant; otherwise one `add_element` on its position). Only `cp_expr` methods touch
 the model. In Stage 1 each call builds anew,
 and a part reached twice is built twice: enough while only the root is built and no step
-writes the model. Stage 5 builds a node once and Stage 6 a position once, through one
-memo per build.
+writes the model. Stage 6 builds a realization and a position once, through one memo
+per build.
 
 **The copy.** `lower_cost_with_tables` copies the model with `model.clone()` before it
 maps an input. A failure in the build can come after variables were made: an entry past
@@ -1405,8 +1438,8 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 |---|---|
 | 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified over placeholders when the node is printed, applied to its operands' tables; `TableLowering` as a sympy `Printer` whose print methods return realizations, with a print method for each operation a stage adds; `AbstractRealization.table(cap)`, a realization as one table for a parent that asks |
 | 4 | the numpy core, `cost_expr_numpy.py`: a node's function from `NUMPY_FUNC_MAP` in place of its lambdified one (`_evaluate`), and the CP-SAT printer's `_evaluate_candidates` through the same `numpy_eval` |
-| 5 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
-| 6 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
+| 5 | `LinearRealization`, returned by `_print_Add` for every sum (`LinearRealization.of`: a sum among the operands taken term by term, constants into the constant, lists on one position added); `_print_Mul` for a constant times one operand, through `AbstractRealization.scaled`; a sum's `table(cap)`, for a parent that needs its list (a power, a log, a Piecewise); `finite` on every realization |
+| 6 | the switch realization; the `CompactIndex` step; the build memo, one per build, passed with the model, so that a realization with several readers and a position are each built once, a position keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
 | 7 | the gate, and `RelayoutCharge` as its own node |
 | 8 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 8 decides whether a node keeps its two best tables for its reader |
 | 9 | the `ExtremeIndex` step; a Min/Max node with its ladder |
@@ -1417,9 +1450,9 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 `Index.positions`, the numpy side of a position, held back from Stage 1, is Stage 3's
 `Index.on_grid`. Stage 12's rows read it too.
 
-Open in Stage 5: whether terms of one sum that are tables on equal positions are added
+Settled in Stage 5, as built: terms of one sum that are lists on one position are added
 before the rounding, one lookup and one rounding (`split ** 0.5 + split ** 0.7` is 3112
-at split 2, against 1448 + 1663 = 3111), or kept apart.
+at split 2, against 1448 + 1663 = 3111 kept apart).
 
 ### Where each stage lands
 
@@ -1429,8 +1462,8 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 | 2 | nothing in the module: synthetic examples of Stages 5 to 11 as strict xfails, and a trivial one that lowers; Stage 1's tests moved to `tests/` and skipped without ortools |
 | 3 | `TableLowering` becomes a sympy `Printer` (`print`, `_print_Symbol`, `_print_Piecewise`, `emptyPrinter`, `_operation`, `_finite`) that returns realizations and builds the positions; `AbstractRealization.table(cap)`; `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' tables, a Mul dividing by the base of a factor with a negative rational exponent; `Node`, `InputNode`, `ConstantNode`, `rewrite`, `children_of`, `lower` and `values_on_grid` go |
 | 4 | the numpy core (`NUMPY_FUNC_MAP`, `numpy_eval`), read by `_operation` in place of the lambdified function (`_evaluate`) and by the CP-SAT printer's `_evaluate_candidates`; `_lambdified` stays for a class the core does not hold |
-| 5 | `LinearRealization`, `AddNode` and `MulNode` for a constant factor, made by `_print_Add` and `_print_Mul`, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
-| 6 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
+| 5 | `LinearRealization`, returned by `_print_Add`; `_print_Mul` for a constant factor, through `AbstractRealization.scaled`; a sum's `table(cap)`; `finite` on every realization; and the affine case of `TableRealization.cp_expr` |
+| 6 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the build memo, building once what several readers share; the choice between ways (rule 3); entry counts on steps and tables |
 | 7 | the gate, and `RelayoutCharge` as its own node |
 | 8 | a node realized from its parts: ranks and pairs |
 | 9 | Min/Max nodes realized by rung: `ExtremeIndex`, ladders, rungs, clamping |
@@ -1497,8 +1530,8 @@ menus"; an empty cell is unchanged:
 - From Stage 5 the sum is linear, so it holds each term's realization: 33 entries where
   one table over the root is 24. On menus this short the terms' tables together are
   larger than the root's one table; at real sizes one table is never an option.
-- The two terms on `split_a` are one list if Stage 5 adds lists on one position before
-  the rounding (open there); kept apart, each total is 3 · 21 more.
+- The two terms on `split_a` are one list: Stage 5 adds lists on one position before
+  the rounding. Kept apart, each total would be 3 · 21 more.
 - Stage 6's switch takes the product from 231 entries to 38. Stage 8 leaves it a switch,
   which has fewer entries than the pair.
 - The Max's ranked parts at Stage 8 assume ranks apply to a Min/Max before Stage 9
@@ -1967,46 +2000,88 @@ An earlier build of the dict alone, from before Stage 3, is kept in
 
 ### Stage 5: linear sums
 
-The second optimization, the first that changes entries: "the sum stays linear" and "an
-affine list needs no table" of "How the tables are kept small", with the collapse of
-"Collapsing float lists into linear terms".
+The second optimization, the first that changes entries: "the sum stays linear", "lists
+on one index are added" and "an affine list needs no table" of "How the tables are kept
+small", with the collapse of "Collapsing float lists into linear terms".
 
-- `LinearRealization`, an `AbstractRealization`: a constant and its terms, each a
-  realization. Its `cp_expr` is its rounded constant plus each term's `cp_expr`.
-- `AddNode`, made by `_print_Add` for an Add, is always realized as a `LinearRealization`
-  of its children's realizations, `A + B + C`, kept whole.
-- `MulNode`, for a Mul with constant factors and one other child: its realization is the
-  child's with the factor applied in float before the rounding. `7 * split ** 0.5` at
-  split 2 is 10137, not 7 * 1448.
-- A node's `table`, for a parent that computes its own values from a child's list (a
-  power, a log, a Piecewise): one table over its inputs, as Stage 1 realizes it, read
-  only when such a parent asks. A sum read that way is one table again, and raises past
-  the cap.
-- Built once: the entry point makes one memo per build and passes it with the model,
-  as #32 did before its hooks were cut (92d7bd42). A node read by several parents is
-  built once through it. It lives for one build: the swap back after a failure drops it
-  with the copy, so nothing built into the discarded model is reused. Positions go
-  through it from Stage 6, when a step first writes the model.
-- `TableRealization.cp_expr` reads a list that is affine in its position as a linear
-  expression, with no table.
-- Open: whether terms of one sum that are tables on equal positions are added before
-  the rounding (one lookup, `split ** 0.5 + split ** 0.7` is 3112 at split 2) or kept
-  apart (two lookups, 1448 + 1663 = 3111).
+- **A sum is a `LinearRealization`,** an `AbstractRealization`: a constant plus its
+  terms, each a list on a position of its own. `_print_Add` returns one for every sum,
+  and its `cp_expr` is its rounded constant plus each term's `cp_expr`.
+- **What goes into one sum (`LinearRealization.of`).** A sum among the operands, as in
+  `2 * (a + b)`, is taken term by term, and a constant operand goes into the constant.
+  Lists on one position are added, one lookup and one rounding: `split ** 0.5 + split **
+  0.7` is 3112 at split 2, where the two lists rounded apart give 1448 + 1663 = 3111.
+  So at this stage a sum's terms are tables on distinct positions.
+- **A constant factor is applied in float.** `_print_Mul`, for a Mul with constant
+  factors and one other operand, returns the operand's realization with the factor
+  applied before the rounding (`AbstractRealization.scaled`): `7 * split ** 0.5` at
+  split 2 is 10137, not 7 * 1448. Any other product is one table, as before, and so is
+  a constant over an operand, which is divided (Stage 3).
+- **A sum's table, for a parent that asks.** A parent that computes its own list from a
+  sum (a power, a log, a Piecewise) asks it for its `table(cap)`: its constant plus its
+  terms' lists on one table over the sum's inputs. The printer hands the sum its input
+  positions, in the order of its symbols, so that table has the position an operation's
+  has. Past the cap the parent is refused first, before the sum is printed. The table
+  is made each time a parent asks, and is not kept.
+- **An affine list needs no table.** `TableRealization.cp_expr` reads a list whose
+  rounded entries are affine in its position as its first entry plus a step times the
+  position. Any list of two values is one.
+- **A value that is not finite** is refused at the node that makes it, as before
+  (`finite`, now on every realization): a sum whose added lists overflow, a product
+  whose coefficient overflows a list, and a sum whose table overflows when a parent
+  asks for it.
+
+Two things differ from this section as it was planned. Both are as built, and open to
+the review of the PR:
+
+- **Lists on one position are added.** The section left it open. The stage table, the
+  collapse and "How the tables are kept small" all had them added, and it is one lookup
+  where kept apart is two.
+- **No build memo.** The plan had one memo per build here, passed with the model, so
+  that a node with several readers is built once. With a sum taken term by term and
+  lists on one position added, a sum's terms are distinct lists and nothing is built
+  twice, so the memo would have no caller and no test. It moves to Stage 6, which first
+  has a realization that two terms hold, and where positions go through it.
 
 After this stage a sum whose terms each fit the cap is lowered exactly, with no table
-across two of its terms' inputs. On real objectives that is 6465 of the 6663 terms, and
-still no whole objective: each has a wide term past the cap.
+across two of its terms' inputs, and still no whole objective: each has a wide term past
+the cap. Measured on the 55 captures of the replay, lowering each objective and then
+each term of its sum:
+
+- every objective is refused at a term, where Stage 4 refused it at its root: a Min on
+  48, a product on 5 and a Max on 2;
+- of the 7,290 terms of the 55 sums, 7,103 lower within the cap and 187 are refused, 1
+  to 7 per objective: 109 Min, 61 products and 17 Max. The estimate on the 50 replayed
+  objectives was 6465 of 6663 terms;
+- the terms that lower are 5,379 lists once lists on one position are added. They build
+  into 2,059 tables of 275,544 entries, and the rest are affine or constant.
+
+Against the production path (Decisions): this stage does not touch the CP-SAT printer,
+and no compile runs the table module, so it changes no production time.
 
 Tests:
 
-- the printer makes an `AddNode` for an Add and a `MulNode` for a constant times one
-  child; a sum's realization is a `LinearRealization` of its children's realizations;
-- the sum that raised in Stage 1 is exact, with no table across two buffers;
-- a coefficient on a term, and on a sum, is applied before the rounding;
-- an affine list adds no table;
-- a sum under a power is read as its table, and raises past the cap;
-- a subexpression shared by two terms is built once;
-- terms on one position: one lookup or two, as the open question is settled.
+- a sum is a `LinearRealization` of its operands' own realizations, a constant operand
+  in its constant, its positions in symbol order; a sum with no symbol is its value;
+- the sum over three buffers that one table could not hold is exact in three tables of
+  21, 11 and 20 entries; asked for its table it is one of 4620, refused past the cap it
+  is asked with, naming no node;
+- a constant times one operand is the operand with the constant applied, a list or a
+  sum; a product of two operands is one table; a constant over an operand is divided;
+- a coefficient on a term, and on a sum with its constant, is applied before the
+  rounding;
+- lists on one position are added before the rounding, one lookup, and a sum under a
+  coefficient joins the others on their positions;
+- an affine list adds no table and no variable, and a list that is not adds one;
+- a sum under a power is read as its table, and past the cap the power is refused
+  before the sum is printed;
+- a sum that is not finite is refused at the sum: its added lists, its table when a
+  parent asks, and a coefficient at its product;
+- the `linear_sum` example loses its mark: four tables of 10 entries, where one table
+  needs 10^4. The other five keep theirs.
+
+Built: torch-spyre/torch-spyre#6561 at d68efa6c, stacked on #6547: the two files give 94
+passed and 5 xfailed in 3.6 s, with no device.
 
 ### Stage 6: rule 4, the switch
 
@@ -2022,7 +2097,11 @@ reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
   values by `CompactIndex`, a new `Index` step: one lookup from its position to the rank
   of its value. Where it does not, its position is its rank. Its values stay numbers.
   `CompactIndex` is the first step that writes the model, so from here a position is
-  built once per build: `Index.cp_expr` looks it up in the build memo by its value. Two
+  built once per build: `Index.cp_expr` looks it up in the build memo by its value. The
+  memo is new in this stage: the entry point makes one per build and passes it with the
+  model, and a realization that several readers hold, as a switch's rest can be, is
+  built once through it too. It lives for one build: the swap back after a failure
+  drops it with the copy, so nothing built into the discarded model is reused. Two
   tables on equal positions share one lookup even when two nodes made them, and a part
   reached twice in one position is built once. Without it each is built twice: two rank
   lookups where one is needed
@@ -2468,7 +2547,8 @@ After Stage 14, posted on that PR:
 Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
 (2026-11-19), 33 device-free tests. Stage 2 is merged: torch-spyre/torch-spyre#6501,
 2850616b (2026-11-20), synthetic examples of the later optimizations as strict xfails,
-with the two changes the review of Stage 1 asked for its tests. Stages 3 and 4 are
-built, each an open draft: torch-spyre/torch-spyre#6525 at e932aaaf, the printer that
-returns realizations, and on it torch-spyre/torch-spyre#6547 at 42570c32, the numpy
-core. Stage 5, linear sums, is next.
+with the two changes the review of Stage 1 asked for its tests. Stages 3, 4 and 5 are
+built, each an open draft on the one before: torch-spyre/torch-spyre#6525 at e932aaaf,
+the printer that returns realizations, torch-spyre/torch-spyre#6547 at 42570c32, the
+numpy core, and torch-spyre/torch-spyre#6561 at d68efa6c, linear sums. Stage 6, the
+switch, is next.
