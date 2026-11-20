@@ -32,13 +32,14 @@ layers, each with its own tests.
   parent never reads its children's tables: it lambdifies its whole expression over its
   inputs, so each operation runs again in every ancestor, and each node pays for its own
   lambdify. Stage 3 keeps what is computed: a node's list is its own operation on its
-  operands' lists, and lambdify runs once per class. The numpy steps follow as Stage 4,
-  in place of those functions. The owner asked why the numpy steps were "so much more
-  complex than lambdify", and on the measurements (Stage 3) said "Lets defer conversion
-  to numpy", then "Ok let move this caching to a new stage. The caching comes first."
-  Every later stage is one later. Measured the same day, Stage 4's numpy steps save
-  nothing per lowering and about 1.1 s of lambdify per process over the 50 replayed
-  objectives (Stage 4); whether to build Stage 4 is open.
+  operands' lists, and as first built lambdify ran once per class. The numpy steps
+  follow as Stage 4, in place of those functions. The owner asked why the numpy steps
+  were "so much more complex than lambdify", and on the measurements (Stage 3) said
+  "Lets defer conversion to numpy", then "Ok let move this caching to a new stage. The
+  caching comes first." Every later stage is one later. Measured the same day against
+  the cache of lambdified functions Stage 3 then had, Stage 4's numpy steps saved
+  nothing per lowering. That cache was removed on 2026-11-20 (below), so the numpy
+  functions are now what spares each node its lambdify (Stage 4).
 - **A stack of PRs**, one per stage, each on the one before, from branches in the fork.
   Stage 1 is torch-spyre/torch-spyre#6475, from the fork's
   `table-lowering-1-base-experimental` on torch-spyre `main` of 2026-11-17 (92582da3).
@@ -167,6 +168,36 @@ layers, each with its own tests.
   class", and on positions "IndexMap's interface should take IndexMap rather than
   CpIndex", "The relationship is circular right now", "Yeah merge them together".
   Spectre-ns/torch-spyre#32 is built this way. See Architecture.
+- **The factory is a sympy `Printer` (2026-11-20).** From Stage 3 `TableLowering`
+  subclasses `sympy.printing.printer.Printer`, as the solver's other lowering,
+  `_SympyExprToCpSat`, does, and prints a node as its `Node`. The owner's words: "Lets
+  update [torch-spyre/torch-spyre#6525] to use a sympy printer".
+  - A Printer already does what the factory did by hand. It dispatches on a node's sympy
+    class, the nearest class along its MRO that has a print method, and falls back to
+    `emptyPrinter`. So each node class is made by a print method: `_print_Symbol` makes
+    the `InputNode`, from Stage 5 `_print_Add` the `AddNode`, and so on. `rewrite`,
+    `children_of` and a table of node classes are not needed.
+  - Only the making of the nodes moves. A node still realizes itself, and a realization
+    and a position are neither sympy nor CP-SAT values, so nothing else is a printer's
+    work. A print method returns a `Node`, not a string, as sympy's pretty, MathML and
+    LLVM printers return types of their own. `lower` is the entry point, and `doprint`,
+    which returns a string, is not overridden.
+  - `_print` keeps each `Node` by its sympy node, which is what makes a shared
+    subexpression one node. A printer keeps its nodes between calls of `lower`; the
+    factory kept nothing.
+  - Measured on a build of every stage (torch-spyre branch
+    `table-lowering-full-printer-experimental`): the 55 captures of the replay lower to
+    the same model, byte for byte, in the same time, with 76 lines added to the module
+    and 67 removed. At Stage 3, on 12 expressions at two caps, each of 232 nodes has the
+    class, the children and the realization, or the refusal, that the factory gave it
+    (`~/gap-probe/table-lowering-printer/2026-11-20/`).
+- **No cache that outlives a lowering (2026-11-20).** Stage 3 as first built kept each
+  lambdified function in a module-level `lru_cache`, one per class and form of operands.
+  The review of torch-spyre/torch-spyre#6525 asked for no cache that hangs around, and
+  the owner's words were "Remove the caching", in that PR. A node now lambdifies its
+  function when it is realized, and nothing keeps it. On Stage 3's 600-node expression that is 0.16 s,
+  against 0.022 s with the cache and 0.18 s in Stage 1. The numpy functions of Stage 4,
+  which need no lambdify, are to win that time back.
 - **Names say what a class is (2026-11-19).** The lowering's classes drop the `Cp`
   prefix. A node ends in `Node`, what a node is realized as ends in `Realization`, and a
   position step ends in `Index`:
@@ -319,11 +350,11 @@ its off half zeros. The estimate ignores lists that turn out affine and cost not
   coefficient exact. How many of the 56 the switch brings under the cap is reported by
   Stage 13's replay.
 - Lowering time matters most where the model is smallest. At the default config a decode
-  block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. Stage 3's caching
-  lowers a 600-node expression in 0.030 s, 0.022 s once its functions are kept, against
-  0.18 s for Stage 1. Stage 4's numpy steps would save only lambdify's one-time cost,
-  about 1.1 s per process over the 50 replayed objectives. What the caching saves on the
-  decode blocks is reported by Stage 13's replay.
+    block takes 0.61 to 0.68 s to lower and 0.08 to 0.10 s to solve. Stage 3 lowers a
+  600-node expression in 0.16 s, against 0.18 s for Stage 1: each node reads its
+  children's lists, but still pays for a lambdify of its own. Numpy functions in place
+  of the lambdified ones lower it in 23 ms (Stage 4). What that saves on the decode
+  blocks is reported by Stage 13's replay.
 
 ## How a table is read
 
@@ -890,11 +921,12 @@ a realization or a position step changes nothing else:
   A *realization* is what a node is realized as, an `AbstractRealization`: a
   `TableRealization` (a float list on a position) and, from Stage 5, a
   `LinearRealization`. Values hold no model.
-- **Nodes.** `TableLowering` is a factory. It makes one `Node` per distinct sympy node,
-  of the class the node's sympy class calls for, and hands it what it reads. An
-  `InputNode` is handed its symbol's variable and values, and makes its own position on
-  the variable. Each node realizes itself the first time its realization is read, and
-  reads its children's realizations as it does.
+- **Nodes.** `TableLowering` is a sympy `Printer` (in Stages 1 and 2, a factory with a
+  walk of its own). It prints each distinct sympy node as one `Node`, of the class the
+  node's sympy class calls for, made by that class's print method, and hands it what it
+  reads. An `InputNode` is handed its symbol's variable and values, and makes its own
+  position on the variable. Each node realizes itself the first time its realization is
+  read, and reads its children's realizations as it does.
 - **The build.** Each value builds its own CP-SAT side with `cp_expr(model)`: a step,
   a position, a table, a node. There is no emitter. The objective is
   `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
@@ -915,6 +947,7 @@ from typing import Any, TypeAlias
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
+from sympy.printing.printer import Printer
 
 # What CP-SAT takes as a linear expression: a LinearExpr, an IntVar or an int.
 CpExpr: TypeAlias = cp_model.LinearExprT
@@ -1026,8 +1059,8 @@ Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 class Node:
     """The CP-SAT counterpart of one sympy node: an operation over free symbols,
     realized as one table over its inputs. expr, children and cap are injected by
-    the factory; children are made first, and a subexpression two parents share is
-    one node. Nothing here touches a model until cp_expr."""
+    the printer; children are printed first, and a subexpression two parents share
+    is one node. Nothing here touches a model until cp_expr."""
 
     expr: sympy.Basic
     children: tuple[Node, ...]
@@ -1055,7 +1088,7 @@ class Node:
 
 @dataclass(eq=False)
 class InputNode(Node):
-    """A symbol: input data. Its variable and its values are injected by the factory;
+    """A symbol: input data. Its variable and its values are injected by the printer;
     None raises "a symbol with no input", naming it, when a reader reads its columns.
     It makes its own position, an InputIndex on its variable, and refuses values that
     are not one per value of the variable."""
@@ -1074,8 +1107,9 @@ class ConstantNode(Node):
         """Its value, one entry on UnitIndex."""
 
 
-class TableLowering:
-    """A factory for Nodes. It holds the inputs and the cap, no model."""
+class TableLowering(Printer):
+    """A sympy Printer whose print of a node is its Node (from Stage 3). It holds the
+    inputs, the cap and the Nodes it has made, and no model."""
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
         """inputs gives each symbol's variable and values; cap bounds one table."""
@@ -1083,9 +1117,22 @@ class TableLowering:
     def lower(self, root: sympy.Basic) -> Node:
         """root's node, over the graph of nodes under it. Nothing is realized here."""
 
-    def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, Node]:
-        """Each distinct node under root, children first, in the order of
-        sympy.postorder_traversal with its repeats dropped; no ExprCondPair."""
+    def _print(self, expr: sympy.Basic, **kwargs: Any) -> Node:
+        """expr's Node, printed the first time it is met and kept: the Printer's
+        dispatch on expr's sympy class, with emptyPrinter as the fallback."""
+
+    def _print_Symbol(self, expr: sympy.Basic) -> Node:
+        """An InputNode holding the symbol's input."""
+
+    def _print_Piecewise(self, expr: sympy.Basic) -> Node:
+        """A Node over its arms' values and conditions; no ExprCondPair gets one."""
+
+    def _print_RelayoutCharge(self, expr: sympy.Basic) -> Node:
+        """A Node over its literal and its division; its prices are data."""
+
+    def emptyPrinter(self, expr: sympy.Basic) -> Node:
+        """Any other class: a Node over its arguments. Whatever its class, a node
+        with no free symbol is a ConstantNode."""
 
 
 # ------------------------------------------------------------------- from Stage 5 on
@@ -1135,22 +1182,25 @@ def lower_cost_with_tables(
 ```
 
 The sketch is the interface: signatures and docstrings, with the bodies in #32. The
-sketch passes mypy 2.1.0 and 1.13.0 with torch-spyre's settings and `empty-body`
-disabled.
+sketch passes mypy 2.1.0 with torch-spyre's settings and `empty-body` disabled.
 
-**The factory.** `rewrite` walks `list(dict.fromkeys(sympy.postorder_traversal(root)))`,
-the distinct nodes, each after its arguments. It makes each node from its children,
-which it made earlier, so a subexpression two terms share is one node that both
-parents hold:
-- A `Symbol` becomes an `InputNode`, handed its variable and its values from the inputs.
-  It makes its own position, an `InputIndex` on the variable.
-- A node with no free symbol becomes a `ConstantNode`: a number, `true`/`false`, or an
-  operation on numbers such as `sqrt(2)`.
-- Any other node becomes a `Node`. From Stage 5, `Add` becomes `AddNode`, and each later
-  operation gets its class the same way.
+**The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. `lower` prints
+the root: `_print` dispatches on the node's sympy class, the nearest class along its MRO
+that has a print method, and falls back to `emptyPrinter`. A print method prints the
+node's children first and makes the node's `Node` over theirs. `_print` keeps each
+`Node` by its sympy node, so a subexpression two terms share is printed once, one node
+that both parents hold:
+- `_print_Symbol` makes an `InputNode`, handed its variable and its values from the
+  inputs. It makes its own position, an `InputIndex` on the variable.
+- A node with no free symbol becomes a `ConstantNode`, whatever its class: a number,
+  `true`/`false`, or an operation on numbers such as `sqrt(2)`.
+- `emptyPrinter` makes a `Node` for any other class. From Stage 5, `_print_Add` makes an
+  `AddNode`, and each later operation gets its print method the same way.
 
-`lower` returns the root's node and realizes nothing. On the 50 replayed objectives
-the list holds 110 to 11,020 distinct nodes, from a traversal of 589 to 71,914.
+`lower` returns the root's node and realizes nothing. The 50 replayed objectives hold
+110 to 11,020 distinct nodes each, in a traversal of 589 to 71,914. In Stages 1 and 2
+`TableLowering` is a factory with a walk of its own, `rewrite`, over
+`sympy.postorder_traversal`; Stage 3 makes it the printer (Decisions).
 
 **Realized when read.** A node computes `columns` (its inputs' columns, gathered from
 its children) and `realization` (`realize()`) the first time each is read, and keeps
@@ -1160,9 +1210,9 @@ it, each once, as deep as the expression (6 to 17 on the replay). Each node chec
 own list as it is realized, which is how a value that is not finite is refused at the
 node that makes it (Decisions). In Stage 1 that lambdifies every node over its inputs,
 as the visitor of the earlier plan did. From Stage 3 a node's list is its own operation
-on its children's lists, lambdified once per class, and Stage 4 replaces most of those
-functions with numpy steps. A node
-past the cap raises before it reads a child, so nothing under it is evaluated.
+on its children's lists, its class lambdified over placeholders when the node is
+realized, and Stage 4 replaces most of those functions with numpy steps. A node past the
+cap raises before it reads a child, so nothing under it is evaluated.
 
 On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, Stage 1
 realizes the root as one table of 6 entries on `2*division_a + division_b` and builds it
@@ -1181,12 +1231,12 @@ root = TableLowering(inputs, cap=8192).lower(9 * split_a ** -2 * split_b ** 0.5)
 model.minimize(root.cp_expr(model))   # 3 variables, 1 constraint
 ```
 
-**Children.** A node's children are `children_of(expr)`, its arguments, with two
-exceptions:
-- A Piecewise's children are its arms' values and conditions; an arm's
-  `ExprCondPair` gets no node.
-- A `RelayoutCharge`'s children are its literal and its division. Its prices are data
-  its node reads from `expr`.
+**Children.** A node's children are the nodes its print method prints: its arguments,
+with two exceptions:
+- A Piecewise's children are its arms' values and conditions (`_print_Piecewise`); an
+  arm's `ExprCondPair` gets no node.
+- A `RelayoutCharge`'s children are its literal and its division
+  (`_print_RelayoutCharge`). Its prices are data its node reads from `expr`.
 
 **Refusals.** A node raises `TableLoweringError`, naming itself, when a reader reads it
 and it has no realization:
@@ -1247,7 +1297,7 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 
 | Stage | Hook |
 |---|---|
-| 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified once per class and form of operands, applied to its operands' lists |
+| 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified over placeholders when the node is realized, applied to its operands' lists; `TableLowering` as a sympy `Printer`, with a print method for each node class a stage adds |
 | 4 | a node's numpy step in place of its lambdified function |
 | 5 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
 | 6 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
@@ -1271,9 +1321,9 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 |---|---|
 | 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | nothing in the module: synthetic examples of Stages 5 to 11 as strict xfails, and a trivial one that lowers; Stage 1's tests moved to `tests/` and skipped without ortools |
-| 3 | `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' lists (`Node.operands`), a Mul dividing by the base of a factor with a negative rational exponent; `values_on_grid` goes |
+| 3 | `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' lists (`Node.operands`), a Mul dividing by the base of a factor with a negative rational exponent; `values_on_grid` goes; `TableLowering` becomes a sympy `Printer` (`_print`, `_print_Symbol`, `_print_Piecewise`, `_print_RelayoutCharge`, `emptyPrinter`), and `rewrite` and `children_of` go |
 | 4 | the dict of numpy steps, applied in place of a node's lambdified function |
-| 5 | `LinearRealization`, `AddNode`, `MulNode` for a constant factor, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
+| 5 | `LinearRealization`, `AddNode` and `MulNode` for a constant factor, made by `_print_Add` and `_print_Mul`, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
 | 6 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
 | 7 | the gate, and `RelayoutCharge` as its own node |
 | 8 | a node realized from its parts: ranks and pairs |
@@ -1543,22 +1593,31 @@ Built: torch-spyre/torch-spyre#6501 at 1fe04ab6, the owner's squash of the examp
 
 ### Stage 3: caching, each node from its children's lists
 
-The first optimization is lowering time. Stage 1 realizes each node once and keeps its
-table, but a parent never reads that table: it lambdifies its whole expression and
-evaluates it from the inputs. So each operation runs again in every ancestor, up to the
-root, and each node pays for a lambdify of its own. Here a node's list is its own
-operation on its operands' lists, and the lambdified functions are kept by class.
-Nothing else changes: the same lists, the same tables, the same model.
+Stage 1 realizes each node once and keeps its table, but a parent never reads that
+table: it lambdifies its whole expression and evaluates it from the inputs. So each
+operation runs again in every ancestor, up to the root. Here a node's list is its own
+operation on its operands' lists, which its children have already computed. The stage
+also makes `TableLowering` a sympy `Printer`. Nothing else changes: the same lists, the
+same tables, the same model.
 
-- **One function per class.** A node's function is its sympy class over one placeholder
-  per operand, lambdified with the numpy module once for each class and form of operands
-  (`_lambdified`, an `lru_cache`), and shared by every node of them in every lowering of
-  the process. 40 terms of one shape, 600 nodes, lambdify 10 functions. The placeholders
-  are plain symbols, `operand0`, `operand1`, ..., whose names are Python identifiers.
-  When any argument is a `Dummy`, lambdify renames every argument, rebuilding the
-  expression through its class once per argument: a Min of 35 operands took 10.5 s, and
-  the 142 functions of the 50 replayed objectives 30.1 s, against 0.28 s and 1.1 s over
-  plain symbols. The expression holds nothing but placeholders, so no name clashes.
+- **A node's own function.** A node's function is its sympy class over one placeholder
+  per operand, lambdified with the numpy module by the node when it is realized
+  (`_lambdified`). Nothing keeps it once the lowering is done: as first built it sat in
+  a module-level `lru_cache`, one function per class and form of operands, which the
+  review asked to remove (Decisions). A node keeps its realization, so a node two
+  parents read is lambdified once. The placeholders are plain symbols, `operand0`,
+  `operand1`, ..., whose names are Python identifiers. When any argument is a `Dummy`,
+  lambdify renames every argument, rebuilding the expression through its class once per
+  argument: a Min of 35 operands took 10.5 s, and the 142 distinct functions of the 50
+  replayed objectives 30.1 s, against 0.28 s and 1.1 s over plain symbols. The
+  expression holds nothing but placeholders, so no name clashes.
+- **`TableLowering` is a sympy `Printer`.** The factory's walk and its tests of a node's
+  class become the Printer's: `_print` keeps each `Node` by its sympy node,
+  `_print_Symbol` makes the `InputNode`, `_print_Piecewise` and `_print_RelayoutCharge`
+  pick their node's children, and `emptyPrinter` makes a `Node` for any other class.
+  `rewrite` and `children_of` go, and `Node.operands` reads a Piecewise's parts from its
+  children. A print method only makes a `Node`: the nodes, realizations and positions
+  are unchanged (Architecture, Decisions).
 - **Each operand read at the node's entries.** An operand on the node's own position is
   read as it is. One on fewer positions is read at its own position: `Index.on_grid`
   computes, from each input position's coordinate at every entry of the node's table,
@@ -1580,18 +1639,23 @@ Nothing else changes: the same lists, the same tables, the same model.
   `(1/3)*b`, as the node computes it. That base is the one node a node reads that is
   not its child.
 
-Lowering a 600-node expression with a root table of 8,192 entries takes 0.18 s in
-Stage 1 and 0.030 s here in a fresh process, 0.022 s once its functions are kept. Every
-entry of its root is Stage 1's to 4e-15. What it saves on the decode blocks is reported
-by Stage 13's replay.
+Lowering a 600-node expression with a root table of 8,192 entries takes 0.18 s in Stage
+1 and 0.16 s here: no operation runs twice, but each node still pays for a lambdify of
+its own. With the cache of the first build it took 0.022 s. Every entry of its root is
+Stage 1's to 4e-15. What it saves on the decode blocks is reported by Stage 13's replay.
 
 Tests, in `tests/test_cpsat_table_lowering.py`:
 
 - `values_on_grid`'s tests become a node's list: row-major, the last position fastest,
   each term read at its own position; two symbols of one position together; a constant
   operand at every entry;
-- one function for each class and form: 40 terms of one shape, over 300 nodes, at most
-  12 functions lambdified, and the root's list is Stage 1's;
+- a node lambdifies once and nothing is kept: 40 terms of one shape make 397 nodes, each
+  lambdified once, among them at most 12 distinct functions; a second lowering
+  lambdifies as many again; the root's list is Stage 1's;
+- the printer: a `Dummy`, a subclass of `Symbol`, is an `InputNode`; a class with no
+  print method goes to `emptyPrinter`; a RelayoutCharge's prices are not children; what
+  two calls of `lower` share is one node; the tests that called `rewrite` reach the
+  nodes under a root through its children;
 - names kept: a Min of 35 operands is lambdified with its parameters named `operand0` to
   `operand34`, nothing renamed; over `Dummy` placeholders the test fails, in 10 s;
 - a quotient divided: `floor(x/y) + floor(x/y**2)` is exact at (98, 49), (98, 7) and
@@ -1607,8 +1671,8 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
   Stage 1 lists fail;
 - the synthetic examples keep their marks: caching changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at 02a87839, stacked on #6501: the file gives 47
-passed and 6 xfailed in 1.6 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at c44dfe43, with `main` merged in: the file gives
+48 passed and 6 xfailed in 3.7 s, with no device.
 
 ### Stage 4: numpy steps from a dict
 
@@ -1641,15 +1705,15 @@ need auto tiling or cost parameters other than production's. The
 functions, a new class each, so no dict holds them, and they keep their lambdified
 function.
 
-What it lowers is what Stage 3 lowers. What it saves over Stage 3 was measured before it
-is built (2026-11-19, `~/gap-probe/torch-spyre-pr6501/stage4-measure/`), with the first
-build's steps dropped in for Stage 3's functions:
+What it lowers is what Stage 3 lowers. What it saves was measured before it is built
+(2026-11-19, `~/gap-probe/torch-spyre-pr6501/stage4-measure/`), with the first build's
+steps dropped in for Stage 3's functions, while Stage 3 still kept those in a cache:
 
-- **Per lowering, nothing.** On Stage 3's 600-node expression, numpy steps take 23 ms,
-  whether the functions are fresh or kept, against Stage 3's 30 ms in a fresh process
-  and 22 ms once its functions are kept, with every root entry equal. A kept function
-  calls the same numpy functions a step does.
-- **Once per process, lambdify.** The 50 replayed objectives hold 99,210 operation
+- **Per lowering.** On Stage 3's 600-node expression, numpy steps take 23 ms. With its
+  cache Stage 3 took 30 ms in a fresh process and 22 ms after, and every root entry was
+  equal: a kept function calls the same numpy functions a step does. With no cache
+  (2026-11-20) Stage 3 takes 0.16 s, so the steps save each node its lambdify.
+- **The functions lambdified.** The 50 replayed objectives hold 99,210 operation
   nodes, and they need 142 functions, one per class and form, 7 to 61 for one objective.
   Lambdifying all 142 takes 1.1 s, 0.82 s of it for the four widest Min/Max (35, 33, 32
   and 16 operands). Nodes past the cap are never evaluated, and from Stage 5 a sum is
@@ -1659,8 +1723,8 @@ build's steps dropped in for Stage 3's functions:
   objectives would keep a lambdified function. None of them holds a delivery-price
   function, which would.
 
-So Stage 4 would save at most about a second per process, and nothing on a lowering
-after the first. Whether to build it is open. The first build and its tests are kept in
+So against Stage 3 as built, with no cache, the numpy steps are what makes a lowering
+fast: 0.16 s to 23 ms on that expression. The first build and its tests are kept in
 `~/gap-probe/torch-spyre-pr6501/stage3-numpy-deferred/`.
 
 Tests, `tests/test_cost_expr_numpy.py`, added to the config Stage 2 moved:
@@ -1689,7 +1753,7 @@ affine list needs no table" of "How the tables are kept small", with the collaps
 
 - `LinearRealization`, an `AbstractRealization`: a constant and its terms, each a
   realization. Its `cp_expr` is its rounded constant plus each term's `cp_expr`.
-- `AddNode`, made by the factory for an Add, is always realized as a `LinearRealization`
+- `AddNode`, made by `_print_Add` for an Add, is always realized as a `LinearRealization`
   of its children's realizations, `A + B + C`, kept whole.
 - `MulNode`, for a Mul with constant factors and one other child: its realization is the
   child's with the factor applied in float before the rounding. `7 * split ** 0.5` at
@@ -1715,7 +1779,7 @@ still no whole objective: each has a wide term past the cap.
 
 Tests:
 
-- the factory makes an `AddNode` for an Add and a `MulNode` for a constant times one
+- the printer makes an `AddNode` for an Add and a `MulNode` for a constant times one
   child; a sum's realization is a `LinearRealization` of its children's realizations;
 - the sum that raised in Stage 1 is exact, with no table across two buffers;
 - a coefficient on a term, and on a sum, is applied before the rounding;
