@@ -230,6 +230,20 @@ layers, each with its own tests.
     `_print_RelayoutCharge`), returning what the class was to realize. A node's two
     reads, its `realization` and its `table`, are the returned realization and its
     `table(cap)`. Those stages' sections keep the node names until each is built.
+  - The full experimental build has this shape too (2026-11-20, fork branch
+    `table-lowering-full-realizations-experimental`, 081b4528, on the numpy-core variant
+    7695c5b9). What each later realization's `table(cap)` is there: a sum, its constant
+    plus its terms' tables; a switch, its factor's values times its rest's table; a
+    gate, its rest's table where the literal is at its kept value, and 0 elsewhere; a
+    Min/Max kept linear, the min or max of its operands' tables, or its table by rung.
+    Each is the cheapest in entries of one table over the inputs under its parts and one
+    over the parts' own positions. A print method that has already computed its node's
+    table to weigh it, a product's or a Min/Max's, hands it to the realization it
+    returns, so a parent's `table(cap)` computes nothing; when the node has no table
+    within the cap, neither has its realization. On the 55 captures the model and the
+    objective are byte-identical to the build with `Node` classes, and the lowering time
+    is the same within run-to-run variation (30.5 s against 27.7 s back to back, 28.6 s
+    against 34.2 s in an earlier pair).
   - Measured on the 55 captures of the replay: each of the 104,234 nodes that fit the
     cap has the list and the position the Nodes gave it, and each of the 770 refusals
     names the same node for the same reason.
