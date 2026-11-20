@@ -74,8 +74,10 @@ layers, each with its own tests.
   steps; the owner made them Stage 2, ahead of every optimization, and every later
   stage moved one later.
 - **Off by default.** Stages 1 to 13 add files no compile runs, with one exception:
-  Stage 4's numpy core, which the CP-SAT printer's `_evaluate_candidates` calls, and
-  which leaves the printer's model as it is on `main`. Stage 14 adds the flag.
+  Stage 4's numpy core, which the CP-SAT printer's `_evaluate_candidates` calls. With
+  it the printer tables a `Not` or an `ITE` that one buffer's candidates decide, so on
+  some objectives its model is smaller than on `main`, at the same optimum (Stage 4).
+  Stage 14 adds the flag.
 - **Base mechanics first, then one optimization per stage, integration last
   (2026-11-17).** Stage 1 lowers an expression from inputs given to it, one table per
   node, and cannot lower a real objective: its one table would hold 10^13.4 to 10^401
@@ -295,10 +297,10 @@ layers, each with its own tests.
   in a follow up PR to feed `_evaluate_candidates`", "Make the numpy follow up as a
   separate PR", and "We need to use the numpy core to evaluate tables as well." The core
   is the dict of the 2026-11-17 decision, `NUMPY_FUNC_MAP` with `numpy_eval`, read by
-  both lowerings. The CP-SAT printer evaluates only the classes it evaluated before, so
-  its model is unchanged, and lambdify stays in the table lowering for a node of a class
-  the core does not hold. Production time is unchanged: the printer takes 890 s on
-  `main` and 892 s through the core on the 55 captures of the replay. Inside the table
+  both lowerings. The CP-SAT printer evaluates every class the core has a function for
+  (below), and lambdify stays in the table lowering for a node of a class the core does
+  not hold. On the 55 captures of the replay the printer lowers the 26 it lowers on
+  `main`, 21 of them to a smaller model, and each to `main`'s optimum. Inside the table
   path the core takes lambdify's place: 70 s to 23 s on the nodes of those captures that
   fit the cap (Stage 4).
 - **The two lowerings share arithmetic, not `_evaluate_candidates` (2026-11-20).** The
@@ -309,11 +311,25 @@ layers, each with its own tests.
   the integer `scale // value`, `log2_` symbols as `round(32 * log2(value))`, floors
   dropped and floats truncated, over one buffer's candidates. The table path evaluates
   the expression as written, in floating point, over several inputs. So what is shared
-  is the arithmetic of each class, the numpy core. And on the printer's list of classes:
-  "_CANDIDATE_CLASSES will remain and expand as the printer is expanded to handle more
-  cases. The table approach seeks to avoid this limitation by numerical evaluation." The
-  list is the printer's own, not derived from the core's map, and a test holds each
-  class on it to a function in the core.
+  is the arithmetic of each class, the numpy core.
+- **The CP-SAT printer keeps no list of classes (2026-11-20).** `_evaluate_candidates`
+  calls `numpy_eval` on any node whose operands it evaluated. A class the core has no
+  function for, its `NotImplementedError`, has no candidate values and goes to its print
+  method. So the core's map is the one list of what is evaluated numerically. The review
+  of torch-spyre/torch-spyre#6547 asked "Try `numpy_eval` and return None if a
+  NotImplementedError is raised by it?", and then said "I don't think it is an issue for
+  the callers and we can get rid of `_CANDIDATE_CLASSES`". The owner's words: "`if not
+  isinstance(expr, _CANDIDATE_CLASSES):` should be unneeded. Just use the underlying
+  compatibility list in eval_numpy", and then "Push this change". This replaces the same
+  day's answer, that the list "will remain and expand as the printer is expanded to
+  handle more cases".
+  - With the list, the printer built `main`'s model on every capture. Without it, a
+    `Not` or an `ITE` that one buffer's candidates decide is one element table, where
+    its print method lowered it before. On the 55 captures those are the only classes
+    newly evaluated: `Not` 262 times and `ITE` 79, of 99,171 evaluations.
+  - So Stage 4 changes the model the production path builds, which Stage 14's flag
+    does not gate: smaller on 21 of the 26 captures the printer lowers, and solved to
+    `main`'s optimum on all 26 (Stage 4).
 - **Names say what a class is (2026-11-19).** The lowering's classes drop the `Cp`
   prefix. A node ends in `Node`, what a node is realized as ends in `Realization`, and a
   position step ends in `Index`:
@@ -1441,7 +1457,7 @@ an example removes its `xfail` mark, and none is left after Stage 11.
 | 1 | the base mechanics: inputs and an expression to a CP-SAT objective, one table per node, every value by lambdify | an expression whose inputs fit the cap together; no real objective |
 | 2 | synthetic examples of the later optimizations as strict xfails; Stage 1's tests out of `tests/inductor/`, skipped where ortools is not installed | the same as Stage 1; each example raises until its stage, and its test says so |
 | 3 | a sympy `Printer` that returns realizations, in place of the factory and its `Node` classes: each list from its operands' tables, by the node's class lambdified as it is printed | the same as Stage 1, no operation run again in an ancestor |
-| 4 | a numpy core shared with the CP-SAT printer: a node's list from it, the lambdified function for any class it does not hold; the CP-SAT printer's candidates through it | the same as Stage 3, and the CP-SAT printer's model unchanged |
+| 4 | a numpy core shared with the CP-SAT printer: a node's list from it, the lambdified function for any class it does not hold; the CP-SAT printer's candidates through it, with no list of classes of its own | the same as Stage 3; the CP-SAT printer also tables a `Not` or an `ITE` over one buffer, at the same optimum |
 | 5 | linear sums: the sum stays linear, lists on one position added, constant factors pushed down, affine lists | a sum of terms that each fit the cap: 6465 of the 6663 real terms, no real objective |
 | 6 | rule 4: the switch, the rest collapsed once and multiplied by each of the factor's values under enforced linear constraints; `CompactIndex` and the choice by entries | any product of a rest and a factor with few values; each literal's term at its rest's entries, not twice them |
 | 7 | rule 5: the gate, the switch on a 0/1 literal with the literal out of the rest and its value pushed in exactly; a relayout charge gated by its literal | the same, the literal in no table, fractional coefficients exact |
@@ -1814,8 +1830,9 @@ buffer's candidates with numpy, by a chain of tests on the node's class. The rev
 torch-spyre/torch-spyre#6525 asked for that as something standalone that both lowerings
 call, in place of the tables' lambdify. Stage 4 builds it: a numpy core that the CP-SAT
 printer evaluates its candidates with, and that the table lowering computes each node's
-list with. The table lowering lowers what Stage 3 lowers, with the same lists, and the
-CP-SAT printer builds the same model.
+list with. The table lowering lowers what Stage 3 lowers, with the same lists. The
+CP-SAT printer lowers what it lowers on `main`, to the same optimum, and to a smaller
+model where the core evaluates a class the printer did not.
 
 Two printers are in this stage: the CP-SAT printer, `_SympyExprToCpSat`, which is the
 production path, and `TableLowering`, a sympy `Printer` since Stage 3. In this section
@@ -1838,20 +1855,25 @@ name and no fallback to numpy's own functions.
   `np.logical_or` pairwise.
 - Piecewise takes, at each entry, the first arm whose condition holds, and NaN where
   none does. An arm that holds everywhere, as a default arm does, is taken as it is.
-- Abs, floor, ceiling, log, exp, Not, ITE and KroneckerDelta are numpy's `abs`, `floor`,
-  `ceil`, `log`, `exp`, `logical_not`, `where` and `equal`. floor, ceiling, log and exp
-  take floats, not exact ints.
+- Abs, floor, ceiling, Not, ITE and KroneckerDelta are numpy's `abs`, `floor`, `ceil`,
+  `logical_not`, `where` and `equal`. floor and ceiling round a column of exact ints or
+  of floats alike.
+- log and exp are numpy's `log` and `exp` over their operands made floats. numpy has no
+  loop for them over a column of exact ints, which is how the CP-SAT printer holds a
+  buffer's candidates.
 - `RelayoutCharge` (`plan_solver.py:487`) is its literal times the price at its
-  division, 0 at a division past the prices, as its own `_imp_` computes it.
+  division, 0 at a division past the prices, as its own `_imp_` computes it. Its
+  division is made a float before it is rounded, for the same reason.
 
 **The CP-SAT printer.** `_evaluate_candidates` keeps what is the printer's own: a
 symbol's candidates and their scales, the owner of a value, and the required default
-arm. For the arithmetic it calls `numpy_eval`, on the classes it evaluated before
-(`_CANDIDATE_CLASSES`: Add, Mul, Pow, Min, Max, the relationals, And, Or, Piecewise and
-KroneckerDelta). A node of any other class still goes to its print method, though the
-core has a function for it, so the printer lowers what it lowered. The list is the
-printer's own and grows as the printer is taught more cases; the table path has no such
-list, since it evaluates any class numerically (Decisions). The table path does not call
+arm. For the arithmetic it calls `numpy_eval` on any node whose operands it evaluated,
+and keeps no list of classes of its own (Decisions). A node of a class the core has no
+function for, its `NotImplementedError`, has no candidate values and goes to its print
+method. On `main` the printer evaluated Add, Mul, Pow, Min, Max, the relationals, And,
+Or, Piecewise and KroneckerDelta. Through the core it also evaluates Abs, floor,
+ceiling, log, exp, Not, ITE and a relayout charge, where one buffer's candidates decide
+the node, so such a node is one element table. The table path does not call
 `_evaluate_candidates`, which evaluates the printer's approximations of logs and
 inverses.
 
@@ -1879,13 +1901,26 @@ Measured on the 55 captures of the replay
   relative on sums and products of 11 to 16 operands, and in no entry after the
   rounding. No node that wide has a table under the cap in the captures. A list is held
   to the expression's value, not to those bits (Decisions).
-- **Production: the same model in the same time.** The production path is the printer
-  (Decisions). On each of the 55 captures, the printer through the core leaves the same
-  model, objective and symbol map as `main`'s printer. It lowers 26 and refuses 29 (`**`
-  on a linear expression), as `main`'s does. Each printer in its own process, the 55
-  take 890 s on `main` and 892 s through the core, and the 26 it lowers 124 s and 122 s
-  (`printer-times.jsonl`). The core evaluates 126 to 5,789 nodes per capture, 98,273 in
-  all.
+- **Production: a smaller model on some objectives, at the same optimum.** The
+  production path is the printer (Decisions). It lowers 26 of the 55 captures and
+  refuses 29 (`**` on a linear expression), as `main`'s does. On 24 captures it leaves
+  `main`'s model, objective and symbol map, and on 31 it does not
+  (`printer-fp-nolist.jsonl`):
+  - The core evaluates 99,171 nodes over the 55. The only classes among them that the
+    printer did not evaluate on `main` are `Not`, 262 times, and `ITE`, 79.
+  - Of the 26 captures it lowers, 21 have a smaller model: 21,883 to 21,372 variables
+    and 38,412 to 37,483 constraints over the 26. All 26 solve to `OPTIMAL` with
+    `main`'s objective value and the same exact cost at the solution, in 22.3 s against
+    23.2 s (`printer-solve-nolist.jsonl`; 8 workers, seed 0).
+  - Of the 29 it refuses, 10 gain one variable and one constraint, an `ITE`'s table,
+    before the same refusal.
+  - The 55 take 732 s on `main` and 701 s through the core, and the 26 it lowers 76.1 s
+    and 74.8 s: each printer in its own process, twelve objectives at once, `main`'s
+    printer and then this one on each objective (`printer-times-nolist.jsonl`). Only
+    the two arms of one run compare. The machine's load moves these times between runs:
+    `main`'s printer on its 26 took from 72 s to 124 s in five runs that day.
+  - As first built, with the printer's own list of classes, it left `main`'s model on
+    all 55.
 - **The table path's own time.** No compile runs the table module, and at this stage it
   lowers none of the 55 captures: each is refused at its root, one table past the cap.
   On the 104,234 nodes that fit the cap, realizing them takes 23 s, against 70 s in
@@ -1896,21 +1931,22 @@ Tests, `tests/test_cost_expr_numpy.py`, with its config beside the one Stage 2 m
 
 - each class against sympy: on 16 expressions over a menu held as an object array, as
   the printer holds its candidates, every entry is the value sympy computes there and no
-  int becomes a float; on 5 more over a float array, the classes that take floats; with
-  a relayout charge they reach every class in the dict;
+  int becomes a float; on 5 more, the classes whose values are floats, over a float
+  array and over an object array of exact ints; with a relayout charge they reach every
+  class in the dict;
 - exact ints: `2**62 + 2**62`, `2**62 * 2**62` and `3**50`, alone and in an object
   array; a sum of floats is Python's `sum`;
 - Piecewise: the first arm that holds wins, a default arm's ints stay ints, and with no
   default an entry no arm holds at is NaN;
 - `RelayoutCharge` agrees with its `_imp_` at every literal and division, its prices as
-  numbers and as lists;
+  numbers and as lists, its division as floats and as exact ints;
 - a subclass is evaluated as its class, and a class with no function (`sympy.sinc`)
   raises `NotImplementedError`, naming it;
-- every class on the CP-SAT printer's list, and each relational, has a function in the
-  core; with Pow taken out of the dict the test fails;
 - the CP-SAT printer: its candidate values of each expression come through `numpy_eval`
-  and are sympy's at every candidate; a class outside its own list (Abs) has no
-  candidate values; each expression it lowers has sympy's value at every candidate;
+  and are sympy's at every candidate, those of Abs, floor, ceiling, log, exp, Not and
+  ITE among them; a class the core has no function for (Mod) has none, and neither has
+  a node above it; a free residency literal stops the evaluation the same way; each cost
+  it lowers, with Abs, Not and ITE among them, has sympy's value at every candidate;
 
 and in `tests/test_cpsat_table_lowering.py`:
 
@@ -1922,8 +1958,8 @@ and in `tests/test_cpsat_table_lowering.py`:
   test and one of the Stage 1 lists fail;
 - the synthetic examples keep their marks: the core changes no lowering.
 
-Built: torch-spyre/torch-spyre#6547 at c4a5addc, stacked on #6525 and merged with its
-printer that returns realizations: the two files give 82 passed and 6 xfailed in 3.5 s,
+Built: torch-spyre/torch-spyre#6547 at 42570c32, stacked on #6525 and merged with its
+printer that returns realizations: the two files give 86 passed and 6 xfailed in 4.3 s,
 with no device.
 
 An earlier build of the dict alone, from before Stage 3, is kept in
@@ -2434,5 +2470,5 @@ Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
 2850616b (2026-11-20), synthetic examples of the later optimizations as strict xfails,
 with the two changes the review of Stage 1 asked for its tests. Stages 3 and 4 are
 built, each an open draft: torch-spyre/torch-spyre#6525 at e932aaaf, the printer that
-returns realizations, and on it torch-spyre/torch-spyre#6547 at c4a5addc, the numpy
+returns realizations, and on it torch-spyre/torch-spyre#6547 at 42570c32, the numpy
 core. Stage 5, linear sums, is next.
