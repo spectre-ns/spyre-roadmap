@@ -199,8 +199,15 @@ layers, each with its own tests.
   themselves of the 2026-11-18 entry.
   - A print method returns the node's realization to the node's parent. It prints the
     node's operands first, which returns theirs, and asks an operand for its table when
-    it computes its own list from it: `AbstractRealization.table()`. In Stage 3 every
+    it computes its own list from it: `AbstractRealization.table(cap)`. In Stage 3 every
     realization is a table and returns itself.
+  - The conversion takes the cap. The owner's words: "So this means that realizing to
+    a table realization will result in evaluation of all child realizations" and "The
+    AbstractRealizations should take the cap into table". From Stage 5 a realization
+    that is not a table makes one from its operands' tables, which asks each of them for
+    theirs, down to the leaves: the operands' own lists are already computed, and what
+    is new is the one list over all their inputs. The cap is passed so that table is
+    refused before it is computed. A `TableRealization` reads no cap: it makes nothing.
   - `print` is the printer's public method, and the print methods return an
     `AbstractRealization`. The owner's words: "print should be a public member of
     TableLowering" and "Shouldn't the print methods call return abstract realizations?"
@@ -218,7 +225,7 @@ layers, each with its own tests.
     (`_print_Add`, `_print_Mul`, `_print_Min` and `_print_Max`,
     `_print_RelayoutCharge`), returning what the class was to realize. A node's two
     reads, its `realization` and its `table`, are the returned realization and its
-    `table()`. Those stages' sections keep the node names until each is built.
+    `table(cap)`. Those stages' sections keep the node names until each is built.
   - Measured on the 55 captures of the replay: each of the 104,234 nodes that fit the
     cap has the list and the position the Nodes gave it, and each of the 770 refusals
     names the same node for the same reason.
@@ -1114,9 +1121,9 @@ class AbstractRealization(ABC):
         """The realization in model, in COST_SCALE units."""
 
     @abstractmethod
-    def table(self) -> TableRealization:
+    def table(self, cap: int) -> TableRealization:
         """The realization as one table, for a parent that computes its own list from
-        it."""
+        it. cap bounds the entries of a table that has to be made."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
@@ -1136,8 +1143,8 @@ class TableRealization(AbstractRealization):
         built; otherwise one add_element on its index's position. Raises
         TableLoweringError for an entry past 2^50."""
 
-    def table(self) -> TableRealization:
-        """Itself."""
+    def table(self, cap: int) -> TableRealization:
+        """Itself: none is made, and cap is not read."""
 
 
 # Each symbol's input: the variable that picks its value, and the symbol's value at
@@ -1199,8 +1206,9 @@ class LinearRealization(AbstractRealization):
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """Its rounded constant plus each term's cp_expr."""
 
-    def table(self) -> TableRealization:
-        """Its terms' tables added on one position over their inputs."""
+    def table(self, cap: int) -> TableRealization:
+        """Its terms' tables added on one position over their inputs, refused when
+        that would pass cap."""
 
 
 # TableLowering._print_Add(self, expr) -> LinearRealization: a sum is always realized
@@ -1262,7 +1270,7 @@ first, each checking its own list, which is how a value that is not finite is re
 the node that makes it (Decisions). Then the node's list is its own operation on its
 operands' tables, each read at the node's entries, its class lambdified over
 placeholders, and Stage 4 replaces most of those functions with numpy steps. A parent
-asks an operand's realization for its `table()`: in Stage 3 every realization is a
+asks an operand's realization for its `table(cap)`: in Stage 3 every realization is a
 table, and from Stage 5 one that is not converts itself. Printing recurses as deep as
 the expression (6 to 17 on the replay). In Stage 1 a node lambdified its whole
 expression over its inputs, when its realization was first read.
@@ -1349,8 +1357,13 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 
 | Stage | Hook |
 |---|---|
+<<<<<<< HEAD
 | 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified over placeholders when the node is realized, applied to its operands' lists; `TableLowering` as a sympy `Printer` whose print methods return realizations, with a print method for each operation a stage adds; `AbstractRealization.table()`, a realization as one table for a parent that asks |
 | 4 | the numpy core, `cost_expr_numpy.py`: a node's function from `NUMPY_FUNC_MAP` in place of its lambdified one (`_evaluate`), and the printer's `_evaluate_candidates` through the same `numpy_eval` |
+=======
+| 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified over placeholders when the node is realized, applied to its operands' lists; `TableLowering` as a sympy `Printer` whose print methods return realizations, with a print method for each operation a stage adds; `AbstractRealization.table(cap)`, a realization as one table for a parent that asks |
+| 4 | a node's numpy step in place of its lambdified function |
+>>>>>>> cpsat-table-lowering-stage3-caching
 | 5 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
 | 6 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
 | 7 | the gate, and `RelayoutCharge` as its own node |
@@ -1373,8 +1386,13 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 |---|---|
 | 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | nothing in the module: synthetic examples of Stages 5 to 11 as strict xfails, and a trivial one that lowers; Stage 1's tests moved to `tests/` and skipped without ortools |
+<<<<<<< HEAD
 | 3 | `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' lists, a Mul dividing by the base of a factor with a negative rational exponent; `values_on_grid` goes; `TableLowering` becomes a sympy `Printer` (`_print`, `_print_Symbol`, `_print_Piecewise`, `emptyPrinter`, `_operation`) that returns realizations and builds the positions; `AbstractRealization.table()`; `Node`, `InputNode`, `ConstantNode`, `rewrite` and `children_of` go |
 | 4 | the numpy core (`NUMPY_FUNC_MAP`, `numpy_eval`), read by a node in place of its lambdified function and by the printer's `_evaluate_candidates`; `_lambdified` stays for a class the core does not hold |
+=======
+| 3 | `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' lists, a Mul dividing by the base of a factor with a negative rational exponent; `values_on_grid` goes; `TableLowering` becomes a sympy `Printer` (`_print`, `_print_Symbol`, `_print_Piecewise`, `emptyPrinter`, `_operation`) that returns realizations and builds the positions; `AbstractRealization.table(cap)`; `Node`, `InputNode`, `ConstantNode`, `rewrite` and `children_of` go |
+| 4 | the dict of numpy steps, applied in place of a node's lambdified function |
+>>>>>>> cpsat-table-lowering-stage3-caching
 | 5 | `LinearRealization`, `AddNode` and `MulNode` for a constant factor, made by `_print_Add` and `_print_Mul`, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
 | 6 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
 | 7 | the gate, and `RelayoutCharge` as its own node |
@@ -1673,7 +1691,7 @@ same tables, the same model.
 - **`TableLowering` is a sympy `Printer` that returns realizations.** The factory's walk
   and its tests of a node's class become the Printer's, and the nodes are merged into it
   (Decisions): a print method returns the node's realization to the node's parent, and
-  `AbstractRealization.table()` gives a parent the table it computes its own list from.
+  `AbstractRealization.table(cap)` gives a parent the table it computes its own list from.
   `print`, its public method, keeps each realization by its sympy node, `_print_Symbol`
   returns the symbol's column on an `InputIndex` the printer makes, and
   `_print_Piecewise` and `emptyPrinter` return one table over the node's inputs
@@ -1754,8 +1772,8 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
 - the synthetic examples keep their marks, each with a reason that gives its failure:
   this stage changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at 21902f0d, with `main` merged in: the file gives
-49 passed and 6 xfailed in 3.4 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at 1d2006b3, with `main` merged in: the file gives
+50 passed and 6 xfailed in 3.7 s, with no device.
 
 ### Stage 4: a numpy core, shared with the printer
 
@@ -1867,8 +1885,8 @@ and in `tests/test_cpsat_table_lowering.py`:
   test and one of the Stage 1 lists fail;
 - the synthetic examples keep their marks: the core changes no lowering.
 
-Built: torch-spyre/torch-spyre#6547 at 687470f3, stacked on #6525 and merged with its
-printer that returns realizations: the two files give 81 passed and 6 xfailed in 3.4 s,
+Built: torch-spyre/torch-spyre#6547 at 4a38e338, stacked on #6525 and merged with its
+printer that returns realizations: the two files give 82 passed and 6 xfailed in 3.4 s,
 with no device.
 
 An earlier build of the dict alone, from before Stage 3, is kept in
