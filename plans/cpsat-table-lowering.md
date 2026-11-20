@@ -180,11 +180,11 @@ layers, each with its own tests.
   - Only the making of the nodes moves. A node still realizes itself, and a realization
     and a position are neither sympy nor CP-SAT values, so nothing else is a printer's
     work. A print method returns a `Node`, not a string, as sympy's pretty, MathML and
-    LLVM printers return types of their own. `lower` is the entry point, and `doprint`,
-    which returns a string, is not overridden.
+    LLVM printers return types of their own. `doprint`, which returns a string, is not
+    overridden.
   - `_print` keeps each `Node` by its sympy node, which is what makes a shared
-    subexpression one node. A printer keeps its nodes between calls of `lower`; the
-    factory kept nothing.
+    subexpression one node. A printer keeps its nodes between calls; the factory kept
+    nothing.
   - Measured on a build of every stage (torch-spyre branch
     `table-lowering-full-printer-experimental`): the 55 captures of the replay lower to
     the same model, byte for byte, in the same time, with 76 lines added to the module
@@ -208,14 +208,18 @@ layers, each with its own tests.
     theirs, down to the leaves: the operands' own lists are already computed, and what
     is new is the one list over all their inputs. The cap is passed so that table is
     refused before it is computed. A `TableRealization` reads no cap: it makes nothing.
-  - `print` is the printer's public method, and the print methods return an
-    `AbstractRealization`. The owner's words: "print should be a public member of
-    TableLowering" and "Shouldn't the print methods call return abstract realizations?"
-    So a parent gets a table only by asking a realization for it.
+  - `print` is the printer's entry point, `lower` is removed, and the print methods
+    return an `AbstractRealization`. The owner's words: "print should be a public member
+    of TableLowering", "Shouldn't the print methods call return abstract realizations?"
+    and "Remove lower, print is the entry point". So the objective is
+    `TableLowering(inputs, cap=cap).print(expr).cp_expr(model)`, and a parent gets a
+    table only by asking a realization for it. The normalization the later stages put in
+    `lower` (Stages 7 and 13) moves to the entry point, `lower_cost_with_tables`, before
+    it prints.
   - The printer builds the positions: a symbol's column on an `InputIndex` of its
     variable, and an operation's position from its inputs' positions, combined in the
     order of its symbols.
-  - Printing realizes, so `lower` raises a refusal itself and returns the root's
+  - Printing realizes, so `print` raises a refusal itself and returns the node's
     realization. What the nodes guaranteed is kept: a node whose table would pass the
     cap is refused before anything under it is printed or evaluated, and a value that is
     not finite at the node that makes it. A refusal from the build, an entry past 2^50,
@@ -995,7 +999,7 @@ a realization or a position step changes nothing else:
   distinct node is printed once.
 - **The build.** Each value builds its own CP-SAT side with `cp_expr(model)`: a step, a
   position, a table. There is no emitter. The objective is `TableLowering(inputs,
-  cap=cap).lower(expr).cp_expr(model)`.
+  cap=cap).print(expr).cp_expr(model)`.
 
 This is how torch-spyre/torch-spyre#6475 is built. The design came out of review on that
 PR on 2026-11-18, and replaces the two passes, the visitor, the pass that marked linear
@@ -1138,14 +1142,11 @@ class TableLowering(Printer):
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
         """inputs gives each symbol's variable and values; cap bounds one table."""
 
-    def lower(self, root: sympy.Basic) -> AbstractRealization:
-        """print of the root. Raises TableLoweringError naming the node that cannot be
-        lowered."""
-
     def print(self, expr: sympy.Basic) -> AbstractRealization:
         """expr's realization, printed the first time it is met and kept: the
         Printer's dispatch on expr's sympy class, with emptyPrinter as the fallback.
-        The public method: a print method prints its operands with it."""
+        The entry point, and what a print method prints its operands with. Raises
+        TableLoweringError naming the node that cannot be lowered."""
 
     def _print_Symbol(self, expr: sympy.Basic) -> AbstractRealization:
         """The symbol's column on an InputIndex made here on its variable."""
@@ -1215,13 +1216,12 @@ def lower_cost_with_tables(
 The sketch is the interface: signatures and docstrings, with the bodies in #32. The
 sketch passes mypy 2.1.0 with torch-spyre's settings and `empty-body` disabled.
 
-**The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. Its public
-method is `print`: `print(expr)` returns the node's realization, and `lower` is `print`
-of the root. It dispatches on the node's sympy class, the nearest class along its MRO
-that has a print method, and falls back to `emptyPrinter`. A print method returns an
-`AbstractRealization`, and prints its node's operands with `print`. `print` keeps each
-realization by its sympy node, so a subexpression two terms share is printed once, and
-both parents read one realization:
+**The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. Its entry point
+is `print`: `print(expr)` returns the node's realization. It dispatches on the node's
+sympy class, the nearest class along its MRO that has a print method, and falls back to
+`emptyPrinter`. A print method returns an `AbstractRealization`, and prints its node's
+operands with `print`. `print` keeps each realization by its sympy node, so a
+subexpression two terms share is printed once, and both parents read one realization:
 - `_print_Symbol` returns the symbol's column: its values on an `InputIndex` the printer
   makes on the symbol's variable.
 - A node with no free symbol is its value on `UnitIndex`, whatever its class: a number,
@@ -1262,7 +1262,7 @@ division_a = model.new_int_var(0, 2, "division_a")   # split_a's menu: 1, 2, 4
 division_b = model.new_int_var(0, 1, "division_b")   # split_b's menu: 1, 3
 split_a, split_b = sympy.symbols("split_a split_b", positive=True)
 inputs = {split_a: (division_a, [1.0, 2.0, 4.0]), split_b: (division_b, [1.0, 3.0])}
-root = TableLowering(inputs, cap=8192).lower(9 * split_a ** -2 * split_b ** 0.5)
+root = TableLowering(inputs, cap=8192).print(9 * split_a ** -2 * split_b ** 0.5)
 model.minimize(root.cp_expr(model))   # 3 variables, 1 constraint
 ```
 
@@ -1289,7 +1289,7 @@ no realization:
 Every refusal is a `TableLoweringError`, so none can reach an `except` around the
 objective as a `RuntimeError`, `TypeError` or `ValueError`.
 
-`lower` touches no model, so a refusal from it leaves the model as it was. From Stage
+`print` touches no model, so a refusal from it leaves the model as it was. From Stage
 4, when one sum's terms are built in turn, a later term can refuse after an earlier one
 was built, and the entry point's copy and swap back (Decisions) restores the model.
 
@@ -1316,7 +1316,7 @@ def lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, *, cap):
     copy = model.clone()
     try:
         inputs = inputs_from_maps(sym_map, buffer_map, cap=cap)
-        return TableLowering(inputs, cap=cap).lower(cost_expr).cp_expr(model)
+        return TableLowering(inputs, cap=cap).print(cost_expr).cp_expr(model)
     except Exception as exc:
         model.proto.copy_from(copy.proto)
         model.rebuild_constant_map()
@@ -1340,7 +1340,7 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 | 9 | the `ExtremeIndex` step; a Min/Max node with its ladder |
 | 10 | the fold, one more way to realize a product |
 | 11 | the `lin_max`/`lin_min` realization, with its entry count for margin 2 |
-| 13 | the `LocateIndex` step, `inputs_from_maps`, `lower`'s normalization, `lower_cost_with_tables` |
+| 13 | the `LocateIndex` step, `inputs_from_maps`, the normalization before printing, `lower_cost_with_tables` |
 
 `Index.positions`, the numpy side of a position, held back from Stage 1, is Stage 3's
 `Index.on_grid`. Stage 12's rows read it too.
@@ -1365,7 +1365,7 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 | 10 | a product realized by fold |
 | 11 | the linear realization of a Min/Max: `lin_max` and `lin_min`, margin 2, operands behind proxies |
 | 12 | not in the stack: the table constraint as a branch that changes the `cp_expr` methods |
-| 13 | `LocateIndex`, `inputs_from_maps`, `lower`'s normalization, and `lower_cost_with_tables` with its copy and swap back |
+| 13 | `LocateIndex`, `inputs_from_maps`, the normalization before printing, and `lower_cost_with_tables` with its copy and swap back |
 | 14 | in the module, only its ortools import, guarded as the printer's is; outside it, the flag, the solver's call, `linear_cost_only` under the flag, and the docs |
 
 ## Stages
@@ -1709,13 +1709,13 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
   lambdified once, among them at most 12 distinct functions; a second lowering
   lambdifies as many again; the root's list is Stage 1's;
 - the printer: a `Dummy`, a subclass of `Symbol`, is printed as its column; a class with
-  no print method goes to `emptyPrinter`; what two calls of `lower` share is one
+  no print method goes to `emptyPrinter`; what two calls of `print` share is one
   realization; operands are printed before their parents and a shared subexpression is
   evaluated once; a Piecewise arm is not printed;
 - positions: a symbol's is made on its variable, and an operation's combines its inputs'
   in symbol order, however the expression is written;
 - refusals: a table at the cap is made and one past it is refused before anything is
-  evaluated, naming the root; `lower` touches no model; an entry past 2^50 is refused by
+  evaluated, naming the root; `print` touches no model; an entry past 2^50 is refused by
   the build, naming no node;
 - names kept: a Min of 35 operands is lambdified with its parameters named `operand0` to
   `operand34`, nothing renamed; over `Dummy` placeholders the test fails, in 10 s;
@@ -1736,8 +1736,8 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
 - the synthetic examples keep their marks, each with a reason that gives its failure:
   this stage changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at 1d2006b3, with `main` merged in: the file gives
-50 passed and 6 xfailed in 3.7 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at e932aaaf, with `main` merged in: the file gives
+50 passed and 6 xfailed in 3.6 s, with no device.
 
 ### Stage 4: numpy steps from a dict
 
@@ -1970,8 +1970,8 @@ one table over its literal and its division, twice the menu, its off half zeros.
   writes `2*(1 - x)`. Its value at the literal's other value, the kept value, is a
   coefficient. A product may hold gates on several literals. A factor of one literal
   that is 0 at neither value, such as `1 + x`, is not a gate.
-- **The rest reads no literal.** `lower`'s normalization reads a gated product's other
-  factors with each gate's literal at its kept value, by `xreplace`, so
+- **The rest reads no literal.** The normalization before printing reads a gated
+  product's other factors with each gate's literal at its kept value, by `xreplace`, so
   `x * Max(x*a, b)` becomes `x * Max(a, b)`. A product with only constants beside its
   gate is a constant times the gate's list on its literal, which is affine (Stage 5): no
   gate and no table. So `(1 - x) * (c - c*x + c*x/t)` becomes `c * (1 - x)`, with no
@@ -2157,8 +2157,8 @@ occur is missing.
   objectives read has gaps, so `LocateIndex` is for objectives the replay does not hold.
   A domain past the cap is not an input. Mapping the inputs adds nothing to the model: a
   `LocateIndex`'s lookup is built by its `cp_expr`, when a table on it is built.
-- `lower`'s normalization: a relayout charge on a source this solve does not divide
-  becomes 0.
+- The normalization before printing: a relayout charge on a source this solve does not
+  divide becomes 0.
 - `lower_cost_with_tables(model, sym_map, buffer_map, cost_expr, cap=...)` copies the
   model and returns the objective, an `int` when it is constant. On any failure it
   swaps the copy back and raises `TableLoweringError`, and nothing else.
