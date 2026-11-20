@@ -201,6 +201,10 @@ layers, each with its own tests.
     node's operands first, which returns theirs, and asks an operand for its table when
     it computes its own list from it: `AbstractRealization.table()`. In Stage 3 every
     realization is a table and returns itself.
+  - `print` is the printer's public method, and the print methods return an
+    `AbstractRealization`. The owner's words: "print should be a public member of
+    TableLowering" and "Shouldn't the print methods call return abstract realizations?"
+    So a parent gets a table only by asking a realization for it.
   - The printer builds the positions: a symbol's column on an `InputIndex` of its
     variable, and an operation's position from its inputs' positions, combined in the
     order of its symbols.
@@ -1128,20 +1132,21 @@ class TableLowering(Printer):
         """inputs gives each symbol's variable and values; cap bounds one table."""
 
     def lower(self, root: sympy.Basic) -> AbstractRealization:
-        """root's realization. Raises TableLoweringError naming the node that cannot
-        be lowered."""
+        """print of the root. Raises TableLoweringError naming the node that cannot be
+        lowered."""
 
-    def _print(self, expr: sympy.Basic, **kwargs: Any) -> AbstractRealization:
+    def print(self, expr: sympy.Basic) -> AbstractRealization:
         """expr's realization, printed the first time it is met and kept: the
-        Printer's dispatch on expr's sympy class, with emptyPrinter as the fallback."""
+        Printer's dispatch on expr's sympy class, with emptyPrinter as the fallback.
+        The public method: a print method prints its operands with it."""
 
-    def _print_Symbol(self, expr: sympy.Basic) -> TableRealization:
+    def _print_Symbol(self, expr: sympy.Basic) -> AbstractRealization:
         """The symbol's column on an InputIndex made here on its variable."""
 
-    def _print_Piecewise(self, expr: sympy.Basic) -> TableRealization:
+    def _print_Piecewise(self, expr: sympy.Basic) -> AbstractRealization:
         """Over its arms' values and conditions; no ExprCondPair is printed."""
 
-    def emptyPrinter(self, expr: sympy.Basic) -> TableRealization:
+    def emptyPrinter(self, expr: sympy.Basic) -> AbstractRealization:
         """Any other class, over its arguments."""
 
     def _operation(
@@ -1202,11 +1207,13 @@ def lower_cost_with_tables(
 The sketch is the interface: signatures and docstrings, with the bodies in #32. The
 sketch passes mypy 2.1.0 with torch-spyre's settings and `empty-body` disabled.
 
-**The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. `lower` prints
-the root: `_print` dispatches on the node's sympy class, the nearest class along its MRO
-that has a print method, and falls back to `emptyPrinter`. A print method returns the
-node's realization. `_print` keeps each realization by its sympy node, so a
-subexpression two terms share is printed once, and both parents read one realization:
+**The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. Its public
+method is `print`: `print(expr)` returns the node's realization, and `lower` is `print`
+of the root. It dispatches on the node's sympy class, the nearest class along its MRO
+that has a print method, and falls back to `emptyPrinter`. A print method returns an
+`AbstractRealization`, and prints its node's operands with `print`. `print` keeps each
+realization by its sympy node, so a subexpression two terms share is printed once, and
+both parents read one realization:
 - `_print_Symbol` returns the symbol's column: its values on an `InputIndex` the printer
   makes on the symbol's variable.
 - A node with no free symbol is its value on `UnitIndex`, whatever its class: a number,
@@ -1641,11 +1648,11 @@ same tables, the same model.
   and its tests of a node's class become the Printer's, and the nodes are merged into it
   (Decisions): a print method returns the node's realization to the node's parent, and
   `AbstractRealization.table()` gives a parent the table it computes its own list from.
-  `_print` keeps each realization by its sympy node, `_print_Symbol` returns the
-  symbol's column on an `InputIndex` the printer makes, and `_print_Piecewise` and
-  `emptyPrinter` return one table over the node's inputs (`_operation`). `Node`,
-  `InputNode`, `ConstantNode`, `rewrite` and `children_of` go. The lists, the positions
-  and the refusals are unchanged (Architecture).
+  `print`, its public method, keeps each realization by its sympy node, `_print_Symbol`
+  returns the symbol's column on an `InputIndex` the printer makes, and
+  `_print_Piecewise` and `emptyPrinter` return one table over the node's inputs
+  (`_operation`). `Node`, `InputNode`, `ConstantNode`, `rewrite` and `children_of` go.
+  The lists, the positions and the refusals are unchanged (Architecture).
 - **Each operand read at the node's entries.** An operand on the node's own position is
   read as it is. One on fewer positions is read at its own position: `Index.on_grid`
   computes, from each input position's coordinate at every entry of the node's table,
@@ -1721,8 +1728,8 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
 - the synthetic examples keep their marks, each with a reason that gives its failure:
   this stage changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at f1f371b8, with `main` merged in: the file gives
-49 passed and 6 xfailed in 3.8 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at 21902f0d, with `main` merged in: the file gives
+49 passed and 6 xfailed in 3.4 s, with no device.
 
 ### Stage 4: numpy steps from a dict
 
