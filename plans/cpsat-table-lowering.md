@@ -195,9 +195,27 @@ layers, each with its own tests.
   lambdified function in a module-level `lru_cache`, one per class and form of operands.
   The review of torch-spyre/torch-spyre#6525 asked for no cache that hangs around, and
   the owner's words were "Remove the caching", in that PR. A node now lambdifies its
-  function when it is realized, and nothing keeps it. On Stage 3's 600-node expression that is 0.16 s,
-  against 0.022 s with the cache and 0.18 s in Stage 1. The numpy functions of Stage 4,
-  which need no lambdify, are to win that time back.
+  function when it is realized, and nothing keeps it. The cache is not weighed in any
+  measurement here: Stage 4's numpy functions take lambdify's place. The owner's words:
+  "We shouldn't consider the cache as its being removed to use numpy look ups. Lets
+  remeasure." The remeasured times are in Stages 3 and 4.
+- **Floating point until CP-SAT, and not the annealer's bits (2026-11-20).** A list is
+  computed in floating point and rounded once, onto `COST_SCALE`, where it enters
+  CP-SAT. It is held to the expression's value, not to another evaluator's result. The
+  owner's words: "We don't care about exactly matching the annealer as it's not able to
+  determine global optimals. We will get some rounding but we should be able to use
+  floating point math until we move into CP-SAT to contain the span." So a list may
+  differ from Stage 1's whole-expression lambdify in its last bits, and by one step
+  where a `floor` or `ceiling` argument lands on an integer: a node sums its operands in
+  their own order, and reads a constant as the double it is, where lambdify prints a
+  Float to 15 digits (its `ceiling(2/3 * c)` is one high at c = 3, 6 and 9). On the 55
+  captures of the replay, 22,167 of 104,234 lists differ from Stage 1's in their last
+  bits and no entry differs after the rounding.
+- **An xfail reason gives the failure, not a stage of the plan (2026-11-20).** The
+  synthetic examples' reasons named the stage that lowers each. The owner's words: "No
+  we shouldn't link to plan. Add the reason to the xfail reasons." Each reason now says
+  which table is past the cap, how many entries it needs, and what is not built that
+  would lower it (#6525, d579576e).
 - **A numpy core, shared with the printer (2026-11-20).** Stage 4 is built, as
   torch-spyre/torch-spyre#6547. The review of #6525 asked for the printer's
   `_evaluate_candidates` as "a standalone function/class that can be called in both
@@ -207,8 +225,8 @@ layers, each with its own tests.
   is the dict of the 2026-11-17 decision, `NUMPY_FUNC_MAP` with `numpy_eval`, read by
   both lowerings. The printer evaluates only the classes it evaluated before, so its
   model is unchanged, and lambdify stays for a table node of a class the core does not
-  hold. With Stage 3's cache gone, the core is what makes a lowering fast: 0.16 s to
-  0.022 s on the 600-node expression (Stage 4).
+  hold. The core takes lambdify's place: 61 s to 21 s on the 55 captures of the replay,
+  and 0.16 s to 0.022 s on the 600-node expression (Stage 4).
 - **Names say what a class is (2026-11-19).** The lowering's classes drop the `Cp`
   prefix. A node ends in `Node`, what a node is realized as ends in `Realization`, and a
   position step ends in `Index`:
@@ -1580,8 +1598,11 @@ stage's optimization can:
   reader. Whether any replayed objective has one is to be measured before Stage 10 is
   built (`~/gap-probe/torch-spyre-pr6501/fold/`).
 - **The marks.** Each param's id is the example's name and its mark is
-  `pytest.mark.xfail(raises=TableLoweringError, strict=True, reason=...)`, naming the
-  stage and why it is refused until then. With `raises`, only a refusal is an expected
+  `pytest.mark.xfail(raises=TableLoweringError, strict=True, reason=...)`. The reason
+  gives the failure itself: which table is past the cap, its entries, and what is not
+  built that would lower it. It names no stage of the plan (Decisions; as #6501 merged
+  them each named its stage, and #6525 rewrote them). With `raises`, only a refusal is
+  an expected
   failure. With `strict`, an example that starts to lower fails the run as an unexpected
   pass, so the stage that lowers it drops its mark. An example lowered earlier or later
   than its stage shows as that, and the PR of the stage that sees it moves the mark.
@@ -1622,6 +1643,10 @@ same tables, the same model.
   argument: a Min of 35 operands took 10.5 s, and the 142 distinct functions of the 50
   replayed objectives 30.1 s, against 0.28 s and 1.1 s over plain symbols. The
   expression holds nothing but placeholders, so no name clashes.
+- **Floating point until CP-SAT.** A list is the expression's value in floating point,
+  rounded once where it enters CP-SAT, and is not held to Stage 1's bits or the
+  annealer's (Decisions). A node sums its operands in their own order and reads a
+  constant as the double it is.
 - **`TableLowering` is a sympy `Printer`.** The factory's walk and its tests of a node's
   class become the Printer's: `_print` keeps each `Node` by its sympy node,
   `_print_Symbol` makes the `InputNode`, `_print_Piecewise` and `_print_RelayoutCharge`
@@ -1652,8 +1677,15 @@ same tables, the same model.
 
 Lowering a 600-node expression with a root table of 8,192 entries takes 0.18 s in Stage
 1 and 0.16 s here: no operation runs twice, but each node still pays for a lambdify of
-its own. With the cache of the first build it took 0.022 s. Every entry of its root is
-Stage 1's to 4e-15. What it saves on the decode blocks is reported by Stage 13's replay.
+its own. Every entry of its root is Stage 1's to 4e-15.
+
+Remeasured on the 55 captures of the replay, 2026-11-20
+(`~/gap-probe/table-lowering-numpy-core/2026-11-20/stage-times.jsonl`): they hold
+105,004 operation nodes, of which 104,234 have a table under the cap and 770 are
+refused, the same ones in every build. Realizing all of them takes 86 s in Stage 1 and
+61 s here, summed over the captures, run eight at once. On 7 of the 55 Stage 3 is the
+slower, by up to 1.7 times: building the function of a Min or Max of 35 operands takes
+0.27 s, and every such node pays it. Stage 4 lambdifies none of these nodes.
 
 Tests, in `tests/test_cpsat_table_lowering.py`:
 
@@ -1669,6 +1701,9 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
   nodes under a root through its children;
 - names kept: a Min of 35 operands is lambdified with its parameters named `operand0` to
   `operand34`, nothing renamed; over `Dummy` placeholders the test fails, in 10 s;
+- a constant read as the double it is: `ceiling(Float(2)/3 * c)` is 1, 2, 4, 5, 6 at c =
+  1, 3, 6, 7, 9, and exact through CP-SAT, where lambdify's 15-digit constant gives 3,
+  5, 7 at 3, 6, 9;
 - a quotient divided: `floor(x/y) + floor(x/y**2)` is exact at (98, 49), (98, 7) and
   (49, 7), where a reciprocal floors one low;
 - every node's list is Stage 1's, its whole expression lambdified over its inputs, to
@@ -1680,10 +1715,11 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
   evaluator (`sa_cooptimizer.py:849`), at its candidate and residency, to 1e-9;
 - with the division turned off, the quotient test, the 40-term test and one of the
   Stage 1 lists fail;
-- the synthetic examples keep their marks: caching changes no lowering.
+- the synthetic examples keep their marks, each with a reason that gives its failure:
+  this stage changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at c44dfe43, with `main` merged in: the file gives
-48 passed and 6 xfailed in 3.7 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at d579576e, with `main` merged in: the file gives
+49 passed and 6 xfailed in 3.5 s, with no device.
 
 ### Stage 4: a numpy core, shared with the printer
 
@@ -1736,12 +1772,21 @@ lambdifies its class over placeholders as in Stage 3, per node and uncached:
 Measured on the 55 captures of the replay
 (`~/gap-probe/table-lowering-numpy-core/2026-11-20/`):
 
-- **The tables' lists are lambdify's, bit for bit.** 104,234 nodes have a table under
-  the cap, 7,252,786 entries in all. Every entry equals the one Stage 3's lambdified
-  function gave, the 770 refusals are the same, and no node is lambdified, so the core
-  holds every class of those nodes. Realizing them takes 29 s where it took 118 s.
-- **Lowering time.** The 600-node expression lowers in 0.022 s, against 0.16 s in Stage
-  3 and 0.18 s in Stage 1.
+- **On the captures, the tables' lists are lambdify's, bit for bit.** 104,234 nodes have
+  a table under the cap, 7,252,786 entries in all. Every entry equals the one Stage 3's
+  lambdified function gave, the 770 refusals are the same, and no node is lambdified, so
+  the core holds every class of those nodes.
+- **Not bit for bit on every expression.** Stage 3 lambdifies an Add or Mul over
+  placeholders, and sympy orders them by name, so beyond 10 operands it sums `operand0 +
+  operand1 + operand10 + operand11 + operand2 ...`. The core takes the operands in the
+  expression's own order, and such a node's list differs in its last bits: up to 6e-16
+  relative on sums and products of 11 to 16 operands, and in no entry after the
+  rounding. No node that wide has a table under the cap in the captures. A list is held
+  to the expression's value, not to those bits (Decisions).
+- **Lowering time.** Realizing those 104,234 nodes takes 21 s, against 61 s in Stage 3
+  and 86 s in Stage 1, summed over the captures, run eight at once
+  (`stage-times.jsonl`). The 600-node expression lowers in 0.022 s, against 0.16 s in
+  Stage 3 and 0.18 s in Stage 1.
 - **The printer's model is `main`'s.** On each of the 55 captures, the printer through
   the core leaves the same model, objective and symbol map as `main`'s printer. It
   lowers 26 and refuses 29 (`**` on a linear expression), as `main`'s does. The core
@@ -1775,12 +1820,11 @@ and in `tests/test_cpsat_table_lowering.py`:
   test and one of the Stage 1 lists fail;
 - the synthetic examples keep their marks: the core changes no lowering.
 
-Built: torch-spyre/torch-spyre#6547 at c9e65b24, stacked on #6525: the two files give 79
-passed and 6 xfailed in 3.2 s, with no device.
+Built: torch-spyre/torch-spyre#6547 at cc1f82de, stacked on #6525: the two files give 80
+passed and 6 xfailed in 3.5 s, with no device.
 
-An earlier build of the dict alone, from before the caching stage, is kept in
-`~/gap-probe/torch-spyre-pr6501/stage3-numpy-deferred/`, and what it was measured to
-save against Stage 3's cache in `~/gap-probe/torch-spyre-pr6501/stage4-measure/`.
+An earlier build of the dict alone, from before Stage 3, is kept in
+`~/gap-probe/torch-spyre-pr6501/stage3-numpy-deferred/`.
 
 ### Stage 5: linear sums
 
