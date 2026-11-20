@@ -191,6 +191,33 @@ layers, each with its own tests.
     and 67 removed. At Stage 3, on 12 expressions at two caps, each of 232 nodes has the
     class, the children and the realization, or the refusal, that the factory gave it
     (`~/gap-probe/table-lowering-printer/2026-11-20/`).
+- **The Nodes are merged into the printer (2026-11-20).** From Stage 3 there are no
+  `Node` classes. The owner's words: "Lets merge the Nodes into the printer such that
+  they return realizations to their parents that can be converted to TableRealizations
+  if requested by their parents. The printer should be able to build the indexes
+  directly... Do this in current stage 3". This replaces the nodes that realize
+  themselves of the 2026-11-18 entry.
+  - A print method returns the node's realization to the node's parent. It prints the
+    node's operands first, which returns theirs, and asks an operand for its table when
+    it computes its own list from it: `AbstractRealization.table()`. In Stage 3 every
+    realization is a table and returns itself.
+  - The printer builds the positions: a symbol's column on an `InputIndex` of its
+    variable, and an operation's position from its inputs' positions, combined in the
+    order of its symbols.
+  - Printing realizes, so `lower` raises a refusal itself and returns the root's
+    realization. What the nodes guaranteed is kept: a node whose table would pass the
+    cap is refused before anything under it is printed or evaluated, and a value that is
+    not finite at the node that makes it. A refusal from the build, an entry past 2^50,
+    names no node.
+  - For the later stages: where this plan names a node class (`AddNode`, `MulNode`,
+    `ExtremeNode`, `RelayoutChargeNode`), it is the print method of that sympy class
+    (`_print_Add`, `_print_Mul`, `_print_Min` and `_print_Max`,
+    `_print_RelayoutCharge`), returning what the class was to realize. A node's two
+    reads, its `realization` and its `table`, are the returned realization and its
+    `table()`. Those stages' sections keep the node names until each is built.
+  - Measured on the 55 captures of the replay: each of the 104,234 nodes that fit the
+    cap has the list and the position the Nodes gave it, and each of the 770 refusals
+    names the same node for the same reason.
 - **Measurements are relative to the production path (2026-11-20).** The production path
   is the CP-SAT printer: it is what lowers a compile's objective. The table path on
   `main` lowers no real model, so it is not a baseline for a claim about speed. The
@@ -949,15 +976,15 @@ a realization or a position step changes nothing else:
   A *realization* is what a node is realized as, an `AbstractRealization`: a
   `TableRealization` (a float list on a position) and, from Stage 5, a
   `LinearRealization`. Values hold no model.
-- **Nodes.** `TableLowering` is a sympy `Printer` (in Stages 1 and 2, a factory with a
-  walk of its own). It prints each distinct sympy node as one `Node`, of the class the
-  node's sympy class calls for, made by that class's print method, and hands it what it
-  reads. An `InputNode` is handed its symbol's variable and values, and makes its own
-  position on the variable. Each node realizes itself the first time its realization is
-  read, and reads its children's realizations as it does.
-- **The build.** Each value builds its own CP-SAT side with `cp_expr(model)`: a step,
-  a position, a table, a node. There is no emitter. The objective is
-  `TableLowering(inputs, cap=cap).lower(expr).cp_expr(model)`.
+- **The printer.** `TableLowering` is a sympy `Printer` (in Stages 1 and 2, a factory
+  with a walk of its own, making nodes that realize themselves). Its print of a sympy
+  node is the node's realization: a print method, chosen by the node's sympy class,
+  prints the node's operands, asks each for its table when it computes its own list from
+  it, builds the node's position, and returns the realization to the node's parent. Each
+  distinct node is printed once.
+- **The build.** Each value builds its own CP-SAT side with `cp_expr(model)`: a step, a
+  position, a table. There is no emitter. The objective is `TableLowering(inputs,
+  cap=cap).lower(expr).cp_expr(model)`.
 
 This is how torch-spyre/torch-spyre#6475 is built. The design came out of review on that
 PR on 2026-11-18, and replaces the two passes, the visitor, the pass that marked linear
@@ -1019,7 +1046,7 @@ class Index(ABC):
 @dataclass(frozen=True)
 class InputIndex(Index):
     """A leaf, and the thinnest step: a variable's own position, v - lo, for a variable
-    whose values run from lo to lo + size - 1. An InputNode makes one on its
+    whose values run from lo to lo + size - 1. The printer makes one on a symbol's
     variable."""
 
     var: cp_model.IntVar
@@ -1047,13 +1074,19 @@ class CombineIndex(Index):
 
 
 class AbstractRealization(ABC):
-    """What a node is realized as: the one thing a reader and the objective take of
-    it. A value that builds its own CP-SAT side: a TableRealization, and from Stage 5
-    a LinearRealization, what a sum is realized as."""
+    """What a node is realized as: what the printer returns for it to its parent, and
+    what the objective takes of the root. A value that builds its own CP-SAT side: a
+    TableRealization, and from Stage 5 a LinearRealization, what a sum is realized
+    as."""
 
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The realization in model, in COST_SCALE units."""
+
+    @abstractmethod
+    def table(self) -> TableRealization:
+        """The realization as one table, for a parent that computes its own list from
+        it."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
@@ -1073,6 +1106,9 @@ class TableRealization(AbstractRealization):
         built; otherwise one add_element on its index's position. Raises
         TableLoweringError for an entry past 2^50."""
 
+    def table(self) -> TableRealization:
+        """Itself."""
+
 
 # Each symbol's input: the variable that picks its value, and the symbol's value at
 # each of that variable's values, from its lowest to its highest.
@@ -1080,87 +1116,42 @@ Input: TypeAlias = tuple[cp_model.IntVar, Sequence[float]]
 Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 
-# ----------------------------------------------------------------------------- nodes
-
-
-@dataclass(eq=False)
-class Node:
-    """The CP-SAT counterpart of one sympy node: an operation over free symbols,
-    realized as one table over its inputs. expr, children and cap are injected by
-    the printer; children are printed first, and a subexpression two parents share
-    is one node. Nothing here touches a model until cp_expr."""
-
-    expr: sympy.Basic
-    children: tuple[Node, ...]
-    cap: int
-
-    @cached_property
-    def columns(self) -> Mapping[sympy.Symbol, TableRealization]:
-        """Each free symbol's column, gathered from the children."""
-
-    @cached_property
-    def realization(self) -> AbstractRealization:
-        """realize(), the first time it is read, and kept."""
-
-    def realize(self) -> AbstractRealization:
-        """One table over its inputs, positions combined in symbol order, the last
-        fastest. Raises TableLoweringError naming the node past the cap (never
-        evaluated) and for a value that is not finite. Under the cap it reads its
-        children's realizations first, so each child refuses its own value that is
-        not finite."""
-
-    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """realization.cp_expr(model): reading the realization realizes the node, so
-        a refusal comes before anything is added to the model."""
-
-
-@dataclass(eq=False)
-class InputNode(Node):
-    """A symbol: input data. Its variable and its values are injected by the printer;
-    None raises "a symbol with no input", naming it, when a reader reads its columns.
-    It makes its own position, an InputIndex on its variable, and refuses values that
-    are not one per value of the variable."""
-
-    input: Input | None = None
-
-    def realize(self) -> TableRealization:
-        """Its column."""
-
-
-@dataclass(eq=False)
-class ConstantNode(Node):
-    """A node with no free symbol: its value on the UnitIndex position."""
-
-    def realize(self) -> TableRealization:
-        """Its value, one entry on UnitIndex."""
+# --------------------------------------------------------------------------- printer
 
 
 class TableLowering(Printer):
-    """A sympy Printer whose print of a node is its Node (from Stage 3). It holds the
-    inputs, the cap and the Nodes it has made, and no model."""
+    """A sympy Printer whose print of a node is the node's realization (from Stage
+    3). It holds the inputs, the cap and the realizations it has printed, and no
+    model."""
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
         """inputs gives each symbol's variable and values; cap bounds one table."""
 
-    def lower(self, root: sympy.Basic) -> Node:
-        """root's node, over the graph of nodes under it. Nothing is realized here."""
+    def lower(self, root: sympy.Basic) -> AbstractRealization:
+        """root's realization. Raises TableLoweringError naming the node that cannot
+        be lowered."""
 
-    def _print(self, expr: sympy.Basic, **kwargs: Any) -> Node:
-        """expr's Node, printed the first time it is met and kept: the Printer's
-        dispatch on expr's sympy class, with emptyPrinter as the fallback."""
+    def _print(self, expr: sympy.Basic, **kwargs: Any) -> AbstractRealization:
+        """expr's realization, printed the first time it is met and kept: the
+        Printer's dispatch on expr's sympy class, with emptyPrinter as the fallback."""
 
-    def _print_Symbol(self, expr: sympy.Basic) -> Node:
-        """An InputNode holding the symbol's input."""
+    def _print_Symbol(self, expr: sympy.Basic) -> TableRealization:
+        """The symbol's column on an InputIndex made here on its variable."""
 
-    def _print_Piecewise(self, expr: sympy.Basic) -> Node:
-        """A Node over its arms' values and conditions; no ExprCondPair gets one."""
+    def _print_Piecewise(self, expr: sympy.Basic) -> TableRealization:
+        """Over its arms' values and conditions; no ExprCondPair is printed."""
 
-    def _print_RelayoutCharge(self, expr: sympy.Basic) -> Node:
-        """A Node over its literal and its division; its prices are data."""
+    def emptyPrinter(self, expr: sympy.Basic) -> TableRealization:
+        """Any other class, over its arguments."""
 
-    def emptyPrinter(self, expr: sympy.Basic) -> Node:
-        """Any other class: a Node over its arguments. Whatever its class, a node
-        with no free symbol is a ConstantNode."""
+    def _operation(
+        self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
+    ) -> TableRealization:
+        """expr as one table: its value on UnitIndex when it has no free symbol,
+        otherwise one table over its inputs, positions combined in symbol order, the
+        last fastest. Refuses a table past the cap before printing an operand, then
+        prints the operands, reads each one's table at its own entries, and refuses a
+        value that is not finite."""
 
 
 # ------------------------------------------------------------------- from Stage 5 on
@@ -1177,13 +1168,12 @@ class LinearRealization(AbstractRealization):
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """Its rounded constant plus each term's cp_expr."""
 
+    def table(self) -> TableRealization:
+        """Its terms' tables added on one position over their inputs."""
 
-@dataclass(eq=False)
-class AddNode(Node):
-    """A sum: always realized as a LinearRealization."""
 
-    def realize(self) -> LinearRealization:
-        """LinearRealization of its children's realizations."""
+# TableLowering._print_Add(self, expr) -> LinearRealization: a sum is always realized
+# as a LinearRealization of its operands' realizations.
 
 
 # ------------------------------------------------------------------ from Stage 13 on
@@ -1214,40 +1204,42 @@ sketch passes mypy 2.1.0 with torch-spyre's settings and `empty-body` disabled.
 
 **The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. `lower` prints
 the root: `_print` dispatches on the node's sympy class, the nearest class along its MRO
-that has a print method, and falls back to `emptyPrinter`. A print method prints the
-node's children first and makes the node's `Node` over theirs. `_print` keeps each
-`Node` by its sympy node, so a subexpression two terms share is printed once, one node
-that both parents hold:
-- `_print_Symbol` makes an `InputNode`, handed its variable and its values from the
-  inputs. It makes its own position, an `InputIndex` on the variable.
-- A node with no free symbol becomes a `ConstantNode`, whatever its class: a number,
+that has a print method, and falls back to `emptyPrinter`. A print method returns the
+node's realization. `_print` keeps each realization by its sympy node, so a
+subexpression two terms share is printed once, and both parents read one realization:
+- `_print_Symbol` returns the symbol's column: its values on an `InputIndex` the printer
+  makes on the symbol's variable.
+- A node with no free symbol is its value on `UnitIndex`, whatever its class: a number,
   `true`/`false`, or an operation on numbers such as `sqrt(2)`.
-- `emptyPrinter` makes a `Node` for any other class. From Stage 5, `_print_Add` makes an
-  `AddNode`, and each later operation gets its print method the same way.
+- `emptyPrinter` returns one table over the node's inputs for any other class
+  (`_operation`). From Stage 5, `_print_Add` returns a `LinearRealization`, and each
+  later operation gets its print method the same way.
 
-`lower` returns the root's node and realizes nothing. The 50 replayed objectives hold
-110 to 11,020 distinct nodes each, in a traversal of 589 to 71,914. In Stages 1 and 2
-`TableLowering` is a factory with a walk of its own, `rewrite`, over
-`sympy.postorder_traversal`; Stage 3 makes it the printer (Decisions).
+The 50 replayed objectives hold 110 to 11,020 distinct nodes each, in a traversal of 589
+to 71,914. In Stages 1 and 2 `TableLowering` is a factory with a walk of its own,
+`rewrite`, over `sympy.postorder_traversal`, making nodes that realize themselves when
+read; Stage 3 makes it the printer (Decisions).
 
-**Realized when read.** A node computes `columns` (its inputs' columns, gathered from
-its children) and `realization` (`realize()`) the first time each is read, and keeps
-them. A node nobody reads is never realized, and `lower` reads none. Realizing a node
-reads its children's realizations first, so reading the root realizes every node under
-it, each once, as deep as the expression (6 to 17 on the replay). Each node checks its
-own list as it is realized, which is how a value that is not finite is refused at the
-node that makes it (Decisions). In Stage 1 that lambdifies every node over its inputs,
-as the visitor of the earlier plan did. From Stage 3 a node's list is its own operation
-on its children's lists, its class lambdified over placeholders when the node is
-realized, and Stage 4 replaces most of those functions with numpy steps. A node past the
-cap raises before it reads a child, so nothing under it is evaluated.
+**Realized when printed.** Printing a node realizes it. `_operation` first finds the
+node's position: its inputs' positions, each symbol's column printed, combined in the
+order of its symbols. A table that would pass the cap is refused there, before any
+operand is printed, so nothing under it is evaluated, and the refusal names the highest
+node past the cap: the root, when the root is. Under the cap the operands are printed
+first, each checking its own list, which is how a value that is not finite is refused at
+the node that makes it (Decisions). Then the node's list is its own operation on its
+operands' tables, each read at the node's entries, its class lambdified over
+placeholders, and Stage 4 replaces most of those functions with numpy steps. A parent
+asks an operand's realization for its `table()`: in Stage 3 every realization is a
+table, and from Stage 5 one that is not converts itself. Printing recurses as deep as
+the expression (6 to 17 on the replay). In Stage 1 a node lambdified its whole
+expression over its inputs, when its realization was first read.
 
 On the product of the step-by-step graph, `9 * split_a ** -2 * split_b ** 0.5`, Stage 1
 realizes the root as one table of 6 entries on `2*division_a + division_b` and builds it
 as one `add_element`. Its three children and the four nodes under them are realized too,
 each checking its own list, and the two powers are lambdified. Only the root is built,
 so they add nothing to the model. The inputs are each symbol's variable and its values,
-and the input nodes make the positions:
+and the printer makes the positions:
 
 ```python
 model = cp_model.CpModel()
@@ -1259,38 +1251,37 @@ root = TableLowering(inputs, cap=8192).lower(9 * split_a ** -2 * split_b ** 0.5)
 model.minimize(root.cp_expr(model))   # 3 variables, 1 constraint
 ```
 
-**Children.** A node's children are the nodes its print method prints: its arguments,
-with two exceptions:
-- A Piecewise's children are its arms' values and conditions (`_print_Piecewise`); an
-  arm's `ExprCondPair` gets no node.
-- A `RelayoutCharge`'s children are its literal and its division
-  (`_print_RelayoutCharge`). Its prices are data its node reads from `expr`.
+**Operands.** A node's operands are what its print method prints: its arguments, with
+one exception. A Piecewise's operands are its arms' values and conditions
+(`_print_Piecewise`); an arm's `ExprCondPair` is not printed. A `RelayoutCharge` needs
+no method of its own: its prices are printed as the constants they are. A Mul also reads
+the base of a factor with a negative rational exponent, in that factor's place (Stage
+3).
 
-**Refusals.** A node raises `TableLoweringError`, naming itself, when a reader reads it
-and it has no realization:
-- a symbol with no input, raised by name when a parent reads its columns;
-- an input the symbol's node cannot make a position on, raised the same way: a variable
-  that is not an `IntVar` (a negated literal), a variable whose domain has gaps (until
-  `LocateIndex` in Stage 13), or values that are not one number per value of the
-  variable;
+**Refusals.** The printer raises `TableLoweringError`, naming the node, when a node has
+no realization:
+- a symbol with no input;
+- an input the printer cannot make a position on: a variable that is not an `IntVar` (a
+  negated literal), a variable whose domain has gaps (until `LocateIndex` in Stage 13),
+  or values that are not one number per value of the variable;
 - one table past the cap, which is never evaluated;
-- a value that is not finite (`Node._finite`, wherever a table is realized), at the node
-  that makes it, since a node reads its children before it makes its own table;
+- a value that is not finite (`TableLowering._finite`, wherever a table is made), at the
+  node that makes it, since a node's operands are printed before its own table is made;
 - a function with no numeric value, and anything else evaluating a node raises;
-- an entry past 2^50, found when the table is built; `Node.cp_expr` names the node.
+- an entry past 2^50, found when the table is built: this one comes from the
+  realization's `cp_expr` and names no node.
 
 Every refusal is a `TableLoweringError`, so none can reach an `except` around the
 objective as a `RuntimeError`, `TypeError` or `ValueError`.
 
-The read comes before anything is added to the model for the node. In Stage 1 the
-root's read comes before any write, so a refusal leaves the model as it was. From Stage
+`lower` touches no model, so a refusal from it leaves the model as it was. From Stage
 4, when one sum's terms are built in turn, a later term can refuse after an earlier one
 was built, and the entry point's copy and swap back (Decisions) restores the model.
 
 **The build.** `Index.cp_expr` builds a position, each step building its parts first,
 `TableRealization.cp_expr` a table (rounded once; a number, adding nothing, when
-constant; otherwise one `add_element` on its position) and `Node.cp_expr` a node's
-realization. Only `cp_expr` methods touch the model. In Stage 1 each call builds anew,
+constant; otherwise one `add_element` on its position). Only `cp_expr` methods touch
+the model. In Stage 1 each call builds anew,
 and a part reached twice is built twice: enough while only the root is built and no step
 writes the model. Stage 5 builds a node once and Stage 6 a position once, through one
 memo per build.
@@ -1325,7 +1316,7 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 
 | Stage | Hook |
 |---|---|
-| 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified over placeholders when the node is realized, applied to its operands' lists; `TableLowering` as a sympy `Printer`, with a print method for each node class a stage adds |
+| 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified over placeholders when the node is realized, applied to its operands' lists; `TableLowering` as a sympy `Printer` whose print methods return realizations, with a print method for each operation a stage adds; `AbstractRealization.table()`, a realization as one table for a parent that asks |
 | 4 | a node's numpy step in place of its lambdified function |
 | 5 | `LinearRealization` and `AddNode`, with a sum always realized as a `LinearRealization`; `MulNode` for a constant times one child. A second read, a node's `table`, for a parent that needs a child's list when the child's realization is linear (a power, a log, a Piecewise). The build memo: one per build, passed with the model, so a node with several readers is built once |
 | 6 | the switch realization; the `CompactIndex` step; positions built once through the build memo, keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
@@ -1349,7 +1340,7 @@ at split 2, against 1448 + 1663 = 3111), or kept apart.
 |---|---|
 | 1 | the values (`Index` with its steps `InputIndex`, `UnitIndex`, `CombineIndex`; `AbstractRealization`, `TableRealization`), each with `cp_expr`; `values_on_grid` by lambdify; `Node`, `InputNode`, `ConstantNode`; `TableLowering`, the factory; `TableLoweringError` |
 | 2 | nothing in the module: synthetic examples of Stages 5 to 11 as strict xfails, and a trivial one that lowers; Stage 1's tests moved to `tests/` and skipped without ortools |
-| 3 | `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' lists (`Node.operands`), a Mul dividing by the base of a factor with a negative rational exponent; `values_on_grid` goes; `TableLowering` becomes a sympy `Printer` (`_print`, `_print_Symbol`, `_print_Piecewise`, `_print_RelayoutCharge`, `emptyPrinter`), and `rewrite` and `children_of` go |
+| 3 | `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' lists, a Mul dividing by the base of a factor with a negative rational exponent; `values_on_grid` goes; `TableLowering` becomes a sympy `Printer` (`_print`, `_print_Symbol`, `_print_Piecewise`, `emptyPrinter`, `_operation`) that returns realizations and builds the positions; `AbstractRealization.table()`; `Node`, `InputNode`, `ConstantNode`, `rewrite` and `children_of` go |
 | 4 | the dict of numpy steps, applied in place of a node's lambdified function |
 | 5 | `LinearRealization`, `AddNode` and `MulNode` for a constant factor, made by `_print_Add` and `_print_Mul`, a node's `table` read, building once what several readers share, and the affine case of `TableRealization.cp_expr` |
 | 6 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the choice between ways (rule 3); entry counts on steps and tables |
@@ -1646,13 +1637,15 @@ same tables, the same model.
   rounded once where it enters CP-SAT, and is not held to Stage 1's bits or the
   annealer's (Decisions). A node sums its operands in their own order and reads a
   constant as the double it is.
-- **`TableLowering` is a sympy `Printer`.** The factory's walk and its tests of a node's
-  class become the Printer's: `_print` keeps each `Node` by its sympy node,
-  `_print_Symbol` makes the `InputNode`, `_print_Piecewise` and `_print_RelayoutCharge`
-  pick their node's children, and `emptyPrinter` makes a `Node` for any other class.
-  `rewrite` and `children_of` go, and `Node.operands` reads a Piecewise's parts from its
-  children. A print method only makes a `Node`: the nodes, realizations and positions
-  are unchanged (Architecture, Decisions).
+- **`TableLowering` is a sympy `Printer` that returns realizations.** The factory's walk
+  and its tests of a node's class become the Printer's, and the nodes are merged into it
+  (Decisions): a print method returns the node's realization to the node's parent, and
+  `AbstractRealization.table()` gives a parent the table it computes its own list from.
+  `_print` keeps each realization by its sympy node, `_print_Symbol` returns the
+  symbol's column on an `InputIndex` the printer makes, and `_print_Piecewise` and
+  `emptyPrinter` return one table over the node's inputs (`_operation`). `Node`,
+  `InputNode`, `ConstantNode`, `rewrite` and `children_of` go. The lists, the positions
+  and the refusals are unchanged (Architecture).
 - **Each operand read at the node's entries.** An operand on the node's own position is
   read as it is. One on fewer positions is read at its own position: `Index.on_grid`
   computes, from each input position's coordinate at every entry of the node's table,
@@ -1700,10 +1693,15 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
 - a node lambdifies once and nothing is kept: 40 terms of one shape make 397 nodes, each
   lambdified once, among them at most 12 distinct functions; a second lowering
   lambdifies as many again; the root's list is Stage 1's;
-- the printer: a `Dummy`, a subclass of `Symbol`, is an `InputNode`; a class with no
-  print method goes to `emptyPrinter`; a RelayoutCharge's prices are not children; what
-  two calls of `lower` share is one node; the tests that called `rewrite` reach the
-  nodes under a root through its children;
+- the printer: a `Dummy`, a subclass of `Symbol`, is printed as its column; a class with
+  no print method goes to `emptyPrinter`; what two calls of `lower` share is one
+  realization; operands are printed before their parents and a shared subexpression is
+  evaluated once; a Piecewise arm is not printed;
+- positions: a symbol's is made on its variable, and an operation's combines its inputs'
+  in symbol order, however the expression is written;
+- refusals: a table at the cap is made and one past it is refused before anything is
+  evaluated, naming the root; `lower` touches no model; an entry past 2^50 is refused by
+  the build, naming no node;
 - names kept: a Min of 35 operands is lambdified with its parameters named `operand0` to
   `operand34`, nothing renamed; over `Dummy` placeholders the test fails, in 10 s;
 - a constant read as the double it is: `ceiling(Float(2)/3 * c)` is 1, 2, 4, 5, 6 at c =
@@ -1723,8 +1721,8 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
 - the synthetic examples keep their marks, each with a reason that gives its failure:
   this stage changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at d579576e, with `main` merged in: the file gives
-49 passed and 6 xfailed in 3.5 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at f1f371b8, with `main` merged in: the file gives
+49 passed and 6 xfailed in 3.8 s, with no device.
 
 ### Stage 4: numpy steps from a dict
 
