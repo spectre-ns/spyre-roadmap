@@ -191,6 +191,16 @@ layers, each with its own tests.
     and 67 removed. At Stage 3, on 12 expressions at two caps, each of 232 nodes has the
     class, the children and the realization, or the refusal, that the factory gave it
     (`~/gap-probe/table-lowering-printer/2026-11-20/`).
+- **Measurements are relative to the production path (2026-11-20).** The production path
+  is the CP-SAT printer: it is what lowers a compile's objective. The table path on
+  `main` lowers no real model, so it is not a baseline for a claim about speed. The
+  owner's words: "Make your measurements relative to the production path. Table path on
+  main doesn't lower real models yet." A stage that touches the printer reports the
+  printer's time and model on the captures, on `main` and after. A stage that only
+  changes the table path says it changes no production time, and reports the table
+  path's own times as that, between stages, on the nodes that fit the cap. The table
+  path is first measured against the printer where it lowers whole objectives, at Stage
+  13's replay.
 - **No cache that outlives a lowering (2026-11-20).** Stage 3 as first built kept each
   lambdified function in a module-level `lru_cache`, one per class and form of operands.
   The review of torch-spyre/torch-spyre#6525 asked for no cache that hangs around, and
@@ -1668,13 +1678,19 @@ Lowering a 600-node expression with a root table of 8,192 entries takes 0.18 s i
 1 and 0.16 s here: no operation runs twice, but each node still pays for a lambdify of
 its own. Every entry of its root is Stage 1's to 4e-15.
 
-Remeasured on the 55 captures of the replay, 2026-11-20
-(`~/gap-probe/table-lowering-numpy-core/2026-11-20/stage-times.jsonl`): they hold
-105,004 operation nodes, of which 104,234 have a table under the cap and 770 are
-refused, the same ones in every build. Realizing all of them takes 86 s in Stage 1 and
-61 s here, summed over the captures, run eight at once. On 7 of the 55 Stage 3 is the
-slower, by up to 1.7 times: building the function of a Min or Max of 35 operands takes
-0.27 s, and every such node pays it. Stage 4 lambdifies none of these nodes.
+Against the production path (Decisions): a compile lowers its objective with the
+printer, which this stage does not touch, and no compile runs the table module, so Stage
+3 changes no production time. The table path lowers none of the 55 captures of the
+replay at this stage, as in Stage 1: each is refused at its root, one table past the
+cap.
+
+Inside the table path, remeasured on those captures, 2026-11-20
+(`~/gap-probe/table-lowering-numpy-core/2026-11-20/stage-times-separate.jsonl`): they
+hold 105,004 operation nodes, of which 104,234 have a table under the cap and 770 are
+refused, the same ones in every build. Realizing all of them takes 93 s in Stage 1 and
+70 s here, summed over the captures, each build in its own process. Stage 3 is not the
+faster on every capture: building the function of a Min or Max of 35 operands takes 0.27
+s, and every such node pays it. Stage 4 lambdifies none of these nodes.
 
 Tests, in `tests/test_cpsat_table_lowering.py`:
 
