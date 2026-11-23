@@ -229,9 +229,9 @@ layers, each with its own tests.
     order of its symbols.
   - Printing realizes, so `print` raises a refusal itself and returns the node's
     realization. What the nodes guaranteed is kept: a node whose table would pass the
-    cap is refused before anything under it is printed or evaluated, and a value that is
-    not finite at the node that makes it. A refusal from the build, an entry past 2^50,
-    names no node.
+    cap is refused once its symbols' columns are read, before any operand is printed,
+    so nothing under it is evaluated, and a value that is not finite at the node that
+    makes it. A refusal from the build, an entry past 2^50, names no node.
   - For the later stages: where this plan names a node class (`AddNode`, `MulNode`,
     `ExtremeNode`, `RelayoutChargeNode`), it is the print method of that sympy class
     (`_print_Add`, `_print_Mul`, `_print_Min` and `_print_Max`,
@@ -281,7 +281,7 @@ layers, each with its own tests.
   floating point math until we move into CP-SAT to contain the span." So a list may
   differ from Stage 1's whole-expression lambdify in its last bits, and by one step
   where a `floor` or `ceiling` argument lands on an integer: a node sums its operands in
-  their own order, and reads a constant as the double it is, where lambdify prints a
+  their own order, and reads a number as the double it is, where lambdify prints a
   Float to 15 digits (its `ceiling(2/3 * c)` is one high at c = 3, 6 and 9). On the 55
   captures of the replay, 22,167 of 104,234 lists differ from Stage 1's in their last
   bits and no entry differs after the rounding.
@@ -1225,11 +1225,12 @@ class TableLowering(Printer):
     def _operation(
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
     ) -> TableRealization:
-        """expr as one table: its value on UnitIndex when it has no free symbol,
-        otherwise one table over its inputs, positions combined in symbol order, the
-        last fastest. Refuses a table past the cap before printing an operand, then
-        prints the operands, reads each one's table at its own entries, and refuses a
-        value that is not finite."""
+        """expr as one table over its inputs, positions combined in symbol order, the
+        last fastest: a number, true or false is its value on UnitIndex, and an
+        operation on numbers is one entry there, computed as any other operation.
+        Refuses a table past the cap before printing an operand, then prints the
+        operands, reads each one's table at its own entries, and refuses a value that
+        is not finite."""
 
     def _finite(self, expr: sympy.Basic, table: TableRealization) -> TableRealization:
         """table, refused naming expr when a value of it is not finite."""
@@ -1294,8 +1295,9 @@ operands with `print`. `print` keeps each realization by its sympy node, so a
 subexpression two terms share is printed once, and both parents read one realization:
 - `_print_Symbol` returns the symbol's column: its values on an `InputIndex` the printer
   makes on the symbol's variable.
-- A node with no free symbol is its value on `UnitIndex`, whatever its class: a number,
-  `true`/`false`, or an operation on numbers such as `sqrt(2)`.
+- A node with no operand, a number or `true`/`false`, is its value on `UnitIndex`. An
+  operation on numbers, such as `sqrt(2)`, is one entry on `UnitIndex` too, computed by
+  its function as any other operation is, so the two sides of a tie are computed alike.
 - `emptyPrinter` returns one table over the node's inputs for any other class
   (`_operation`). From Stage 5, `_print_Add` returns a `LinearRealization`, and each
   later operation gets its print method the same way.
@@ -1728,7 +1730,12 @@ printer (Decisions), so neither a cache nor a `Node` is in what is written.
 - **Floating point until CP-SAT.** A list is the expression's value in floating point,
   rounded once where it enters CP-SAT, and is not held to Stage 1's bits or the
   annealer's (Decisions). A node sums its operands in their own order and reads a
-  constant as the double it is.
+  number as the double it is.
+- **Operations on numbers.** Only a number itself is read as its double. An operation
+  on numbers, such as `sqrt(2)` or `3*sqrt(2)`, is one entry on `UnitIndex`, computed
+  by its function as any other operation is, so the two sides of a tie are computed
+  alike. Stage 1's `ConstantNode` read sympy's `float(expr)`: `float(sqrt(19))` is the
+  double below numpy's `sqrt(19)`, which makes `sqrt(a) > sqrt(19)` true at a = 19.
 - **`TableLowering` is a sympy `Printer` that returns realizations.** The factory's walk
   and its tests of a node's class become the Printer's, and the nodes are merged into it
   (Decisions): a print method returns the node's realization to the node's parent, and
@@ -1736,10 +1743,12 @@ printer (Decisions), so neither a cache nor a `Node` is in what is written.
   `print`, its public method and the entry point, keeps each realization by its sympy
   node. `_print_Symbol` returns the symbol's column on an `InputIndex` the printer
   makes, and `_print_Piecewise` and `emptyPrinter` return one table over the node's
-  inputs (`_operation`). A table past the cap is refused before an operand is printed,
-  and a value that is not finite at the node that makes it (`_finite`). `Node`,
-  `InputNode`, `ConstantNode`, `rewrite`, `children_of` and `lower` go. The lists, the
-  positions and the refusals are the ones the nodes gave (Architecture).
+  inputs (`_operation`). A table past the cap is refused once its symbols' columns are
+  read, before an operand is printed, and a value that is not finite at the node that
+  makes it (`_finite`). `Node`, `InputNode`, `ConstantNode`, `rewrite`, `children_of`
+  and `lower` go. The lists, the positions and the refusals are the ones the nodes gave
+  (Architecture), except an operation on numbers (above); none of the 55 captures of
+  the replay holds one.
 - **Each operand read at the node's entries.** An operand on the node's own position is
   read as it is. One on fewer positions is read at its own position: `Index.on_grid`
   computes, from each input position's coordinate at every entry of the node's table,
@@ -1776,8 +1785,8 @@ Inside the table path, remeasured on those captures, 2026-11-20
 hold 105,004 operation nodes, of which 104,234 have a table under the cap and 770 are
 refused, the same ones in every build. Realizing all of them takes 93 s in Stage 1 and
 70 s here, summed over the captures, each build in its own process. Stage 3 is not the
-faster on every capture: building the function of a Min or Max of 35 operands takes 0.27
-s, and every such node pays it. Stage 4 lambdifies none of these nodes.
+faster on every capture: building the function of a Min or Max of 35 operands takes
+about 0.28 s, and every such node pays it. Stage 4 lambdifies none of these nodes.
 
 Tests, in `tests/test_cpsat_table_lowering.py`:
 
@@ -1785,9 +1794,10 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
   each term read at its own position; two symbols of one position together; a constant
   operand at every entry;
 - a node is lambdified once and nothing keeps its function: 40 terms of one shape make
-  397 nodes, each lambdified once as it is printed, among them at most 12 distinct
-  functions; printing the root again and building it lambdify nothing; a second printer
-  lambdifies as many again; the root's list is Stage 1's;
+  522 nodes, 397 of them operations, each operation lambdified once as it is printed,
+  among them at most 12 distinct functions; printing the root again and building it
+  lambdify nothing; a second printer lambdifies as many again; the root's list is
+  Stage 1's;
 - the printer: it is a sympy `Printer` with `print` and no `lower`; a `Dummy`, a
   subclass of `Symbol`, is printed as its column; a class with no print method goes to
   `emptyPrinter`; what two calls of `print` share is one realization; operands are
@@ -1806,6 +1816,10 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
 - a constant read as the double it is: `ceiling(Float(2)/3 * c)` is 1, 2, 4, 5, 6 at c =
   1, 3, 6, 7, 9, and exact through CP-SAT, where lambdify's 15-digit constant gives 3,
   5, 7 at 3, 6, 9;
+- an operation on numbers computed as any other: `ceiling(sqrt(2)*a - 3*sqrt(2))` is
+  -2, -1, 0 at a = 1, 2, 3, and `sqrt(a) > sqrt(19)` is false at a = 19, both exact
+  through CP-SAT, where sympy's `float(3*sqrt(2))` and `float(sqrt(19))`, each the
+  double below numpy's, make the first one high at a = 3 and the second true at a = 19;
 - a quotient divided: `floor(x/y) + floor(x/y**2)` is exact at (98, 49), (98, 7) and
   (49, 7), where a reciprocal floors one low;
 - every node's list is Stage 1's, its whole expression lambdified over its inputs, to
@@ -1820,8 +1834,9 @@ Tests, in `tests/test_cpsat_table_lowering.py`:
 - the synthetic examples keep their marks, each with a reason that gives its failure:
   this stage changes no lowering.
 
-Built: torch-spyre/torch-spyre#6525 at e932aaaf, with `main` merged in: the file gives
-50 passed and 6 xfailed in 3.6 s, with no device.
+Built: torch-spyre/torch-spyre#6525 at 1ce25253, squashed onto torch-spyre `main`
+4787c100 with the operations on numbers added: the file gives 51 passed and 6 xfailed
+in 1.9 s, with no device.
 
 ### Stage 4: a numpy core, shared with the printer
 
