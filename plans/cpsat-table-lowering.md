@@ -1973,9 +1973,11 @@ and in `tests/test_cpsat_table_lowering.py`:
   test and one of the Stage 1 lists fail;
 - the synthetic examples keep their marks: the core changes no lowering.
 
-Built: torch-spyre/torch-spyre#6547 at 42570c32, stacked on #6525 and merged with its
-printer that returns realizations: the two files give 86 passed and 6 xfailed in 4.3 s,
-with no device.
+Built: torch-spyre/torch-spyre#6547 at 716a24be, one commit on #6525's 1ce25253:
+42570c32 and the commits before it, replayed onto Stage 3 as squashed. An operation on
+numbers goes through the core's function of its class like any other node. The two
+files give 87 passed and 6 xfailed in 1.6 s, with no device, one more than at 42570c32
+for Stage 3's test of an operation on numbers.
 
 An earlier build of the dict alone, from before Stage 3, is kept in
 `~/gap-probe/torch-spyre-pr6501/stage3-numpy-deferred/`.
