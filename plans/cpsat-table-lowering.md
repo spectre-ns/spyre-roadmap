@@ -2080,8 +2080,12 @@ Tests:
 - the `linear_sum` example loses its mark: four tables of 10 entries, where one table
   needs 10^4. The other five keep theirs.
 
-Built: torch-spyre/torch-spyre#6561 at d68efa6c, stacked on #6547: the two files give 94
-passed and 5 xfailed in 3.6 s, with no device.
+Built: torch-spyre/torch-spyre#6561 at 6a4680fe, stacked on #6547: d68efa6c replayed
+onto Stage 4 after Stage 3 was squashed. Where Stage 3's operations on numbers meet this
+stage's helpers, `_operation` takes `_inputs(expr) or [UNIT]`, and `_on` reads a
+constant as a broadcast of its one entry. The two files give 95 passed and 5 xfailed in
+2.0 s, with no device, one more than at d68efa6c for Stage 3's test of an operation on
+numbers.
 
 ### Stage 6: rule 4, the switch
 
@@ -2548,7 +2552,7 @@ Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
 (2026-11-19), 33 device-free tests. Stage 2 is merged: torch-spyre/torch-spyre#6501,
 2850616b (2026-11-20), synthetic examples of the later optimizations as strict xfails,
 with the two changes the review of Stage 1 asked for its tests. Stages 3, 4 and 5 are
-built, each an open draft on the one before: torch-spyre/torch-spyre#6525 at e932aaaf,
-the printer that returns realizations, torch-spyre/torch-spyre#6547 at 42570c32, the
-numpy core, and torch-spyre/torch-spyre#6561 at d68efa6c, linear sums. Stage 6, the
-switch, is next.
+built and open, each on the one before: torch-spyre/torch-spyre#6525 at 1ce25253, the
+printer that returns realizations, ready for review; torch-spyre/torch-spyre#6547 at
+716a24be, the numpy core, and torch-spyre/torch-spyre#6561 at 6a4680fe, linear sums,
+both drafts. Stage 6, the switch, is next.
