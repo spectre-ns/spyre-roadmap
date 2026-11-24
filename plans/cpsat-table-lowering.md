@@ -137,7 +137,9 @@ layers, each with its own tests.
   children's realizations as it is realized. So every node under the root is realized
   and checks its own list, whether or not the root's value depends on it: an arm that is
   not taken raises in Stage 1 too. The owner's words (2026-11-19): "The non-finite
-  should just be a check in the child node".
+  should just be a check in the child node". From 2026-11-24 the check is in the
+  realization, as it is made, and the printer names the node (Stage 5 as reviewed,
+  below).
 - **Behaviour, not code.** The stages below say what each layer does. The prototype is
   cited for its results only.
 - **Free to deviate.** The forms need not be the prototype's. Every roll-up is built
@@ -346,17 +348,19 @@ layers, each with its own tests.
   since they are CP-SAT expressions. The owner gave the first seven names and asked for
   the rest to follow, then said "I think that is cleaner naming." #32 is renamed
   (8367e1a1). The classes of later stages follow the same pattern in this plan, though
-  the owner has not named them one by one: `LinearRealization`, `CompactIndex`,
-  `ExtremeIndex` and `LocateIndex`. From Stage 3 no class ends in `Node`: `Node`,
-  `InputNode` and `ConstantNode` are gone, and what this plan named `AddNode`, `MulNode`
-  and `ExtremeNode` for later stages are print methods (above).
+  the owner has not named them one by one: `CompactIndex`, `ExtremeIndex` and
+  `LocateIndex`. The sum's realization, planned as `LinearRealization`, is
+  `SumRealization`, a `SymbolicRealization` (2026-11-23, Stage 5 as reviewed, below).
+  From Stage 3 no class ends in `Node`: `Node`, `InputNode` and `ConstantNode` are
+  gone, and what this plan named `AddNode`, `MulNode` and `ExtremeNode` for later
+  stages are print methods (above).
 - **The switch and the gate right after the linear sums (2026-11-18).** The order is 1
   base, 2 the synthetic examples (from 2026-11-19), 3 the printer that returns
   realizations (planned as caching, 2026-11-19), 4 the numpy core, 5 linear sums, 6 the
   switch, 7 the gate, 8 ranks and pairs, 9 rungs, 10 the fold, 11 `lin_max`. Before
   2026-11-18 ranks, rungs, the fold and `lin_max` came before the switch and the gate.
   - The switch needs only Stage 5: its rest is a realization Stage 5 makes, a table or a
-    `LinearRealization`. It brings `CompactIndex` and the choice between ways by entries
+    `SumRealization`. It brings `CompactIndex` and the choice between ways by entries
     (rule 3), which Stage 8 extends.
   - It serves both kinds of term: it takes the literals out of the narrow terms' tables
     and splits the wide products. On the step-by-step graph's product it is 38 entries
@@ -417,6 +421,68 @@ layers, each with its own tests.
   out: a `ValueError` out of numpy, or Stage 4's `NotImplementedError`, which is a
   `RuntimeError`, cannot reach that `except` and become the traffic solve. On the 50
   replayed models the copy takes 0.2 to 9 ms.
+- **Stage 5 as reviewed (2026-11-23 and 2026-11-24).** torch-spyre/torch-spyre#6561,
+  one commit, 40cb2a09, on torch-spyre `main` 22259576 after #6547 merged. What changed
+  in its review, and what each change means for the later stages:
+  - **A sum is a `SumRealization`, the first `SymbolicRealization`.** The owner chose
+    "Both in #6561": `LinearRealization` is renamed `SumRealization` and derives from
+    `SymbolicRealization`, a realization with no list of its own, which CP-SAT builds
+    from its operands' expressions. `TableRealization` is its sibling.
+    `AbstractRealization.symbolic()`, a method at the owner's word, tells the two apart,
+    and `_print_Add` asks it in place of an `isinstance`. For the later stages: the
+    switch (Stage 6), the gate (Stage 7) and a Min/Max kept linear (Stage 11) are
+    `SymbolicRealization`s. What they share, a `table(cap)` from the operands' tables
+    and the input positions, moves onto `SymbolicRealization` when `_operation` becomes
+    a function of its operands' realizations.
+  - **A nested sum is not flattened.** The owner: "Drop the flattening. Yes".
+    `SumRealization.terms` are any realizations, and a sum that is an operand of
+    another is one term of it. sympy flattens sums and distributes a number over one,
+    so a sum is an operand of another only under a constant that is not a number, as in
+    `sqrt(2) * (a + b)`. None of the 13,842 sums of the 55 captures has one. For the
+    later stages: a switch, a gate or a Min/Max kept linear is one term of a sum, as it
+    is.
+  - **The printer makes every realization.** `LinearRealization.of` is gone:
+    `_print_Add` makes the sum's realization, at the owner's word that making it
+    belongs in `TableLowering`. A realization holds only what it does with itself:
+    `symbolic`, `cp_expr`, `table` and `scaled`.
+  - **A print method declines with `None`, in sympy's convention.** The owner: "Use the
+    sympy convention". `TableLowering` overrides sympy's `Printer._print` with its memo
+    by node. A print method returns `None` for a node that is not its case:
+    `_print_Add` a sum with no symbol, `_print_Mul` any product but a constant times one
+    operand, `emptyPrinter` every class with no print method. `_print` then makes the
+    node one table (`_operation`). The print methods reach their operands through
+    `self._print`, and `print`, the entry point, turns a `RecursionError` into a
+    refusal. The owner rejected a decorator for the memo and the fallback. For the
+    later stages: each new print method (the switch's `_print_Mul`, `_print_Min`,
+    `_print_Max`, `_print_RelayoutCharge`) returns `None` where its way does not apply,
+    and the fallback to one table stays in one place.
+  - **A value that is not finite is refused as a realization is made.** The owner:
+    "Let's get rid of finite. We don't allow any non numerical float values so we can
+    catch this in realization directly". A `TableRealization` with an inf or a NaN, and
+    a `SumRealization` whose constant is one, raise `TableLoweringError` naming no node
+    as they are made. `_print` names the node it was printing, and `_table` the operand
+    whose table it asked for. The `finite` property and `TableLowering._finite` are
+    gone. numpy's `errstate` was weighed: in raise mode it catches overflow, division by
+    zero and invalid results in numpy arithmetic, but not an inf in an input's values,
+    `float(sympy.oo)`, Python float arithmetic, or arithmetic on an inf already there.
+    For the later stages: a realization made only from realizations holds finite
+    numbers already; one that computes numbers of its own (a ladder, a bound, a rank's
+    values) checks them as it is made, naming no node.
+  - **Double precision is enough.** The owner: "The precision down to double is fine."
+    `_print_Mul` multiplies by a constant divisor's reciprocal, so `floor(log(x, 2))`
+    is one low at x = 8, where `_operation`, which divides, is not. A difference of one
+    ulp from the order of evaluation is accepted, not a defect. None of the 25,291
+    distinct products of the 55 captures has a constant factor that is not a number.
+  - **The constant factor stays in Stage 5.** The owner asked to pull `_print_Mul` and
+    `scaled` out ("I don't think this is central to sum realizations"), then had them
+    put back. Without them, a term of a sum that is not a list comes only from a sum
+    built unevaluated.
+  - **Lean docstrings and comments.** The owner: "We should be lean on comments. The
+    code should be expressive." A docstring is a line or two of what the definition is
+    for, plus what the code cannot show: a reason, a constraint from elsewhere, a case
+    that is not obvious. #6561 trimmed its own definitions (the module from 107 to 56
+    docstring lines, the tests from 63 to 29); definitions it does not otherwise change
+    keep theirs. Every later stage writes its docstrings this way.
 
 ## Estimates
 
@@ -1054,7 +1120,8 @@ a realization or a position step changes nothing else:
   `UnitIndex`, `CombineIndex`; later `CompactIndex`, `ExtremeIndex` and `LocateIndex`).
   A *realization* is what a node is realized as, an `AbstractRealization`: a
   `TableRealization` (a float list on a position) and, from Stage 5, a
-  `LinearRealization`. Values hold no model.
+  `SymbolicRealization`, which CP-SAT builds from its operands' expressions: first a
+  sum's `SumRealization`. Values hold no model.
 - **The printer.** `TableLowering` is a sympy `Printer` (in Stages 1 and 2, a factory
   with a walk of its own, making nodes that realize themselves). Its print of a sympy
   node is the node's realization: a print method, chosen by the node's sympy class,
@@ -1154,10 +1221,12 @@ class CombineIndex(Index):
 
 
 class AbstractRealization(ABC):
-    """What a node is realized as: what the printer returns for it to its parent, and
-    what the objective takes of the root. A value that builds its own CP-SAT side: a
-    TableRealization, and from Stage 5 a LinearRealization, what a sum is realized
-    as."""
+    """What the printer returns for a node. It holds no model, and from Stage 5 only
+    finite values: one that is not is refused as the realization is made."""
+
+    @abstractmethod
+    def symbolic(self) -> bool:
+        """From Stage 5: whether it has no list of its own."""
 
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -1168,12 +1237,6 @@ class AbstractRealization(ABC):
         """The realization as one table, for a parent that computes its own list from
         it. cap bounds the entries of a table that has to be made."""
 
-    @property
-    @abstractmethod
-    def finite(self) -> bool:
-        """From Stage 5, on every realization: whether every value it holds is a
-        finite number."""
-
     @abstractmethod
     def scaled(self, factor: float) -> AbstractRealization:
         """From Stage 5: factor times the realization, applied in float before any
@@ -1182,21 +1245,17 @@ class AbstractRealization(ABC):
 
 @dataclass(frozen=True, eq=False, kw_only=True)
 class TableRealization(AbstractRealization):
-    """values[index], made together and never apart: a read-only float list, refused
-    when its length is not the index's size."""
+    """values[index]: a read-only list, one value per entry of index."""
 
     values: np.ndarray
     index: Index
 
-    @property
-    def finite(self) -> bool:
-        """Whether every value in its list is a finite number."""
+    def symbolic(self) -> bool:
+        """False."""
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """Rounded once onto COST_SCALE; a number when constant, its position never
-        built; from Stage 5, its first entry plus a step times its position when
-        affine; otherwise one add_element on its index's position. Raises
-        TableLoweringError for an entry past 2^50."""
+        """A constant list adds no table, and from Stage 5 neither does an affine one;
+        any other is one add_element."""
 
     def table(self, cap: int) -> TableRealization:
         """Itself: none is made, and cap is not read."""
@@ -1215,18 +1274,21 @@ Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 
 class TableLowering(Printer):
-    """A sympy Printer whose print of a node is the node's realization (from Stage
-    3). It holds the inputs, the cap and the realizations it has printed, and no
-    model."""
+    """A sympy Printer whose print of a node is its realization (from Stage 3). From
+    Stage 5 a print method returns None to decline a node, which is then one table
+    over its inputs."""
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
         """inputs gives each symbol's variable and values; cap bounds one table."""
 
     def print(self, expr: sympy.Basic) -> AbstractRealization:
-        """expr's realization, printed the first time it is met and kept: the
-        Printer's dispatch on expr's sympy class, with emptyPrinter as the fallback.
-        The entry point, and what a print method prints its operands with. Raises
-        TableLoweringError naming the node that cannot be lowered."""
+        """expr's realization, the entry point; raises TableLoweringError for what
+        cannot be lowered."""
+
+    def _print(self, expr: sympy.Basic, **kwargs: Any) -> AbstractRealization:
+        """From Stage 5, sympy's dispatch, kept by node (Stages 3 and 4 kept it in
+        _realization). A declined node is one table, and a refusal that names no
+        node, as a realization's, names expr."""
 
     def _print_Symbol(self, expr: sympy.Symbol) -> AbstractRealization:
         """The symbol's column on an InputIndex made here on its variable."""
@@ -1234,62 +1296,58 @@ class TableLowering(Printer):
     def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
         """Over its arms' values and conditions; no ExprCondPair is printed."""
 
-    def emptyPrinter(self, expr: sympy.Basic) -> AbstractRealization:
-        """Any other class, over its arguments."""
+    def emptyPrinter(self, expr: sympy.Basic) -> None:
+        """From Stage 5, any other class is declined; through Stage 4 it was one table
+        over its arguments."""
 
     def _operation(
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
     ) -> TableRealization:
-        """expr as one table over its inputs, positions combined in symbol order, the
-        last fastest: a number, true or false is its value on UnitIndex, and an
-        operation on numbers is one entry there, computed as any other operation.
-        Refuses a table past the cap before printing an operand, then prints the
-        operands, reads each one's table at its own entries, and refuses a value that
-        is not finite."""
+        """expr as one table over its inputs, in symbol order. An operation on numbers
+        is computed the same way, on UnitIndex. The cap is checked before any operand
+        is printed, so nothing under a refused node is evaluated."""
 
-    def _finite(self, expr: sympy.Basic, table: TableRealization) -> TableRealization:
-        """table, refused naming expr when a value of it is not finite."""
+    def _table(self, expr: sympy.Basic) -> TableRealization:
+        """From Stage 5: expr's table within the cap; a refusal of that table names
+        expr."""
 
 
 # ------------------------------------------------------------------- from Stage 5 on
 
 
+class SymbolicRealization(AbstractRealization):
+    """No list of its own: CP-SAT builds it from its operands' expressions. The
+    switch, the gate and a Min/Max kept linear are ones too (Stages 6, 7 and 11)."""
+
+    def symbolic(self) -> bool:
+        """True."""
+
+
 @dataclass(frozen=True, eq=False)
-class LinearRealization(AbstractRealization):
-    """A sum kept linear: its constant plus its terms, each a list on a position of
-    its own. positions are the sum's input positions, in the order its table has
-    them. In Stage 5 every term is a table."""
+class SumRealization(SymbolicRealization):
+    """constant + sum(terms). positions are its inputs', in its table's order. A
+    constant that is not finite is refused as it is made."""
 
     constant: float
-    terms: tuple[TableRealization, ...]
+    terms: tuple[AbstractRealization, ...]
     positions: tuple[Index, ...]
-
-    @classmethod
-    def of(
-        cls, operands: Sequence[AbstractRealization], positions: Sequence[Index]
-    ) -> LinearRealization:
-        """The sum of operands, over positions: a sum among them taken term by term,
-        a constant into the constant, lists on one position added, all in float."""
-
-    @property
-    def finite(self) -> bool:
-        """Whether its constant and every term are finite."""
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """Its rounded constant plus each term's cp_expr."""
 
     def table(self, cap: int) -> TableRealization:
-        """Its constant plus its terms' lists on one table over its positions, refused
-        when that would pass cap or holds a value that is not finite."""
+        """A term's inputs are among the sum's, so its table fits when the sum's
+        does."""
 
-    def scaled(self, factor: float) -> LinearRealization:
+    def scaled(self, factor: float) -> SumRealization:
         """Its constant and each term times factor."""
 
 
-# TableLowering._print_Add(self, expr) -> AbstractRealization: a sum is always a
-# LinearRealization of its operands' realizations.
-# TableLowering._print_Mul(self, expr) -> AbstractRealization: a constant times one
-# operand is the operand's realization scaled; any other product is one table.
+# TableLowering._print_Add(self, expr) -> AbstractRealization | None: a sum with a
+# symbol is a SumRealization of its operands' realizations, lists on one position
+# added in float; a sum with none is declined.
+# TableLowering._print_Mul(self, expr) -> AbstractRealization | None: a constant times
+# one operand is the operand's realization scaled; any other product is declined.
 
 
 # ------------------------------------------------------------------ from Stage 13 on
@@ -1323,17 +1381,22 @@ passes mypy 2.1.0 with torch-spyre's settings and `empty-body` disabled.
 **The printer.** `TableLowering` is a `sympy.printing.printer.Printer`. Its entry point
 is `print`: `print(expr)` returns the node's realization. It dispatches on the node's
 sympy class, the nearest class along its MRO that has a print method, and falls back to
-`emptyPrinter`. A print method returns an `AbstractRealization`, and prints its node's
-operands with `print`. `print` keeps each realization by its sympy node, so a
-subexpression two terms share is printed once, and both parents read one realization:
+`emptyPrinter`. From Stage 5 that dispatch is sympy's `_print`, which the printer
+overrides with its memo by node, and a print method prints its node's operands with
+`self._print`, as a sympy printer's do (Stages 3 and 4: `print`, through
+`_realization`). A subexpression two terms share is printed once, and both parents read
+one realization:
 - `_print_Symbol` returns the symbol's column: its values on an `InputIndex` the printer
   makes on the symbol's variable.
 - A node with no operand, a number or `true`/`false`, is its value on `UnitIndex`. An
   operation on numbers, such as `sqrt(2)`, is one entry on `UnitIndex` too, computed by
   its function as any other operation is, so the two sides of a tie are computed alike.
-- `emptyPrinter` returns one table over the node's inputs for any other class
-  (`_operation`). From Stage 5, `_print_Add` returns a `LinearRealization`, and each
-  later operation gets its print method the same way.
+- Any other node is one table over its inputs (`_operation`). Through Stage 4
+  `emptyPrinter` returned it. From Stage 5 a print method returns an
+  `AbstractRealization`, or `None` to decline a node that is not its case, and
+  `emptyPrinter` declines every node; `_print` makes a declined node its table, in one
+  place. `_print_Add` returns a `SumRealization`, `_print_Mul` a constant times one
+  operand scaled, and each later operation gets its print method the same way.
 
 The 50 replayed objectives hold 110 to 11,020 distinct nodes each, in a traversal of 589
 to 71,914. In Stages 1 and 2 `TableLowering` is a factory with a walk of its own,
@@ -1346,7 +1409,8 @@ order of its symbols. A table that would pass the cap is refused there, before a
 operand is printed, so nothing under it is evaluated, and the refusal names the highest
 node past the cap: the root, when the root is. Under the cap the operands are printed
 first, each checking its own list, which is how a value that is not finite is refused at
-the node that makes it (Decisions). Then the node's list is its own operation on its
+the node that makes it (Decisions). From Stage 5 the check is the realization's, as it
+is made, and `_print` names the node. Then the node's list is its own operation on its
 operands' tables, each read at the node's entries. In Stage 3 that operation is the
 node's class lambdified over placeholders. From Stage 4 it is the numpy core's function
 of the class, and lambdify is kept for a class the core has none for. A parent asks an
@@ -1387,8 +1451,11 @@ no realization:
   negated literal), a variable whose domain has gaps (until `LocateIndex` in Stage 13),
   or values that are not one number per value of the variable;
 - one table past the cap, which is never evaluated;
-- a value that is not finite (`TableLowering._finite`, wherever a table is made), at the
-  node that makes it, since a node's operands are printed before its own table is made;
+- a value that is not finite, at the node that makes it, since a node's operands are
+  printed before its own table is made: through Stage 4 `TableLowering._finite`
+  wherever a table is made; from Stage 5 the realization as it is made, naming no node,
+  and `_print` names the node it was printing (`_table` the operand whose table it
+  asked for);
 - a function with no numeric value, and anything else evaluating a node raises;
 - an entry past 2^50, found when the table is built: this one comes from the
   realization's `cp_expr` and names no node.
@@ -1440,8 +1507,8 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 |---|---|
 | 3 | `Index.on_grid`, the numpy side of a position, on every step; a node's function, its class lambdified over placeholders when the node is printed, applied to its operands' tables; `TableLowering` as a sympy `Printer` whose print methods return realizations, with a print method for each operation a stage adds; `AbstractRealization.table(cap)`, a realization as one table for a parent that asks |
 | 4 | the numpy core, `cost_expr_numpy.py`: a node's function from `NUMPY_FUNC_MAP` in place of its lambdified one (`_evaluate`), and the CP-SAT printer's `_evaluate_candidates` through the same `numpy_eval` |
-| 5 | `LinearRealization`, returned by `_print_Add` for every sum (`LinearRealization.of`: a sum among the operands taken term by term, constants into the constant, lists on one position added); `_print_Mul` for a constant times one operand, through `AbstractRealization.scaled`; a sum's `table(cap)`, for a parent that needs its list (a power, a log, a Piecewise); `finite` on every realization |
-| 6 | the switch realization; the `CompactIndex` step; the build memo, one per build, passed with the model, so that a realization with several readers and a position are each built once, a position keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `LinearRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
+| 5 | `SymbolicRealization` and `SumRealization`, made by `_print_Add` for every sum with a symbol (constants into the constant, lists on one position added, a nested sum one term); `AbstractRealization.symbolic()`; `_print_Mul` for a constant times one operand, through `AbstractRealization.scaled`; a sum's `table(cap)`, for a parent that needs its list (a power, a log, a Piecewise); `_print` overridden with the memo, and `None` from a print method for a node it declines; a value that is not finite refused by the realization as it is made |
+| 6 | the switch realization; the `CompactIndex` step; the build memo, one per build, passed with the model, so that a realization with several readers and a position are each built once, a position keyed by value; a second way to realize a node, and with it the choice between ways by entries (rule 3), with an entry count on the realizations it weighs: the switch and `SumRealization`. A step's own `entries`, with `parts` and `under()` to count the remaps under an index once, and `TableRealization.entries` |
 | 7 | the gate, and `RelayoutCharge` as its own node |
 | 8 | one more way to realize a node, from its parts. Rule 3 picks at the node, before the parent is known: 19 entries against 18 on the roll-up, and the review showed it can refuse an objective that lowers. Stage 8 decides whether a node keeps its two best tables for its reader |
 | 9 | the `ExtremeIndex` step; a Min/Max node with its ladder |
@@ -1454,7 +1521,10 @@ Stage 1 has only what Stage 1 uses. Each later need lands in the stage that has 
 
 Settled in Stage 5, as built: terms of one sum that are lists on one position are added
 before the rounding, one lookup and one rounding (`split ** 0.5 + split ** 0.7` is 3112
-at split 2, against 1448 + 1663 = 3111 kept apart).
+at split 2, against 1448 + 1663 = 3111 kept apart). And in its review (Decisions,
+Stage 5 as reviewed): a realization that is not a table is a `SymbolicRealization`, a
+print method declines with `None`, and a realization refuses a value that is not finite
+as it is made.
 
 ### Where each stage lands
 
@@ -1464,7 +1534,7 @@ at split 2, against 1448 + 1663 = 3111 kept apart).
 | 2 | nothing in the module: synthetic examples of Stages 5 to 11 as strict xfails, and a trivial one that lowers; Stage 1's tests moved to `tests/` and skipped without ortools |
 | 3 | `TableLowering` becomes a sympy `Printer` (`print`, `_print_Symbol`, `_print_Piecewise`, `emptyPrinter`, `_operation`, `_finite`) that returns realizations and builds the positions; `AbstractRealization.table(cap)`; `Index.on_grid` on each step; a node's function (`_lambdified`), applied to its operands' tables, a Mul dividing by the base of a factor with a negative rational exponent; `Node`, `InputNode`, `ConstantNode`, `rewrite`, `children_of`, `lower` and `values_on_grid` go |
 | 4 | the numpy core (`NUMPY_FUNC_MAP`, `numpy_eval`), read by `_operation` in place of the lambdified function (`_evaluate`) and by the CP-SAT printer's `_evaluate_candidates`; `_lambdified` stays for a class the core does not hold |
-| 5 | `LinearRealization`, returned by `_print_Add`; `_print_Mul` for a constant factor, through `AbstractRealization.scaled`; a sum's `table(cap)`; `finite` on every realization; and the affine case of `TableRealization.cp_expr` |
+| 5 | `SymbolicRealization` and `SumRealization`, made by `_print_Add`; `symbolic()`; `_print_Mul` for a constant factor, through `AbstractRealization.scaled`; a sum's `table(cap)`; `_print` with the memo and the fallback for a declined node; the finite check in the realizations, `_finite` gone; and the affine case of `TableRealization.cp_expr` |
 | 6 | the switch: a product's linear realization, the rest collapsed once and multiplied per factor value; `CompactIndex`; the build memo, building once what several readers share; the choice between ways (rule 3); entry counts on steps and tables |
 | 7 | the gate, and `RelayoutCharge` as its own node |
 | 8 | a node realized from its parts: ranks and pairs |
@@ -2021,19 +2091,26 @@ The second optimization, the first that changes entries: "the sum stays linear",
 on one index are added" and "an affine list needs no table" of "How the tables are kept
 small", with the collapse of "Collapsing float lists into linear terms".
 
-- **A sum is a `LinearRealization`,** an `AbstractRealization`: a constant plus its
-  terms, each a list on a position of its own. `_print_Add` returns one for every sum,
-  and its `cp_expr` is its rounded constant plus each term's `cp_expr`.
-- **What goes into one sum (`LinearRealization.of`).** A sum among the operands, as in
-  `2 * (a + b)`, is taken term by term, and a constant operand goes into the constant.
-  Lists on one position are added, one lookup and one rounding: `split ** 0.5 + split **
-  0.7` is 3112 at split 2, where the two lists rounded apart give 1448 + 1663 = 3111.
-  So at this stage a sum's terms are tables on distinct positions.
+- **A sum is a `SumRealization`,** the first `SymbolicRealization`: a realization with
+  no list of its own, its constant plus its terms. `_print_Add` makes one for every sum
+  with a symbol, and its `cp_expr` is its rounded constant plus each term's `cp_expr`.
+  `AbstractRealization.symbolic()` tells it from a `TableRealization`.
+- **What goes into one sum.** A constant operand goes into the constant. Lists on one
+  position are added, one lookup and one rounding: `split ** 0.5 + split ** 0.7` is
+  3112 at split 2, where the two lists rounded apart give 1448 + 1663 = 3111. Any other
+  operand is a term as it is. sympy flattens sums and distributes a number over one, so
+  a sum is an operand of another only under a constant that is not a number, as in
+  `sqrt(2) * (a + b)`: that sum, scaled, is one term, not flattened.
 - **A constant factor is applied in float.** `_print_Mul`, for a Mul with constant
   factors and one other operand, returns the operand's realization with the factor
   applied before the rounding (`AbstractRealization.scaled`): `7 * split ** 0.5` at
-  split 2 is 10137, not 7 * 1448. Any other product is one table, as before, and so is
-  a constant over an operand, which is divided (Stage 3).
+  split 2 is 10137, not 7 * 1448. Any other product is declined, and so is a constant
+  over an operand, which `_operation` divides (Stage 3).
+- **A declined node is one table.** A print method returns `None` for a node that is
+  not its case: `_print_Add` a sum with no symbol, `_print_Mul` any other product,
+  `emptyPrinter` every class with no print method. `_print`, sympy's dispatcher, which
+  the printer overrides with its memo by node, makes a declined node one table over its
+  inputs (`_operation`). `_print_Piecewise` makes its table itself.
 - **A sum's table, for a parent that asks.** A parent that computes its own list from a
   sum (a power, a log, a Piecewise) asks it for its `table(cap)`: its constant plus its
   terms' lists on one table over the sum's inputs. The printer hands the sum its input
@@ -2042,23 +2119,25 @@ small", with the collapse of "Collapsing float lists into linear terms".
   is made each time a parent asks, and is not kept.
 - **An affine list needs no table.** `TableRealization.cp_expr` reads a list whose
   rounded entries are affine in its position as its first entry plus a step times the
-  position. Any list of two values is one.
-- **A value that is not finite** is refused at the node that makes it, as before
-  (`finite`, now on every realization): a sum whose added lists overflow, a product
-  whose coefficient overflows a list, and a sum whose table overflows when a parent
-  asks for it.
+  position. Any list of two entries is one.
+- **A value that is not finite** is refused as a realization is made: a
+  `TableRealization` with an inf or a NaN, and a `SumRealization` whose constant is
+  one. The realization names no node: `_print` names the node it was printing, and
+  `_table` the sum whose table it asked for. So a sum whose added lists overflow, a
+  product whose coefficient overflows a list, and a sum whose table overflows when a
+  parent asks for it are each refused at their node. `finite` and `_finite` are gone.
 
-Two things differ from this section as it was planned. Both are as built, and open to
-the review of the PR:
+Two things differ from this section as it was planned, as built. The review's changes
+are in Decisions (Stage 5 as reviewed):
 
 - **Lists on one position are added.** The section left it open. The stage table, the
   collapse and "How the tables are kept small" all had them added, and it is one lookup
   where kept apart is two.
 - **No build memo.** The plan had one memo per build here, passed with the model, so
-  that a node with several readers is built once. With a sum taken term by term and
-  lists on one position added, a sum's terms are distinct lists and nothing is built
-  twice, so the memo would have no caller and no test. It moves to Stage 6, which first
-  has a realization that two terms hold, and where positions go through it.
+  that a node with several readers is built once. With lists on one position added, and
+  a nested sum's terms scaled copies, a sum's terms are distinct lists and nothing is
+  built twice, so the memo would have no caller and no test. It moves to Stage 6, which
+  first has a realization that two terms hold, and where positions go through it.
 
 After this stage a sum whose terms each fit the cap is lowered exactly, with no table
 across two of its terms' inputs, and still no whole objective: each has a wide term past
@@ -2078,8 +2157,10 @@ and no compile runs the table module, so it changes no production time.
 
 Tests:
 
-- a sum is a `LinearRealization` of its operands' own realizations, a constant operand
+- a sum is a `SumRealization` of its operands' own realizations, a constant operand
   in its constant, its positions in symbol order; a sum with no symbol is its value;
+- a table is not symbolic and a sum is; a print method and `emptyPrinter` return `None`
+  for a node they decline;
 - the sum over three buffers that one table could not hold is exact in three tables of
   21, 11 and 20 entries; asked for its table it is one of 4620, refused past the cap it
   is asked with, naming no node;
@@ -2092,17 +2173,19 @@ Tests:
 - an affine list adds no table and no variable, and a list that is not adds one;
 - a sum under a power is read as its table, and past the cap the power is refused
   before the sum is printed;
+- a sum under a constant that is not a number is one term of the sum around it, and
+  both are exact; with nested sums flattened, this test fails;
+- a realization with a value that is not finite is not made, naming no node;
 - a sum that is not finite is refused at the sum: its added lists, its table when a
   parent asks, and a coefficient at its product;
 - the `linear_sum` example loses its mark: four tables of 10 entries, where one table
   needs 10^4. The other five keep theirs.
 
-Built: torch-spyre/torch-spyre#6561 at 6a4680fe, stacked on #6547: d68efa6c replayed
-onto Stage 4 after Stage 3 was squashed. Where Stage 3's operations on numbers meet this
-stage's helpers, `_operation` takes `_inputs(expr) or [UNIT]`, and `_on` reads a
-constant as a broadcast of its one entry. The two files give 95 passed and 5 xfailed in
-2.0 s, with no device, one more than at d68efa6c for Stage 3's test of an operation on
-numbers.
+Built: torch-spyre/torch-spyre#6561, one commit, 40cb2a09, on torch-spyre `main`
+22259576 (2026-11-24), after #6547 merged as 80b762d9. Where Stage 3's operations on
+numbers meet this stage's helpers, `_operation` takes `_inputs(expr) or [UNIT]`, and
+`_on` reads a constant as a broadcast of its one entry. The two files give 99 passed
+and 5 xfailed in 2 s, with no device.
 
 ### Stage 6: rule 4, the switch
 
@@ -2161,9 +2244,14 @@ reuse, `CompactIndex` and the choice between a node's ways by entries (rule 3).
   the product's one table over its inputs. A factor with a repeated value times a short
   list can keep its table: `[1, 1, 2]` times a list of 2 is 6 entries as a table and 7
   as a switch. Under a nonlinear reader the product is its table, as in Stage 5.
-- **Entries.** `AbstractRealization` stays `cp_expr` alone; the realizations the choice
-  weighs get an entry count here. The switch counts its rest's entries, one per factor
-  value and the factor's `CompactIndex`. `LinearRealization` counts its terms', since a
+- **In the printer as Stage 5 left it.** The switch is a `SymbolicRealization`, and a
+  sum holds it as one term. `_print_Mul` returns it, or `None` where the choice keeps
+  the product's table, and `_print` makes that table. A constant on the product is
+  applied through the switch's `scaled`, to its rest. Its numbers are its factor's
+  values and its rest's, finite already, so it adds no check of its own.
+- **Entries.** `AbstractRealization` gets no entry count; the realizations the choice
+  weighs get one here. The switch counts its rest's entries, one per factor value and
+  the factor's `CompactIndex`. `SumRealization` counts its terms', since a
   switch's rest can be a sum: `derate * (A + B)` weighs its switch, over `A`'s and `B`'s
   tables, against one table over every input of the product.
 - **The cap.** A factor's values count as entries; a factor with more values than the
@@ -2232,10 +2320,11 @@ one table over its literal and its division, twice the menu, its off half zeros.
   gate and no table. So `(1 - x) * (c - c*x + c*x/t)` becomes `c * (1 - x)`, with no
   table over the tile's division.
 - **The linear realization.** A gate is a switch realization on the literal's position,
-  with values 0 and 1. Its kept case's rest is the rest's realization times the gate's
-  value, in float, and the other case is empty. A product with gates on several literals
-  is a switch inside a switch. An Add merges gates on one literal into one, their rests
-  added case by case, so lists on one position inside them are one list and round once.
+  with values 0 and 1, and so a `SymbolicRealization`. Its kept case's rest is the
+  rest's realization times the gate's value, in float, and the other case is empty. A
+  product with gates on several literals is a switch inside a switch. An Add merges
+  gates on one literal into one, their rests added case by case, so lists on one
+  position inside them are one list and round once.
 - **A relayout charge** gets a node class of its own. Its realization gates its prices,
   a list on its division, by its literal kept at 1, so it costs the division's menu
   once. Its table over the literal and the division stays for a nonlinear reader.
@@ -2330,6 +2419,10 @@ and "values past the bound are clamped" of "How the tables are kept small".
   an operand's value is clamped.
 - Rungs: each of an operand's clamped values as its position on the ladder, a
   `CompactIndex`; then `ExtremeIndex`, the max or min of the rungs.
+- `_print_Min` and `_print_Max` are the print methods (`ExtremeNode` above), and return
+  `None` where neither the rung nor a later way applies, so `_print` makes the one
+  table. The ladder and the bound are numbers this stage computes, so the realization
+  that holds them refuses one that is not finite as it is made, naming no node.
 
 Tests:
 
@@ -2369,8 +2462,10 @@ table.
   in it: sums, constant factors, other Min/Max nodes, and any product, whose switch
   (Stage 6) multiplies the collapsed Min/Max by its factor's values. Its operands are
   linear realizations, so a switch or a gate inside one is one more term there.
+- The linear realization is a `SymbolicRealization`. A sum holds it as one term, which
+  Stage 5's `SumRealization` already takes: its terms are any realizations.
 - A coefficient on the Min/Max is applied to its operands' lists before they are
-  collapsed. A negative one turns Min into Max.
+  collapsed, through its `scaled`. A negative one turns Min into Max.
 - The linear realization counts its entries, its operands' lists, which margin 2 weighs
   against the table's.
 - Each operand sits behind a variable of its own. With a long sum of literals inside
@@ -2568,8 +2663,9 @@ After Stage 14, posted on that PR:
 Stage 1 is merged: torch-spyre/torch-spyre#6475, 290b5e0f on torch-spyre `main`
 (2026-11-19), 33 device-free tests. Stage 2 is merged: torch-spyre/torch-spyre#6501,
 2850616b (2026-11-20), synthetic examples of the later optimizations as strict xfails,
-with the two changes the review of Stage 1 asked for its tests. Stages 3, 4 and 5 are
-built and open, each on the one before: torch-spyre/torch-spyre#6525 at 1ce25253, the
-printer that returns realizations, ready for review; torch-spyre/torch-spyre#6547 at
-716a24be, the numpy core, and torch-spyre/torch-spyre#6561 at 6a4680fe, linear sums,
-both drafts. Stage 6, the switch, is next.
+with the two changes the review of Stage 1 asked for its tests. Stage 3 is merged:
+torch-spyre/torch-spyre#6525, 87e63673, the printer that returns realizations. Stage 4
+is merged: torch-spyre/torch-spyre#6547, 80b762d9 (2026-11-24), the numpy core. Stage 5
+is built and open: torch-spyre/torch-spyre#6561, linear sums, one commit, 40cb2a09, on
+`main` 22259576, a draft, with the changes of its review (Decisions, Stage 5 as
+reviewed). Stage 6, the switch, is next.
